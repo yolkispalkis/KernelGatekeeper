@@ -9,23 +9,17 @@ proxy:
 
 kerberos: # Hints for Client's Kerberos (uses user ccache)
   realm: "EXAMPLE.COM" # Optional hint for client
-  # kdc_host: "" # Not needed, client uses system krb5.conf
-  # principal: "" # Not needed, client uses ccache default
-  # keytab_path: "" # Not used by client
   enable_cache: true # Client always uses ccache in this model
   ticket_lifetime: 24 # Informational only
   cache_path: "" # Informational, client uses system default or krb5.conf
 
 ebpf: # Configuration for Service's BPF programs
-  interface: "eth0" # Interface hint for service logging/stats (sockops is cgroup based)
-  program_path: "" # No longer used, path is determined by `go generate`
   target_ports: [80, 443] # Ports BPF sockops should check for redirection
-  load_mode: "sockops" # Informational, hardcoded to sockops/skmsg now
   allow_dynamic_ports: true # Allow service to update target_ports map via IPC
   stats_interval: 15 # Service BPF stats logging interval (seconds)
 
 # Service Logging configuration
-log_level: "info" # debug, info, warn, error
+log_level: "debug" # debug, info, warn, error
 log_path: "/var/log/kernelgatekeeper.log" # Path for service logs, empty for stderr
 
 # Service configuration
