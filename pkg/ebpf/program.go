@@ -23,6 +23,8 @@ import (
 	"github.com/yolki/kernelgatekeeper/pkg/config"
 )
 
+//go:generate go run -tags linux github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpf -cflags "-O2 -g -Wall -Werror -DDEBUG -I./bpf -I/usr/include/bpf -I/usr/include" bpf ./bpf/sockops.c ./bpf/skmsg.c -- -I./bpf
+
 const (
 	GlobalStatsMatchedIndex = 1
 	DefaultCgroupPath       = "/sys/fs/cgroup"
@@ -78,7 +80,6 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan NotificationTuple) (*B
 	if err := loadBpfObjects(&objs, opts); err != nil {
 		var verr *ebpf.VerifierError
 		if errors.As(err, &verr) {
-
 			slog.Error("eBPF Verifier error", "log", fmt.Sprintf("%+v", verr))
 		}
 		return nil, fmt.Errorf("failed to load eBPF objects (run 'make generate'): %w", err)
@@ -116,7 +117,6 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan NotificationTuple) (*B
 }
 
 func (m *BPFManager) attachPrograms(cgroupPath string) error {
-
 	if m.objs.KernelgatekeeperSockops == nil {
 		return errors.New("sock_ops program not found in BPF objects (run 'make generate')")
 	}
@@ -184,7 +184,6 @@ func (m *BPFManager) Start(ctx context.Context, wg *sync.WaitGroup) error {
 		return errors.New("BPF manager not initialized, cannot start")
 	}
 	slog.Info("Starting BPF Manager background tasks")
-
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -192,7 +191,6 @@ func (m *BPFManager) Start(ctx context.Context, wg *sync.WaitGroup) error {
 		m.readNotifications(ctx)
 		slog.Info("BPF ring buffer reader stopped.")
 	}()
-
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -204,7 +202,6 @@ func (m *BPFManager) Start(ctx context.Context, wg *sync.WaitGroup) error {
 }
 
 func (m *BPFManager) readNotifications(ctx context.Context) {
-
 	var tupleSize = binary.Size(bpfConnectionTupleT{})
 	if tupleSize < 0 {
 		slog.Error("Could not determine size of bpfConnectionTupleT (run 'make generate')")
@@ -218,10 +215,8 @@ func (m *BPFManager) readNotifications(ctx context.Context) {
 		case <-m.stopChan:
 			return
 		default:
-
 			record, err := m.notificationReader.Read()
 			if err != nil {
-
 				if errors.Is(err, ringbuf.ErrClosed) || errors.Is(err, context.Canceled) || errors.Is(err, errClosed) {
 					slog.Warn("Ring buffer reader closed or context cancelled.")
 					return
@@ -258,7 +253,6 @@ func (m *BPFManager) readNotifications(ctx context.Context) {
 			case <-m.stopChan:
 				return
 			default:
-
 				slog.Warn("Notification channel full, dropping event", "event", event)
 			}
 		}
@@ -284,7 +278,6 @@ func (m *BPFManager) statsUpdater(ctx context.Context) {
 		case <-m.stopChan:
 			return
 		case <-ticker.C:
-
 			if err := m.updateAndLogStats(); err != nil {
 				slog.Error("Failed to update eBPF stats", "error", err)
 			}
@@ -331,7 +324,6 @@ func (m *BPFManager) readGlobalStats(index uint32) (GlobalStats, error) {
 
 	var perCPUValues []bpfGlobalStatsT
 	if err := m.objs.GlobalStats.Lookup(index, &perCPUValues); err != nil {
-
 		return agg, fmt.Errorf("lookup stats index %d failed: %w", index, err)
 	}
 
@@ -359,7 +351,6 @@ func (m *BPFManager) UpdateTargetPorts(ports []int) error {
 		}
 	}
 	if err := iter.Err(); err != nil {
-
 		slog.Warn("Failed to iterate existing target_ports map, proceeding with update", "error", err)
 		currentPorts = make(map[uint16]bool)
 	}
@@ -379,7 +370,6 @@ func (m *BPFManager) UpdateTargetPorts(ports []int) error {
 	deletedCount := 0
 	for port := range currentPorts {
 		if !newPortsSet[port] {
-
 			if err := m.objs.TargetPorts.Delete(port); err != nil {
 				if !errors.Is(err, ebpf.ErrKeyNotExist) {
 					slog.Error("Failed to delete target port from BPF map", "port", port, "error", err)
@@ -395,7 +385,6 @@ func (m *BPFManager) UpdateTargetPorts(ports []int) error {
 	var one uint8 = 1
 	for port := range newPortsSet {
 		if !currentPorts[port] {
-
 			if err := m.objs.TargetPorts.Put(port, one); err != nil {
 				slog.Error("Failed to add target port to BPF map", "port", port, "error", err)
 			} else {
@@ -423,24 +412,19 @@ func (m *BPFManager) GetConnectionPID(tuple NotificationTuple) (uint32, error) {
 	}
 
 	key := bpfConnectionTupleT{
-
-		SrcIp: binary.BigEndian.Uint32(tuple.SrcIP.To4()),
-		DstIp: binary.BigEndian.Uint32(tuple.DstIP.To4()),
-
+		SrcIp:    binary.BigEndian.Uint32(tuple.SrcIP.To4()),
+		DstIp:    binary.BigEndian.Uint32(tuple.DstIP.To4()),
 		SrcPort:  htons(tuple.SrcPort),
 		DstPort:  htons(tuple.DstPort),
 		Protocol: tuple.Protocol,
 	}
 
 	var state BpfConnectionStateT
-
 	err := m.objs.ConnectionMap.Lookup(&key, &state)
 	if err != nil {
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
-
 			return 0, fmt.Errorf("connection state not found in map for tuple %+v: %w", tuple, err)
 		}
-
 		return 0, fmt.Errorf("failed to lookup connection state for tuple %+v: %w", tuple, err)
 	}
 
@@ -458,7 +442,6 @@ func (m *BPFManager) GetStats() (total GlobalStats, matched GlobalStats, err err
 	defer m.statsCache.RUnlock()
 
 	total = GlobalStats{}
-
 	matched = m.statsCache.matchedConns
 	return total, matched, nil
 }
@@ -470,7 +453,6 @@ func (m *BPFManager) Close() error {
 	var firstErr error
 	m.stopOnce.Do(func() {
 		slog.Info("Closing BPF Manager...")
-
 		close(m.stopChan)
 
 		if m.notificationReader != nil {
@@ -523,7 +505,6 @@ func (m *BPFManager) Close() error {
 				firstErr = fmt.Errorf("bpf objects close: %w", err)
 			}
 		}
-
 		m.objs = bpfObjects{}
 
 		slog.Info("BPF Manager closed.")
@@ -535,7 +516,6 @@ var nativeEndian binary.ByteOrder
 var errClosed = errors.New("reader closed")
 
 func init() {
-
 	buf := [2]byte{}
 	*(*uint16)(unsafe.Pointer(&buf[0])) = 0xABCD
 	switch buf {
@@ -550,26 +530,21 @@ func init() {
 
 func ipFromInt(ipInt uint32) net.IP {
 	ip := make(net.IP, 4)
-
 	binary.BigEndian.PutUint32(ip, ipInt)
 	return ip
 }
 
 func ntohs(n uint16) uint16 {
-
 	if nativeEndian == binary.BigEndian {
 		return n
 	}
-
 	return (n >> 8) | (n << 8)
 }
 
 func htons(n uint16) uint16 {
-
 	if nativeEndian == binary.BigEndian {
 		return n
 	}
-
 	return (n >> 8) | (n << 8)
 }
 
@@ -580,11 +555,9 @@ func GetAvailableInterfaces() ([]string, error) {
 	}
 	var names []string
 	for _, i := range interfaces {
-
 		if (i.Flags&net.FlagUp == 0) || (i.Flags&net.FlagLoopback != 0) {
 			continue
 		}
-
 		if strings.HasPrefix(i.Name, "veth") || strings.HasPrefix(i.Name, "docker") || strings.HasPrefix(i.Name, "br-") {
 			continue
 		}
@@ -596,11 +569,10 @@ func GetAvailableInterfaces() ([]string, error) {
 	return names, nil
 }
 
-func getUidFromPid(pid uint32) (uint32, error) {
+func GetUidFromPid(pid uint32) (uint32, error) {
 	statusFilePath := fmt.Sprintf("/proc/%d/status", pid)
 	data, err := os.ReadFile(statusFilePath)
 	if err != nil {
-
 		if os.IsNotExist(err) {
 			return 0, fmt.Errorf("process %d not found (likely finished): %w", pid, err)
 		}
@@ -610,10 +582,8 @@ func getUidFromPid(pid uint32) (uint32, error) {
 	lines := strings.SplitN(string(data), "\n", -1)
 	for _, line := range lines {
 		if strings.HasPrefix(line, "Uid:") {
-
 			fields := strings.Fields(line)
 			if len(fields) >= 2 {
-
 				uidVal, err := strconv.ParseUint(fields[1], 10, 32)
 				if err == nil {
 					return uint32(uidVal), nil
