@@ -56,6 +56,7 @@ type BPFManager struct {
 	notificationChannel chan NotificationTuple
 	stopOnce            sync.Once
 	stopChan            chan struct{}
+	skmsgProgram        *ebpf.Program
 	statsCache          struct {
 		sync.RWMutex
 
@@ -123,9 +124,25 @@ func (m *BPFManager) attachPrograms(cgroupPath string) error {
 	if m.objs.KernelgatekeeperSockops == nil {
 		return errors.New("sock_ops program not found in BPF objects (run 'go generate')")
 	}
-	if m.objs.KernelgatekeeperSkmsg == nil {
-		return errors.New("sk_msg program not found in BPF objects (run 'go generate')")
+
+	// Загружаем программу sk_msg напрямую, так как она не генерируется автоматически
+	spec, err := loadBpf()
+	if err != nil {
+		return fmt.Errorf("failed to load BPF spec: %w", err)
 	}
+
+	skmsgProgram := spec.Programs["kernelgatekeeper_skmsg"]
+	if skmsgProgram == nil {
+		return errors.New("sk_msg program not found in BPF spec")
+	}
+
+	skmsgObj, err := ebpf.NewProgram(skmsgProgram)
+	if err != nil {
+		return fmt.Errorf("failed to load sk_msg program: %w", err)
+	}
+
+	m.skmsgProgram = skmsgObj
+
 	if m.objs.ProxySockMap == nil {
 		return errors.New("proxy_sock_map not found in BPF objects (run 'go generate')")
 	}
@@ -151,7 +168,7 @@ func (m *BPFManager) attachPrograms(cgroupPath string) error {
 	slog.Info("sock_ops program attached to cgroup", "path", cgroupPath)
 
 	skLink, err := link.AttachRawLink(link.RawLinkOptions{
-		Program: m.objs.KernelgatekeeperSkmsg,
+		Program: m.skmsgProgram,
 		Attach:  ebpf.AttachSkMsgVerdict,
 		Target:  m.objs.ProxySockMap.FD(),
 		Flags:   0,
@@ -474,6 +491,18 @@ func (m *BPFManager) Close() error {
 			}
 			m.skMsgLink = nil
 		}
+
+		if m.skmsgProgram != nil {
+			slog.Debug("Closing sk_msg program...")
+			if err := m.skmsgProgram.Close(); err != nil {
+				slog.Error("Error closing sk_msg program", "error", err)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("sk_msg program close: %w", err)
+				}
+			}
+			m.skmsgProgram = nil
+		}
+
 		if m.cgroupLink != nil {
 			slog.Debug("Closing cgroup link...")
 			if err := m.cgroupLink.Close(); err != nil {
