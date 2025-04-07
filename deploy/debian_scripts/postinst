@@ -20,7 +20,7 @@ fi
 
 # Reload systemd daemon
 if command -v systemctl >/dev/null; then
-   systemctl daemon-reload || true # Don't fail if systemd is not available
+    systemctl daemon-reload || true # Don't fail if systemd is not available
 fi
 
 # Enable and start the system service on first install/configure

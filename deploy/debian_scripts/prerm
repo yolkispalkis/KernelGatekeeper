@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 case "$1" in
-    remove|upgrade)
+    remove | upgrade)
         if command -v systemctl >/dev/null; then
             echo "Stopping kernelgatekeeper system service..."
             systemctl stop kernelgatekeeper.service || true

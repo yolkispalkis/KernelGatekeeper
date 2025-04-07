@@ -22,8 +22,7 @@ case "$1" in
             systemctl daemon-reload || true
         fi
         ;;
-    upgrade|abort*|disappear)
-        ;;
+    upgrade | abort* | disappear) ;;
     *)
         echo "postrm called with unknown argument '$1'" >&2
         exit 1
