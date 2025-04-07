@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+case "$1" in
+    remove|upgrade)
+        if command -v systemctl >/dev/null; then
+            echo "Stopping kernelgatekeeper system service..."
+            systemctl stop kernelgatekeeper.service || true
+        fi
+        ;;
+    *)
+        echo "prerm called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+exit 0

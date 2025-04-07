@@ -1,18 +1,27 @@
 # Makefile
-.PHONY: all build clean ebpf generate deps test install fmt lint help
+.PHONY: all build clean ebpf generate deps test install fmt lint help deb
 
+# --- Переменные ---
 SERVICE_BINARY=kernelgatekeeper-service
 CLIENT_BINARY=kernelgatekeeper-client
+VERSION ?= 0.1.0
+ARCH ?= $(shell dpkg --print-architecture)
+DEB_ROOT=debian_pkg
+DEB_PACKAGE_NAME=kernelgatekeeper
+DEB_FILENAME=$(DEB_PACKAGE_NAME)_$(VERSION)_$(ARCH).deb
+# Путь к исходным файлам для DEB
+DEB_SCRIPTS_SRC=deploy/debian_scripts
+
 BPF_C_SRC=$(wildcard pkg/ebpf/bpf/*.c)
 BPF_HEADER_DIR=pkg/ebpf/bpf
 BPF_OUTPUT_DIR=pkg/ebpf/bpf
 CLANG ?= clang
-# Update CFLAGS for includes relative to the BPF dir
 CFLAGS ?= -O2 -g -Wall -Werror -target bpf -I./ -I/usr/include/bpf -I/usr/include
 DESTDIR ?= bin
 GO_CMD=go
 GOLANGCILINT = $(shell command -v golangci-lint 2> /dev/null)
 
+# --- Основные цели ---
 all: fmt lint test generate build
 
 build: build-service build-client
@@ -28,18 +37,11 @@ build-client: $(DESTDIR)
 	@echo "Building client application..."
 	$(GO_CMD) build -ldflags="-s -w" -v -o $(DESTDIR)/$(CLIENT_BINARY) ./cmd/client
 
-# generate target now handles BPF compilation via bpf2go
 generate: $(BPF_HEADER_DIR)/bpf_shared.h $(BPF_C_SRC)
 	@echo "Generating Go wrappers and compiling eBPF C code..."
 	$(GO_CMD) generate ./pkg/ebpf/...
 
-# ebpf target is now just a dependency check
-ebpf: $(BPF_HEADER_DIR)/bpf_shared.h $(BPF_C_SRC)
-	@echo "Ensuring BPF source and header files exist..."
-	@if [ ! -f "$(BPF_HEADER_DIR)/bpf_shared.h" ]; then echo "Error: $(BPF_HEADER_DIR)/bpf_shared.h not found"; exit 1; fi
-	@if [ -z "$$(ls $(BPF_C_SRC))" ]; then echo "Error: No BPF C source files found in $(BPF_HEADER_DIR)"; exit 1; fi
-
-
+# --- Вспомогательные цели ---
 deps:
 	@echo "Tidying dependencies..."
 	$(GO_CMD) mod tidy
@@ -63,44 +65,80 @@ endif
 
 clean:
 	@echo "Cleaning up..."
-	rm -rf $(DESTDIR)
+	rm -rf $(DESTDIR) $(DEB_ROOT) $(DEB_FILENAME)
 	rm -f $(BPF_OUTPUT_DIR)/bpf_bpfel.go $(BPF_OUTPUT_DIR)/bpf_bpfeb.go $(BPF_OUTPUT_DIR)/*.o
 	$(GO_CMD) clean
 
-install-dirs:
-	@echo "Creating installation directories..."
-	mkdir -p $(DESTDIR) /etc/kernelgatekeeper /etc/systemd/system /usr/lib/systemd/user /var/log
-
-install: build install-dirs
-	@echo "Installing..."
-	install -m 755 $(DESTDIR)/$(SERVICE_BINARY) /usr/local/bin/
-	install -m 755 $(DESTDIR)/$(CLIENT_BINARY) /usr/local/bin/
-
-	@if [ -f "config.yaml" ]; then \
-		if [ ! -f "/etc/kernelgatekeeper/config.yaml" ]; then \
-			echo "Installing default config..."; \
-			install -m 640 config.yaml /etc/kernelgatekeeper/config.yaml; \
-		else \
-			echo "Config file /etc/kernelgatekeeper/config.yaml exists, skipping."; \
-		fi \
-	else \
-		echo "Warning: Default config.yaml not found."; \
-	fi
-
-	@echo "Installing systemd service files..."
-	install -m 644 deploy/kernelgatekeeper.service /etc/systemd/system/
-	install -m 644 deploy/kernelgatekeeper-client.service /usr/lib/systemd/user/
-
-	@echo "Setting up log file..."
-	touch /var/log/kernelgatekeeper.log
-	chmod 640 /var/log/kernelgatekeeper.log
+# --- Установка (ручная, для разработки) ---
+install: build
+	@echo "Manual installation (for development)..."
+	sudo install -D -m 755 $(DESTDIR)/$(SERVICE_BINARY) /usr/local/bin/
+	sudo install -D -m 755 $(DESTDIR)/$(CLIENT_BINARY) /usr/local/bin/
+	# Install config if not exists
+	sudo install -D -m 640 config.yaml /etc/kernelgatekeeper/config.yaml || echo "Config exists, skipping"
+	sudo install -D -m 644 deploy/kernelgatekeeper.service /etc/systemd/system/
+	sudo install -D -m 644 deploy/kernelgatekeeper-client.service /usr/lib/systemd/user/
+	# Create log file with permissions
+	sudo touch /var/log/kernelgatekeeper.log
+	sudo chmod 640 /var/log/kernelgatekeeper.log
 	# Consider chown root:adm /var/log/kernelgatekeeper.log
+	@echo "Manual installation complete! Reload systemd:"
+	@echo "  sudo systemctl daemon-reload"
+	@echo "  systemctl --user daemon-reload"
+	@echo "Then enable services:"
+	@echo "  sudo systemctl enable --now kernelgatekeeper.service"
+	@echo "  systemctl --user enable --now kernelgatekeeper-client.service"
 
-	@echo "Installation complete!"
-	@echo "To enable system service: sudo systemctl daemon-reload && sudo systemctl enable --now kernelgatekeeper.service"
-	@echo "To enable user service (run as user): systemctl --user daemon-reload && systemctl --user enable --now kernelgatekeeper-client.service"
-	@echo "Check service logs: sudo journalctl -u kernelgatekeeper.service -f"
-	@echo "Check client logs: journalctl --user -u kernelgatekeeper-client.service -f"
+
+# --- Сборка DEB пакета ---
+deb: clean build
+	@echo "Building DEB package..."
+	# --- Создание каталогов ---
+	mkdir -p $(DEB_ROOT)/DEBIAN
+	mkdir -p $(DEB_ROOT)/usr/local/bin
+	mkdir -p $(DEB_ROOT)/etc/kernelgatekeeper
+	mkdir -p $(DEB_ROOT)/etc/systemd/system
+	mkdir -p $(DEB_ROOT)/usr/lib/systemd/user
+	mkdir -p $(DEB_ROOT)/var/log # Каталог создаст postinst
+	mkdir -p $(DEB_ROOT)/etc/profile.d
+
+	# --- Копирование файлов приложения ---
+	cp $(DESTDIR)/$(SERVICE_BINARY) $(DEB_ROOT)/usr/local/bin/
+	cp $(DESTDIR)/$(CLIENT_BINARY) $(DEB_ROOT)/usr/local/bin/
+	cp config.yaml $(DEB_ROOT)/etc/kernelgatekeeper/config.yaml.example
+	cp deploy/kernelgatekeeper.service $(DEB_ROOT)/etc/systemd/system/
+	cp deploy/kernelgatekeeper-client.service $(DEB_ROOT)/usr/lib/systemd/user/
+
+	# --- Копирование скриптов пакета ---
+	cp $(DEB_SCRIPTS_SRC)/conffiles $(DEB_ROOT)/DEBIAN/
+	cp $(DEB_SCRIPTS_SRC)/postinst $(DEB_ROOT)/DEBIAN/
+	cp $(DEB_SCRIPTS_SRC)/prerm $(DEB_ROOT)/DEBIAN/
+	cp $(DEB_SCRIPTS_SRC)/postrm $(DEB_ROOT)/DEBIAN/
+	cp $(DEB_SCRIPTS_SRC)/99-kernelgatekeeper-client-enabler.sh $(DEB_ROOT)/etc/profile.d/
+
+	# --- Генерация DEBIAN/control (с переменными) ---
+	@echo "Generating DEBIAN/control..."
+	@echo "Package: $(DEB_PACKAGE_NAME)" > $(DEB_ROOT)/DEBIAN/control
+	@echo "Version: $(VERSION)" >> $(DEB_ROOT)/DEBIAN/control
+	@echo "Section: net" >> $(DEB_ROOT)/DEBIAN/control
+	@echo "Priority: optional" >> $(DEB_ROOT)/DEBIAN/control
+	@echo "Architecture: $(ARCH)" >> $(DEB_ROOT)/DEBIAN/control
+	@echo "Depends: libc6, adduser" >> $(DEB_ROOT)/DEBIAN/control
+	@echo "Maintainer: Your Name <your.email@example.com>" >> $(DEB_ROOT)/DEBIAN/control # ЗАМЕНИТЕ ЭТО!
+	@echo "Description: Transparent Kerberos proxy using eBPF sockops." >> $(DEB_ROOT)/DEBIAN/control
+	@echo " Provides transparent proxying for user applications by leveraging" >> $(DEB_ROOT)/DEBIAN/control
+	@echo " eBPF sockops/sockmap to redirect traffic and performing Kerberos" >> $(DEB_ROOT)/DEBIAN/control
+	@echo " authentication via a user-specific client process." >> $(DEB_ROOT)/DEBIAN/control
+
+	# --- Установка прав на выполнение ---
+	@echo "Setting script permissions..."
+	chmod +x $(DEB_ROOT)/DEBIAN/postinst $(DEB_ROOT)/DEBIAN/prerm $(DEB_ROOT)/DEBIAN/postrm
+	chmod 755 $(DEB_ROOT)/etc/profile.d/99-kernelgatekeeper-client-enabler.sh
+
+	# --- Сборка пакета ---
+	@echo "Building the package..."
+	dpkg-deb --build $(DEB_ROOT) $(DEB_FILENAME)
+	@echo "DEB package created: $(DEB_FILENAME)"
 
 run-service: build-service
 	@echo "Running service application (requires sudo)..."
@@ -119,7 +157,8 @@ help:
 	@echo "  make test         - Run tests"
 	@echo "  make fmt          - Format Go code"
 	@echo "  make lint         - Run linter"
-	@echo "  make clean        - Remove build artifacts"
-	@echo "  make install      - Build and install system-wide"
+	@echo "  make clean        - Remove build artifacts and deb package"
+	@echo "  make install      - Manual installation (for development)"
+	@echo "  make deb          - Build the Debian (.deb) package"
 	@echo "  make run-service  - Build and run service (sudo required)"
 	@echo "  make run-client   - Build and run client"
