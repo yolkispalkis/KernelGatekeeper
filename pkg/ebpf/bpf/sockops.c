@@ -3,7 +3,7 @@
 #include <bpf/bpf_endian.h>
 #include <linux/socket.h>
 #include <linux/in.h>
-#include <linux/tcp.h>
+
 
 #include "bpf_shared.h"
 
@@ -12,33 +12,24 @@
 #endif
 
 static __always_inline int extract_tuple(struct bpf_sock_ops *skops, struct connection_tuple_t *tuple) {
-    if (skops->sk == NULL) {
-        bpf_printk("SOCKOPS_ERR: skops->sk is NULL in extract_tuple. Cannot get ports.\n");
-        return -1;
-    }
-
     if (skops->family != AF_INET) {
-        return -1;
+        return -1; 
     }
 
-    __u16 local_port_host;
-    bpf_probe_read_kernel(&local_port_host, sizeof(local_port_host), &skops->sk->skc_num);
-    if (local_port_host == 0) {
-         bpf_printk("SOCKOPS_WARN: Read local port (skc_num) is 0 in extract_tuple.\n");
-    }
+    __u32 remote_port_host = skops->remote_port;
+    __u32 local_port_host = skops->local_port;
 
-    __be16 remote_port_net;
-    bpf_probe_read_kernel(&remote_port_net, sizeof(remote_port_net), &skops->sk->skc_dport);
-    if (remote_port_net == 0) {
-        bpf_printk("SOCKOPS_ERR: Read remote port (skc_dport) is 0 in extract_tuple. Cannot proceed.\n");
+    if (remote_port_host == 0 || local_port_host == 0) {
+        bpf_printk("SOCKOPS_ERR: Zero port detected in skops struct (L:%u, R:%u) at TCP_CONNECT_CB. Cannot create valid tuple.\n",
+                   local_port_host, remote_port_host);
         return -1;
     }
 
     tuple->src_ip = skops->local_ip4;
     tuple->dst_ip = skops->remote_ip4;
 
-    tuple->src_port = bpf_htons(local_port_host);
-    tuple->dst_port = remote_port_net;
+    tuple->src_port = bpf_htons((__u16)local_port_host);
+    tuple->dst_port = bpf_htons((__u16)remote_port_host);
 
     tuple->protocol = IPPROTO_TCP;
     tuple->padding[0] = 0; tuple->padding[1] = 0; tuple->padding[2] = 0;
@@ -48,7 +39,7 @@ static __always_inline int extract_tuple(struct bpf_sock_ops *skops, struct conn
         return -1;
     }
 
-    bpf_printk("SOCKOPS: Extracted tuple OK (from sk): %x:%u -> %x:%u\n",
+    bpf_printk("SOCKOPS: Extracted tuple OK (from skops): %x:%u -> %x:%u\n",
                bpf_ntohl(tuple->src_ip), bpf_ntohs(tuple->src_port),
                bpf_ntohl(tuple->dst_ip), bpf_ntohs(tuple->dst_port));
 
@@ -78,8 +69,9 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
     }
 
     struct connection_tuple_t tuple = {};
+
     if (extract_tuple(skops, &tuple) != 0) {
-        bpf_printk("SOCKOPS_ERR: Failed to extract tuple in TCP_CONNECT_CB using sk, skipping.\n");
+        bpf_printk("SOCKOPS_ERR: Failed to extract tuple in TCP_CONNECT_CB using skops, skipping.\n");
         return BPF_OK;
     }
 
