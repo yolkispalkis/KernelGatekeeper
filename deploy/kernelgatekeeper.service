@@ -11,17 +11,14 @@ Restart=on-failure
 RestartSec=5s
 User=root
 Group=root
-
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_BPF CAP_PERFMON
-
-# Усиление безопасности
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
-ReadWritePaths=/var/run/kernelgatekeeper.sock /var/log/kernelgatekeeper.log # Разрешить сокет и лог
+ReadWritePaths=/var/run/kernelgatekeeper.sock /var/log/kernelgatekeeper.log
 DevicePolicy=closed
 ProtectHostname=true
 ProtectClock=true
