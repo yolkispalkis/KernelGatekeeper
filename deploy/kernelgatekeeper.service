@@ -1,8 +1,8 @@
 [Unit]
 Description=KernelGatekeeper Service (BPF SockOps Manager)
-After=network-online.target cgroup.target # Depends on cgroup fs being ready
+After=network-online.target cgroup.target local-fs.target
 Wants=network-online.target
-ConditionPathExists=/sys/fs/cgroup # Basic check for cgroup fs
+ConditionPathExists=/sys/fs/cgroup
 
 [Service]
 Type=simple
@@ -12,33 +12,24 @@ RestartSec=5s
 User=root
 Group=root
 
-# Capabilities needed for BPF (load/attach/maps), cgroup attach, networking info
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_BPF CAP_PERFMON
-# CAP_SYS_ADMIN might be needed for cgroup attach or can be reduced with more specific capabilities
 
-# Security Hardening
+# Усиление безопасности
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true # Service should not need user home dirs
+ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
+ReadWritePaths=/var/run/kernelgatekeeper.sock /var/log/kernelgatekeeper.log # Разрешить сокет и лог
 DevicePolicy=closed
 ProtectHostname=true
 ProtectClock=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
-ProtectControlGroups=true # Service reads/attaches to cgroup, so cannot be fully protected? Set to false or fine-tune.
-# Let's allow read access needed for attach
-# ReadOnlyPaths=/sys/fs/cgroup
-ReadWritePaths=/var/run/kernelgatekeeper.sock /var/log/kernelgatekeeper.log # Allow socket and log
-# Restrict filesystem access further if possible
-
-RestrictAddressFamilies=AF_UNIX AF_NETLINK # Needed by BPF/Netlink? Add INET/INET6 if service needs external network.
-RestrictNamespaces=true
 RestrictRealtime=true
 SystemCallArchitectures=native
-# Consider SystemCallFilter=@system-service or more specific filters
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target
