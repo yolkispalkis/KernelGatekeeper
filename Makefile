@@ -99,13 +99,13 @@ deb: clean build
 	mkdir -p $(DEB_ROOT)/etc/kernelgatekeeper
 	mkdir -p $(DEB_ROOT)/etc/systemd/system
 	mkdir -p $(DEB_ROOT)/usr/lib/systemd/user
-	mkdir -p $(DEB_ROOT)/var/log # Каталог создаст postinst
+	mkdir -p $(DEB_ROOT)/var/log
 	mkdir -p $(DEB_ROOT)/etc/profile.d
 
 	# --- Копирование файлов приложения ---
 	cp $(DESTDIR)/$(SERVICE_BINARY) $(DEB_ROOT)/usr/local/bin/
 	cp $(DESTDIR)/$(CLIENT_BINARY) $(DEB_ROOT)/usr/local/bin/
-	cp config.yaml $(DEB_ROOT)/etc/kernelgatekeeper/config.yaml.example
+	cp config.yaml $(DEB_ROOT)/etc/kernelgatekeeper/config.yaml
 	cp deploy/kernelgatekeeper.service $(DEB_ROOT)/etc/systemd/system/
 	cp deploy/kernelgatekeeper-client.service $(DEB_ROOT)/usr/lib/systemd/user/
 
@@ -124,7 +124,7 @@ deb: clean build
 	@echo "Priority: optional" >> $(DEB_ROOT)/DEBIAN/control
 	@echo "Architecture: $(ARCH)" >> $(DEB_ROOT)/DEBIAN/control
 	@echo "Depends: libc6, adduser" >> $(DEB_ROOT)/DEBIAN/control
-	@echo "Maintainer: Your Name <your.email@example.com>" >> $(DEB_ROOT)/DEBIAN/control # ЗАМЕНИТЕ ЭТО!
+	@echo "Maintainer: Karim Zabbarov <me@w3h.su>" >> $(DEB_ROOT)/DEBIAN/control
 	@echo "Description: Transparent Kerberos proxy using eBPF sockops." >> $(DEB_ROOT)/DEBIAN/control
 	@echo " Provides transparent proxying for user applications by leveraging" >> $(DEB_ROOT)/DEBIAN/control
 	@echo " eBPF sockops/sockmap to redirect traffic and performing Kerberos" >> $(DEB_ROOT)/DEBIAN/control
