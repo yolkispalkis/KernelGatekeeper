@@ -78,7 +78,7 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
          return BPF_OK;
     }
 
-    ret = bpf_sock_map_update(skops, &proxy_sock_map, &sock_cookie, BPF_ANY);
+    ret = bpf_sock_hash_update(skops, &proxy_sock_map, &sock_cookie, BPF_ANY);
     if (ret != 0) {
         bpf_printk("SOCKOPS: Failed to update proxy_sock_map: %d\n", ret);
         bpf_map_delete_elem(&connection_map, &tuple); 
