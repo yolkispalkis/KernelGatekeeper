@@ -12,14 +12,14 @@
 
 static __always_inline int extract_tuple(struct bpf_sock_ops *skops, struct connection_tuple_t *tuple) {
     if (skops->family != AF_INET) {
-        return -1; 
+        return -1;
     }
 
     tuple->src_ip = skops->local_ip4;
     tuple->dst_ip = skops->remote_ip4;
-    tuple->src_port = bpf_htons(skops->local_port); 
+    tuple->src_port = bpf_htons(skops->local_port);
     tuple->dst_port = bpf_htons(skops->remote_port);
-    tuple->protocol = IPPROTO_TCP; 
+    tuple->protocol = IPPROTO_TCP;
     tuple->padding[0] = 0; tuple->padding[1] = 0; tuple->padding[2] = 0;
 
     if (tuple->src_port == 0 || tuple->dst_port == 0) {
@@ -52,10 +52,9 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
         return BPF_OK;
     }
 
-    __u16 dst_port_h = skops->remote_port; 
+    __u16 dst_port_h = skops->remote_port;
     __u8 *target = bpf_map_lookup_elem(&target_ports, &dst_port_h);
     if (!target || *target != 1) {
-
         return BPF_OK;
     }
 
@@ -68,31 +67,28 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
     int ret = bpf_map_update_elem(&connection_map, &tuple, &new_state, BPF_ANY);
     if (ret != 0) {
         bpf_printk("SOCKOPS: Failed to update connection_map: %d\n", ret);
-        return BPF_OK; 
+        return BPF_OK;
     }
 
     __u32 sock_cookie = bpf_get_socket_cookie(skops);
     if (sock_cookie == 0) {
          bpf_printk("SOCKOPS: Failed to get socket cookie\n");
-         bpf_map_delete_elem(&connection_map, &tuple); 
+         bpf_map_delete_elem(&connection_map, &tuple);
          return BPF_OK;
     }
 
-    ret = bpf_sock_hash_update(skops, &proxy_sock_map, &sock_cookie, BPF_ANY);
+    ret = bpf_sock_map_update(skops, &proxy_sock_map, &sock_cookie, BPF_ANY);
     if (ret != 0) {
-        bpf_printk("SOCKOPS: Failed to update proxy_sock_map: %d\n", ret);
-        bpf_map_delete_elem(&connection_map, &tuple); 
+        bpf_printk("SOCKOPS: Failed to update proxy_sock_map (sockmap): %d\n", ret);
+        bpf_map_delete_elem(&connection_map, &tuple);
         return BPF_OK;
     }
-    bpf_printk("SOCKOPS: Socket %u added to proxy_sock_map\n", sock_cookie);
+    bpf_printk("SOCKOPS: Socket %u added to proxy_sock_map (sockmap)\n", sock_cookie);
 
-    struct connection_tuple_t *event_data = bpf_ringbuf_reserve(&notification_ringbuf, sizeof(struct connection_tuple_t), 0);
+    struct connection_tuple_t *event_data = bpf_ringbuf_reserve(¬ification_ringbuf, sizeof(struct connection_tuple_t), 0);
     if (!event_data) {
-
         bpf_printk("SOCKOPS: Failed to reserve space in ringbuf\n");
-
     } else {
-
         __builtin_memcpy(event_data, &tuple, sizeof(struct connection_tuple_t));
         bpf_ringbuf_submit(event_data, 0);
         bpf_printk("SOCKOPS: Sent notification for tuple to ringbuf\n");
@@ -101,12 +97,10 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
      __u32 stats_key_matched = 1;
      struct global_stats_t *stats = bpf_map_lookup_elem(&global_stats, &stats_key_matched);
      if (stats) {
-
          __sync_fetch_and_add(&stats->packets, 1);
-
      }
 
-    return BPF_OK; 
+    return BPF_OK;
 }
 
 char _license[] SEC("license") = "GPL";
