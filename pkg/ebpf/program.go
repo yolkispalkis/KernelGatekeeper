@@ -112,9 +112,9 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan NotificationTuple) (*B
 		},
 	}
 
-	var loadedSockopsMaps bpfSockopsMaps
-	var loadedSockopsPrograms bpfSockopsPrograms
-	var loadedSkmsgPrograms bpfSkmsgPrograms
+	var loadedSockopsMaps bpf_sockopsMaps
+	var loadedSockopsPrograms bpf_sockopsPrograms
+	var loadedSkmsgPrograms bpf_skmsgPrograms
 
 	if err := specSockops.LoadAndAssign(&loadedSockopsMaps, opts); err != nil {
 		var verr *ebpf.VerifierError
