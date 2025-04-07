@@ -1,0 +1,25 @@
+[Unit]
+Description=KernelGatekeeper Client-Side Proxy Listener (SockOps Model)
+# Запускается после сети и системного сервиса
+After=network-online.target kernelgatekeeper.service
+# Требует, чтобы системный сервис был запущен
+Requires=kernelgatekeeper.service
+# Хочет, чтобы сеть была онлайн (не блокирует запуск, но желательно)
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Путь к бинарнику при установке пакета
+ExecStart=/usr/local/bin/kernelgatekeeper-client -socket=/var/run/kernelgatekeeper.sock
+Restart=on-failure
+RestartSec=5s
+# Environment="LOG_LEVEL=debug" # Для отладки
+
+# Ограничения прав (обычно не нужны специфичные для клиента)
+AmbientCapabilities=
+CapabilityBoundingSet=
+
+[Install]
+# Включаем юнит в стандартную цель пользовательского сеанса
+# Это обычно охватывает и графические, и SSH сеансы, где запускается systemd --user
+WantedBy=default.target
