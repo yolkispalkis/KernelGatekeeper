@@ -32,8 +32,10 @@ struct {
 } connection_map SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_SOCKMAP);
-	__uint(max_entries, 8192);
+    __uint(type, BPF_MAP_TYPE_SOCKMAP);
+    __uint(max_entries, 8192);
+    __type(key, __u32);
+    __type(value, __u32); 
 } proxy_sock_map SEC(".maps");
 
 struct {
