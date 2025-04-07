@@ -66,7 +66,7 @@ endif
 clean:
 	@echo "Cleaning up..."
 	rm -rf $(DESTDIR) $(DEB_ROOT) $(DEB_FILENAME)
-	rm -f $(BPF_OUTPUT_DIR)/bpf_skmsg_bpf.go $(BPF_OUTPUT_DIR)/bpf_sockops_bpf.go $(BPF_OUTPUT_DIR)/*.o
+	rm -f pkg/ebpf/bpf_skmsg_bpf.go pkg/ebpf/bpf_sockops_bpf.go pkg/ebpf/*.o
 	$(GO_CMD) clean
 
 # --- Установка (ручная, для разработки) ---
