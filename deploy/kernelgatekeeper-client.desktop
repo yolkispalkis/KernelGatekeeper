@@ -1,0 +1,24 @@
+[Unit]
+Description=KernelGatekeeper Client-Side Proxy Listener (SockOps Model)
+After=network.target network-online.target kernelgatekeeper.service
+Wants=network-online.target
+Requires=kernelgatekeeper.service # Make sure system service is running
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/kernelgatekeeper-client -socket=/var/run/kernelgatekeeper.sock
+Restart=on-failure
+RestartSec=5s
+# Add environment variables if needed for debugging or specific configs
+# Environment="LOG_LEVEL=debug"
+
+# Client runs as the user, no special capabilities needed usually
+AmbientCapabilities=
+CapabilityBoundingSet=
+
+# User service specific settings
+# TimeoutStartSec=
+# TimeoutStopSec=
+
+[Install]
+WantedBy=default.target # Start on user login
