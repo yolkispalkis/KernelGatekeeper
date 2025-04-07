@@ -1,4 +1,3 @@
-// cmd/client/main.go
 package main
 
 import (
@@ -16,7 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"reflect" // Added for DeepEqual
+	"reflect"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -45,7 +44,7 @@ var (
 	globalProxyMgr     *proxy.ProxyManager
 	globalShutdownOnce sync.Once
 	globalWg           sync.WaitGroup
-	workerSemaphore    *semaphore.Weighted = semaphore.NewWeighted(100) // Limit concurrent handlers
+	workerSemaphore    *semaphore.Weighted = semaphore.NewWeighted(100)
 )
 
 const (
@@ -90,23 +89,37 @@ func main() {
 		})
 	}()
 
+	var ipcConn net.Conn
 	var err error
-	var initialConfig *config.Config
 	for i := 0; i < 5; i++ {
-		initialConfig, err = getConfigFromServer(flags)
+		ipcConn, err = connectToService(flags.socketPath, flags.connectTimeout)
 		if err == nil {
 			break
 		}
-		slog.Warn("Failed get config, retrying...", "attempt", i+1, "error", err)
+		slog.Warn("Failed connect to service IPC, retrying...", "attempt", i+1, "error", err)
 		select {
 		case <-time.After(5 * time.Second):
 		case <-ctx.Done():
-			slog.Error("Context cancelled during init")
+			slog.Error("Context cancelled during initial service connection")
 			os.Exit(1)
 		}
 	}
 	if err != nil {
-		slog.Error("Giving up fetching config. Exiting.", "error", err)
+		slog.Error("Giving up connecting to service IPC. Exiting.", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("Connected to service IPC", "socket", flags.socketPath)
+
+	if err := registerWithService(ipcConn); err != nil {
+		slog.Error("Failed register with service", "error", err)
+		ipcConn.Close()
+		os.Exit(1)
+	}
+
+	initialConfig, err := getConfigOverIPC(ipcConn, flags.connectTimeout)
+	if err != nil {
+		slog.Error("Failed get config from service after registration", "error", err)
+		ipcConn.Close()
 		os.Exit(1)
 	}
 	setConfig(initialConfig)
@@ -128,39 +141,30 @@ func main() {
 	listener, err := net.Listen("tcp", listenAddress)
 	if err != nil {
 		slog.Error("Failed start local listener", "address", listenAddress, "error", err)
+		ipcConn.Close()
 		os.Exit(1)
 	}
 	defer listener.Close()
 	slog.Info("Started local listener", "address", listenAddress)
 
-	ipcConn, err := connectToService(flags.socketPath, flags.connectTimeout)
-	if err != nil {
-		slog.Error("Failed connect to service IPC", "socket", flags.socketPath, "error", err)
-		os.Exit(1)
-	}
-	if err := registerWithService(ipcConn); err != nil {
-		slog.Error("Failed register with service", "error", err)
-		ipcConn.Close()
-		os.Exit(1)
-	}
-
 	globalWg.Add(1)
-	go listenIPCNotifications(ctx, ipcConn, listener, flags) // Pass flags for reconnect
+	go listenIPCNotifications(ctx, ipcConn, listener, flags)
 	globalWg.Add(1)
-	go runBackgroundTasks(ctx, &globalWg, flags)
+	go runBackgroundTasks(ctx, &globalWg, flags, ipcConn) // Pass ipcConn for config refresh
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	slog.Info("Client running. Waiting for connections and signals.")
+
 	select {
 	case sig := <-sigCh:
 		slog.Info("Received signal, shutting down...", "signal", sig)
 	case <-ctx.Done():
 		slog.Info("Context cancelled, shutting down...")
 	}
-	cancel()         // Signal background tasks via context
-	listener.Close() // Close listener to unblock accept
-	ipcConn.Close()  // Close IPC
+	cancel()
+	listener.Close()
+	ipcConn.Close()
 }
 
 func parseFlags() clientFlags {
@@ -206,34 +210,39 @@ func connectToService(socketPath string, timeout time.Duration) (net.Conn, error
 	return conn, nil
 }
 
-func getConfigFromServer(flags clientFlags) (*config.Config, error) {
-	conn, err := connectToService(flags.socketPath, flags.connectTimeout)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
+func getConfigOverIPC(conn net.Conn, timeout time.Duration) (*config.Config, error) {
 	cmd, err := ipc.NewCommand("get_config", nil)
 	if err != nil {
-		return nil, fmt.Errorf("create cmd: %w", err)
+		return nil, fmt.Errorf("create get_config cmd: %w", err)
 	}
 	encoder := json.NewEncoder(conn)
 	if err := encoder.Encode(cmd); err != nil {
-		return nil, fmt.Errorf("send cmd: %w", err)
+		if isConnectionClosedErr(err) {
+			return nil, fmt.Errorf("IPC connection closed before sending get_config: %w", err)
+		}
+		return nil, fmt.Errorf("send get_config cmd: %w", err)
 	}
-	conn.SetReadDeadline(time.Now().Add(flags.connectTimeout))
+
+	conn.SetReadDeadline(time.Now().Add(timeout))
 	decoder := json.NewDecoder(conn)
 	var resp ipc.Response
 	if err := decoder.Decode(&resp); err != nil {
-		return nil, fmt.Errorf("decode resp: %w", err)
+		conn.SetReadDeadline(time.Time{})
+		if isConnectionClosedErr(err) {
+			return nil, fmt.Errorf("IPC connection closed while waiting for get_config response: %w", err)
+		}
+		return nil, fmt.Errorf("decode get_config resp: %w", err)
 	}
+	conn.SetReadDeadline(time.Time{})
+
 	if resp.Status != ipc.StatusOK {
 		return nil, fmt.Errorf("service error: %s", resp.Error)
 	}
 	var data ipc.GetConfigData
 	if err := ipc.DecodeData(resp.Data, &data); err != nil {
-		return nil, fmt.Errorf("decode data: %w", err)
+		return nil, fmt.Errorf("decode config data from response: %w", err)
 	}
-	slog.Debug("Got config from service.")
+	slog.Debug("Got config from service via IPC.")
 	return &data.Config, nil
 }
 
@@ -246,15 +255,24 @@ func registerWithService(ipcConn net.Conn) error {
 	}
 	encoder := json.NewEncoder(ipcConn)
 	if err := encoder.Encode(cmd); err != nil {
+		if isConnectionClosedErr(err) {
+			return fmt.Errorf("IPC connection closed before sending register_client: %w", err)
+		}
 		return fmt.Errorf("send register cmd: %w", err)
 	}
+
 	ipcConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	decoder := json.NewDecoder(ipcConn)
 	var resp ipc.Response
 	if err := decoder.Decode(&resp); err != nil {
+		ipcConn.SetReadDeadline(time.Time{})
+		if isConnectionClosedErr(err) {
+			return fmt.Errorf("IPC connection closed while waiting for register_client response: %w", err)
+		}
 		return fmt.Errorf("decode register resp: %w", err)
 	}
 	ipcConn.SetReadDeadline(time.Time{})
+
 	if resp.Status != ipc.StatusOK {
 		return fmt.Errorf("service registration failed: %s", resp.Error)
 	}
@@ -265,12 +283,21 @@ func registerWithService(ipcConn net.Conn) error {
 func listenIPCNotifications(ctx context.Context, initialIPCConn net.Conn, localListener net.Listener, flags clientFlags) {
 	defer globalWg.Done()
 	var ipcConn net.Conn = initialIPCConn
+	var decoder *json.Decoder
+	if ipcConn != nil {
+		decoder = json.NewDecoder(ipcConn)
+	}
+
 	defer func() {
 		if ipcConn != nil {
 			ipcConn.Close()
 		}
 	}()
+
 	slog.Info("Listening for IPC notifications...")
+	reconnectTicker := time.NewTicker(10 * time.Second)
+	defer reconnectTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -278,42 +305,53 @@ func listenIPCNotifications(ctx context.Context, initialIPCConn net.Conn, localL
 			return
 		default:
 		}
+
 		if ipcConn == nil {
-			slog.Info("Attempting IPC reconnect...")
-			var err error
-			ipcConn, err = connectToService(flags.socketPath, flags.connectTimeout)
-			if err != nil {
-				slog.Error("IPC reconnect failed, retrying...", "error", err)
-				select {
-				case <-time.After(10 * time.Second):
+			select {
+			case <-reconnectTicker.C:
+				slog.Info("Attempting IPC reconnect...")
+				var err error
+				ipcConn, err = connectToService(flags.socketPath, flags.connectTimeout)
+				if err != nil {
+					slog.Error("IPC reconnect failed, will retry...", "error", err)
+					ipcConn = nil
 					continue
-				case <-ctx.Done():
-					return
 				}
+				if err := registerWithService(ipcConn); err != nil {
+					slog.Error("IPC re-register failed after reconnect", "error", err)
+					ipcConn.Close()
+					ipcConn = nil
+					continue
+				}
+				slog.Info("IPC reconnected and re-registered.")
+				decoder = json.NewDecoder(ipcConn)
+			case <-ctx.Done():
+				return
 			}
-			if err := registerWithService(ipcConn); err != nil {
-				slog.Error("IPC re-register failed", "error", err)
-				ipcConn.Close()
-				ipcConn = nil
-				time.Sleep(5 * time.Second)
-				continue
-			}
-			slog.Info("IPC reconnected and re-registered.")
 		}
-		decoder := json.NewDecoder(ipcConn)
+
+		if decoder == nil {
+			slog.Error("IPC decoder is nil despite connection existing, attempting reconnect")
+			ipcConn.Close()
+			ipcConn = nil
+			continue
+		}
+
 		var cmd ipc.Command
 		err := decoder.Decode(&cmd)
 		if err != nil {
 			slog.Warn("Error decoding IPC or connection lost", "error", err)
 			ipcConn.Close()
 			ipcConn = nil
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-				slog.Info("IPC connection closed, will reconnect.")
+			decoder = nil
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || isConnectionClosedErr(err) {
+				slog.Info("IPC connection closed, will attempt reconnect.")
 			} else {
-				slog.Warn("Decoding error, reconnecting.")
+				slog.Warn("Unexpected decoding error, will attempt reconnect.", "error", err)
 			}
 			continue
 		}
+
 		if cmd.Command == "notify_accept" {
 			var data ipc.NotifyAcceptData
 			if err := ipc.DecodeData(cmd.Data, &data); err != nil {
@@ -324,7 +362,7 @@ func listenIPCNotifications(ctx context.Context, initialIPCConn net.Conn, localL
 			acceptedConn, err := localListener.Accept()
 			if err != nil {
 				if errors.Is(err, net.ErrClosed) {
-					slog.Info("Local listener closed.")
+					slog.Info("Local listener closed, stopping IPC listener.")
 					return
 				}
 				slog.Error("Accept BPF connection failed", "error", err)
@@ -332,7 +370,11 @@ func listenIPCNotifications(ctx context.Context, initialIPCConn net.Conn, localL
 			}
 			slog.Debug("Accepted connection from BPF sockmap", "local", acceptedConn.LocalAddr(), "remote", acceptedConn.RemoteAddr())
 			if err := workerSemaphore.Acquire(ctx, 1); err != nil {
-				slog.Error("Acquire worker semaphore failed", "error", err)
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					slog.Info("Worker semaphore acquire cancelled or timed out during shutdown")
+				} else {
+					slog.Error("Acquire worker semaphore failed", "error", err)
+				}
 				acceptedConn.Close()
 				continue
 			}
@@ -354,11 +396,12 @@ func handleAcceptedConnection(acceptedConn net.Conn, originalDest ipc.NotifyAcce
 	slog.Info("Handling proxied connection", "orig_dst", targetAddr)
 	effectiveProxyURL := globalProxyMgr.GetEffectiveProxyURL()
 	if effectiveProxyURL == nil {
-		slog.Error("No effective proxy URL", "orig_dst", targetAddr)
+		slog.Error("No effective proxy URL available", "orig_dst", targetAddr)
 		return
 	}
-	// Convert int seconds from config to time.Duration
-	proxyDialer := net.Dialer{Timeout: time.Duration(getConfig().Proxy.ConnectionTimeout) * time.Second}
+
+	cfg := getConfig()
+	proxyDialer := net.Dialer{Timeout: time.Duration(cfg.Proxy.ConnectionTimeout) * time.Second}
 	proxyConn, err := proxyDialer.Dial("tcp", effectiveProxyURL.Host)
 	if err != nil {
 		slog.Error("Failed connect to real proxy", "proxy", effectiveProxyURL.Host, "error", err)
@@ -366,14 +409,16 @@ func handleAcceptedConnection(acceptedConn net.Conn, originalDest ipc.NotifyAcce
 	}
 	defer proxyConn.Close()
 	slog.Debug("Connected to real proxy", "proxy", effectiveProxyURL.Host)
+
 	if err := establishConnectTunnel(proxyConn, targetAddr, globalKerbClient); err != nil {
 		slog.Error("Failed establish CONNECT tunnel", "target", targetAddr, "proxy", effectiveProxyURL.Host, "error", err)
 		return
 	}
 	slog.Debug("CONNECT tunnel established", "target", targetAddr)
+
 	slog.Debug("Starting data relay", "target", targetAddr)
 	err = relayDataBidirectionally(acceptedConn, proxyConn)
-	if err != nil {
+	if err != nil && !isConnectionClosedErr(err) {
 		slog.Warn("Data relay ended with error", "target", targetAddr, "error", err)
 	} else {
 		slog.Debug("Data relay completed", "target", targetAddr)
@@ -384,41 +429,46 @@ func establishConnectTunnel(proxyConn net.Conn, targetAddr string, krbClient *ke
 	slog.Debug("Establishing CONNECT tunnel", "target", targetAddr)
 	connectReq := &http.Request{Method: "CONNECT", URL: &url.URL{Opaque: targetAddr}, Host: targetAddr, Header: make(http.Header)}
 	connectReq.Header.Set("User-Agent", "KernelGatekeeper-Client/1.0")
-	var err error
+
+	// Declare error variables needed later, before the krbClient check
+	var kerr error
+	var spnegoErr error
 	var spnegoTransport http.RoundTripper
+
 	if krbClient != nil {
-		// Call exported method
-		if kerr := krbClient.CheckAndRefreshClient(); kerr != nil {
-			slog.Warn("Kerberos ticket potentially invalid", "error", kerr)
-		} else {
-			// Note: The RoundTrip call here is a bit of a hack to pre-populate headers.
-			// SPNEGO usually works on the response (407) from the proxy.
-			// Using a nil dialer prevents actual connection attempts by the transport itself.
-			baseTransport := &http.Transport{
-				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					// This dialer should *only* be used for the SPNEGO header generation,
-					// not for the actual proxy connection (which is already established).
-					return nil, errors.New("dial disabled for SPNEGO prep")
-				},
-			}
-			spnegoTransport, err = krbClient.CreateProxyTransport(baseTransport)
-			if err != nil {
-				slog.Warn("Failed create SPNEGO transport", "error", err)
-				spnegoTransport = nil
-			}
+		// Assign to the pre-declared kerr
+		kerr = krbClient.CheckAndRefreshClient()
+		if kerr != nil {
+			slog.Warn("Kerberos ticket potentially invalid before CONNECT", "error", kerr)
+			// Do not return here, allow attempt without SPNEGO maybe
+		}
+
+		baseTransport := &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return nil, errors.New("dial disabled for SPNEGO prep")
+			},
+		}
+		// Assign to pre-declared spnegoTransport and spnegoErr
+		spnegoTransport, spnegoErr = krbClient.CreateProxyTransport(baseTransport)
+		if spnegoErr != nil {
+			slog.Warn("Failed create SPNEGO transport for CONNECT", "error", spnegoErr)
+			spnegoTransport = nil // Ensure it's nil if creation failed
 		}
 	}
+
 	const maxAuthAttempts = 2
 	var resp *http.Response
+	cfg := getConfig()
+
 	for attempt := 1; attempt <= maxAuthAttempts; attempt++ {
 		currentReq := connectReq.Clone(context.Background())
-		if spnegoTransport != nil {
+
+		// Check spnegoErr here, not kerr
+		if spnegoTransport != nil && spnegoErr == nil {
 			prepCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			// Use the SPNEGO transport to *modify* the request headers
+			// Use a separate variable for RoundTrip error to avoid shadowing
 			_, rtErr := spnegoTransport.RoundTrip(currentReq.WithContext(prepCtx))
 			cancel()
-			// Expect "dial disabled" error as the transport's dialer is nilled.
-			// Any other error during header preparation is potentially problematic.
 			if rtErr != nil && !strings.Contains(rtErr.Error(), "dial disabled") {
 				slog.Warn("SPNEGO prep error (ignoring dial disabled)", "error", rtErr)
 			}
@@ -427,51 +477,57 @@ func establishConnectTunnel(proxyConn net.Conn, targetAddr string, krbClient *ke
 				slog.Warn("SPNEGO did not add Proxy-Authorization header on retry")
 			}
 		}
-		if err = currentReq.Write(proxyConn); err != nil {
-			if isConnectionClosedErr(err) {
-				return fmt.Errorf("proxy conn closed before CONNECT write: %w", err)
+
+		// Declare and use specific error variables for Write and ReadResponse
+		var writeErr error
+		writeErr = currentReq.Write(proxyConn)
+		if writeErr != nil {
+			if isConnectionClosedErr(writeErr) {
+				return fmt.Errorf("proxy conn closed before CONNECT write (attempt %d): %w", attempt, writeErr)
 			}
-			return fmt.Errorf("send CONNECT failed (attempt %d): %w", attempt, err)
+			return fmt.Errorf("send CONNECT failed (attempt %d): %w", attempt, writeErr)
 		}
-		// Convert int seconds from config to time.Duration
-		deadline := time.Now().Add(time.Duration(getConfig().Proxy.RequestTimeout) * time.Second)
+
+		deadline := time.Now().Add(time.Duration(cfg.Proxy.RequestTimeout) * time.Second)
 		proxyConn.SetReadDeadline(deadline)
 		proxyReader := bufio.NewReader(proxyConn)
-		resp, err = http.ReadResponse(proxyReader, currentReq)
+
+		var readErr error
+		resp, readErr = http.ReadResponse(proxyReader, currentReq)
 		proxyConn.SetReadDeadline(time.Time{})
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				return fmt.Errorf("timeout reading CONNECT resp (attempt %d): %w", attempt, err)
+
+		if readErr != nil {
+			if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+				return fmt.Errorf("timeout reading CONNECT resp (attempt %d): %w", attempt, readErr)
 			}
-			// If EOF happens before getting a response, especially on retry, proxy might have closed conn.
-			if errors.Is(err, io.EOF) { // Removed check `&& resp == nil && attempt < maxAuthAttempts` as resp might be non-nil but incomplete
-				return fmt.Errorf("proxy closed conn unexpectedly after CONNECT write (attempt %d): %w", attempt, err)
+			if errors.Is(readErr, io.EOF) || isConnectionClosedErr(readErr) {
+				return fmt.Errorf("proxy closed conn unexpectedly after CONNECT write (attempt %d): %w", attempt, readErr)
 			}
-			return fmt.Errorf("read CONNECT resp failed (attempt %d): %w", attempt, err)
+			return fmt.Errorf("read CONNECT resp failed (attempt %d): %w", attempt, readErr)
 		}
+
 		if resp.StatusCode == http.StatusOK {
 			resp.Body.Close()
+			slog.Debug("CONNECT tunnel established successfully", "target", targetAddr)
 			return nil
 		}
+
 		if resp.StatusCode == http.StatusProxyAuthRequired && attempt < maxAuthAttempts && spnegoTransport != nil {
 			slog.Info("Received 407 Proxy Auth Required, will retry with SPNEGO", "attempt", attempt)
-			// The SPNEGO transport should handle the 407 response headers in the next RoundTrip call.
-			// We just need to loop again.
 			resp.Body.Close()
-			// Potentially extract WWW-Authenticate header here if needed for debugging
-			// wwwAuth := resp.Header.Get("Proxy-Authenticate")
-			// slog.Debug("Received Proxy-Authenticate header", "header", wwwAuth)
 			continue
 		}
-		// Handle other errors or final failure
+
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		resp.Body.Close()
+		// Define errMsg here for this specific failure case
 		errMsg := fmt.Sprintf("proxy CONNECT failed (attempt %d): %s (%s)", attempt, resp.Status, strings.TrimSpace(string(bodyBytes)))
 		return errors.New(errMsg)
 	}
-	// If loop finishes without success
+
+	// Define errMsg here for the "max attempts reached" case
 	errMsg := fmt.Sprintf("failed establish CONNECT tunnel after %d attempts", maxAuthAttempts)
-	if resp != nil {
+	if resp != nil { // resp might be non-nil from the last failed attempt
 		errMsg = fmt.Sprintf("%s, last status: %s", errMsg, resp.Status)
 	}
 	return errors.New(errMsg)
@@ -481,35 +537,32 @@ func relayDataBidirectionally(conn1, conn2 net.Conn) error {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	errChan := make(chan error, 2)
+
 	copyData := func(dst, src net.Conn, tag string) {
 		defer wg.Done()
-		// Use a larger buffer? Default is 32KB which should be fine.
-		buf := make([]byte, 32*1024) // io.Copy uses 32KB buffer by default
+		buf := make([]byte, 32*1024)
 		copied, err := io.CopyBuffer(dst, src, buf)
 		slog.Debug("Relay copy finished", "tag", tag, "bytes", copied)
 		if err != nil && !isConnectionClosedErr(err) {
 			select {
 			case errChan <- fmt.Errorf("%s copy failed: %w", tag, err):
-			default: // Avoid blocking if channel is full (shouldn't happen with size 2)
+			default:
 			}
 		}
-		// Signal peer that we are done writing.
-		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
-			cw.CloseWrite()
-		} else if tcpDst, ok := dst.(*net.TCPConn); ok {
-			tcpDst.CloseWrite()
+		if tcpDst, ok := dst.(*net.TCPConn); ok {
+			_ = tcpDst.CloseWrite() // Ignore error for CloseWrite
 		} else {
-			// Fallback: Close the whole connection if CloseWrite isn't available.
-			// This might prematurely close the read side if the peer is still sending.
-			// dst.Close()
-			slog.Debug("Could not CloseWrite on destination", "tag", tag, "type", reflect.TypeOf(dst))
+			slog.Debug("Could not CloseWrite on destination (non-TCP or unsupported)", "tag", tag, "type", reflect.TypeOf(dst))
 		}
 	}
+
 	go copyData(conn1, conn2, "proxy->client(bpf)")
 	go copyData(conn2, conn1, "client(bpf)->proxy")
+
 	wg.Wait()
 	close(errChan)
-	// Return the first error encountered, if any
+
+	// Return the first non-nil error if any
 	for err := range errChan {
 		if err != nil {
 			return err
@@ -522,84 +575,113 @@ func isConnectionClosedErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	// Check for standard closed connection errors
 	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
 		return true
 	}
-	// Check for specific error strings that indicate a closed connection
 	errMsg := err.Error()
-	if strings.Contains(errMsg, "use of closed network connection") || strings.Contains(errMsg, "broken pipe") || strings.Contains(errMsg, "connection reset by peer") {
+	if strings.Contains(errMsg, "use of closed network connection") ||
+		strings.Contains(errMsg, "broken pipe") ||
+		strings.Contains(errMsg, "connection reset by peer") ||
+		strings.Contains(errMsg, "forcibly closed by the remote host") || // Windows specific
+		strings.Contains(errMsg, "socket is not connected") {
 		return true
 	}
-	// Check OpError for closed connection specifically
 	if opErr, ok := err.(*net.OpError); ok {
-		if opErr.Err != nil {
-			errMsg := opErr.Err.Error()
-			if strings.Contains(errMsg, "use of closed network connection") {
+		if sysErr, ok := opErr.Err.(*os.SyscallError); ok {
+			if errors.Is(sysErr.Err, syscall.EPIPE) || errors.Is(sysErr.Err, syscall.ECONNRESET) || errors.Is(sysErr.Err, syscall.ENOTCONN) {
 				return true
 			}
-			// Check underlying syscall errors wrapped in OpError
-			if sysErr, ok := opErr.Err.(*os.SyscallError); ok {
-				if errors.Is(sysErr.Err, syscall.EPIPE) || errors.Is(sysErr.Err, syscall.ECONNRESET) {
-					return true
-				}
-			}
+		}
+		// Check for the specific string within OpError as well
+		if opErr.Err != nil && opErr.Err.Error() == "use of closed network connection" {
+			return true
 		}
 	}
 	return false
 }
 
-func runBackgroundTasks(ctx context.Context, wg *sync.WaitGroup, flags clientFlags) {
+func runBackgroundTasks(ctx context.Context, wg *sync.WaitGroup, flags clientFlags, ipcConn net.Conn) {
 	defer wg.Done()
 	configRefreshTicker := time.NewTicker(15 * time.Minute)
 	defer configRefreshTicker.Stop()
 	kerbCheckTicker := time.NewTicker(5 * time.Minute)
 	defer kerbCheckTicker.Stop()
+
+	// Use a mutex to protect access to ipcConn, as it can be nilled by listenIPCNotifications
+	var ipcConnMu sync.Mutex
+
+	// Goroutine to handle potential niling of ipcConn by listener
+	go func() {
+		<-ctx.Done() // Wait for context cancellation
+		ipcConnMu.Lock()
+		if ipcConn != nil {
+			// It's generally safer not to close the connection here,
+			// let the main shutdown or the listener handle it.
+			// ipcConn.Close()
+		}
+		ipcConn = nil // Ensure it's nil on shutdown
+		ipcConnMu.Unlock()
+	}()
+
 	for {
 		select {
 		case <-configRefreshTicker.C:
 			slog.Debug("Refreshing config from service...")
-			newCfg, err := getConfigFromServer(flags)
+
+			ipcConnMu.Lock()
+			currentIPCConn := ipcConn // Get current connection under lock
+			ipcConnMu.Unlock()
+
+			if currentIPCConn == nil { // Check if connection is still valid
+				slog.Warn("Cannot refresh config, IPC connection is nil (likely disconnected).")
+				continue // Skip refresh attempt
+			}
+
+			// Perform IPC operation with the captured connection reference
+			newCfg, err := getConfigOverIPC(currentIPCConn, flags.connectTimeout)
 			if err != nil {
 				slog.Warn("Failed refresh config", "error", err)
-				continue
+				if isConnectionClosedErr(err) {
+					// Don't close connection here, listener goroutine handles reconnects
+					slog.Warn("Config refresh failed due to closed IPC connection.")
+				}
+				continue // Skip update if refresh failed
 			}
-			globalConfigMu.Lock()
-			configChanged := globalConfig == nil || !reflect.DeepEqual(globalConfig.Proxy, newCfg.Proxy) || !reflect.DeepEqual(globalConfig.Kerberos, newCfg.Kerberos)
-			if configChanged {
-				// Only update if changed to avoid unnecessary re-init
-				globalConfig = newCfg
-			}
-			globalConfigMu.Unlock()
+
+			// Compare and apply the new config (no IPC needed here)
+			currentCfg := getConfig()
+			configChanged := !reflect.DeepEqual(currentCfg.Proxy, newCfg.Proxy) || !reflect.DeepEqual(currentCfg.Kerberos, newCfg.Kerberos)
 
 			if configChanged {
 				slog.Info("Config changed, re-initializing proxy/kerberos...")
+				setConfig(newCfg) // Update global config
+
 				// Re-init Proxy Manager
 				if globalProxyMgr != nil {
-					globalProxyMgr.Close() // Close old manager first
+					globalProxyMgr.Close()
 				}
-				newProxyMgr, err := proxy.NewProxyManager(&newCfg.Proxy)
-				if err != nil {
-					slog.Error("Failed re-init proxy manager", "error", err)
+				newProxyMgr, proxyErr := proxy.NewProxyManager(&newCfg.Proxy) // Use separate error var
+				if proxyErr != nil {
+					slog.Error("Failed re-init proxy manager after config refresh", "error", proxyErr)
 				} else {
-					globalProxyMgr = newProxyMgr // Assign new manager
+					globalProxyMgr = newProxyMgr
+					slog.Info("Proxy manager re-initialized.")
 				}
 
 				// Re-init or check Kerberos
 				if globalKerbClient != nil {
-					// Check if Kerberos config actually changed significantly
-					// For now, always check/refresh if any config changed
-					// Call exported method
-					if err := globalKerbClient.CheckAndRefreshClient(); err != nil {
-						slog.Warn("Failed Kerberos refresh on config change", "error", err)
+					if krbErr := globalKerbClient.CheckAndRefreshClient(); krbErr != nil { // Use separate error var
+						slog.Warn("Failed Kerberos refresh on config change", "error", krbErr)
+					} else {
+						slog.Info("Kerberos client refreshed/checked.")
 					}
 				} else {
-					// Initialize Kerberos if it wasn't before
-					newKerbClient, err := kerb.NewKerberosClient(&newCfg.Kerberos)
-					if err != nil {
-						slog.Error("Failed initial Kerberos init on config change", "error", err)
+					newKerbClient, krbErr := kerb.NewKerberosClient(&newCfg.Kerberos) // Use separate error var
+					if krbErr != nil {
+						slog.Error("Failed initial Kerberos init on config change", "error", krbErr)
 					} else {
-						globalKerbClient = newKerbClient // Assign new client
+						globalKerbClient = newKerbClient
+						slog.Info("Kerberos client initialized.")
 					}
 				}
 			} else {
@@ -608,7 +690,6 @@ func runBackgroundTasks(ctx context.Context, wg *sync.WaitGroup, flags clientFla
 		case <-kerbCheckTicker.C:
 			if globalKerbClient != nil {
 				slog.Debug("Checking Kerberos ticket...")
-				// Call exported method
 				if err := globalKerbClient.CheckAndRefreshClient(); err != nil {
 					slog.Warn("Periodic Kerberos check/refresh failed", "error", err)
 				}
@@ -625,18 +706,15 @@ func setConfig(cfg *config.Config) {
 	globalConfig = cfg
 	globalConfigMu.Unlock()
 }
+
 func getConfig() config.Config {
 	globalConfigMu.RLock()
 	defer globalConfigMu.RUnlock()
 	if globalConfig == nil {
-		// Return a default config or handle error appropriately
 		slog.Error("Attempted to get config before initialization")
-		return config.Config{} // Return zero value config
+		return config.Config{}
 	}
-	// Return a deep copy to prevent race conditions if the caller modifies the config
 	cfgCopy := *globalConfig
-	// Deep copy slices/maps if necessary, though current fields are value types or pointers managed elsewhere
-	// Example: cfgCopy.EBPF.TargetPorts = append([]int{}, globalConfig.EBPF.TargetPorts...)
 	return cfgCopy
 }
 
