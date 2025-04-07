@@ -98,7 +98,7 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
     }
     bpf_printk("SOCKOPS: Socket cookie %u added to proxy_sock_map (sockmap)\n", sock_cookie);
 
-    struct connection_tuple_t *event_data = bpf_ringbuf_reserve(¬ification_ringbuf, sizeof(struct connection_tuple_t), 0);
+    struct connection_tuple_t *event_data = bpf_ringbuf_reserve(&notification_ringbuf, sizeof(struct connection_tuple_t), 0);
     if (!event_data) {
         bpf_printk("SOCKOPS_ERR: Failed to reserve space in ringbuf for notification\n");
     } else {
