@@ -381,7 +381,7 @@ func (s *Service) handleIPCConnection(conn net.Conn) {
 			return
 		}
 		slog.Info("Received IPC command", "command", cmd.Command, "client", clientAddr)
-		resp, err := s.processIPCCommand(conn, &cmd, &clientUID, ®istered)
+		resp, err := s.processIPCCommand(conn, &cmd, &clientUID, &registered)
 		if err != nil {
 			resp = ipc.NewErrorResponse(err.Error())
 		}
