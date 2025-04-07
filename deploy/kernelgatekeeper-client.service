@@ -1,7 +1,6 @@
 [Unit]
 Description=KernelGatekeeper Client-Side Proxy Listener (SockOps Model)
-After=network-online.target kernelgatekeeper.service
-Requires=kernelgatekeeper.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -9,7 +8,6 @@ Type=simple
 ExecStart=/usr/local/bin/kernelgatekeeper-client -socket=/var/run/kernelgatekeeper.sock
 Restart=on-failure
 RestartSec=5s
-
 AmbientCapabilities=
 CapabilityBoundingSet=
 
