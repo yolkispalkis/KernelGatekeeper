@@ -14,10 +14,10 @@ import (
 
 	"golang.org/x/sync/semaphore"
 
-	"github.com/yolki/kernelgatekeeper/pkg/common"
-	"github.com/yolki/kernelgatekeeper/pkg/ipc"
-	"github.com/yolki/kernelgatekeeper/pkg/pac"
-	"github.com/yolki/kernelgatekeeper/pkg/proxy"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/common"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/ipc"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/pac"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/proxy"
 )
 
 const (

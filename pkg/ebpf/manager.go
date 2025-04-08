@@ -16,7 +16,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 
-	"github.com/yolki/kernelgatekeeper/pkg/config"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 )
 
 const (

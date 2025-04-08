@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yolki/kernelgatekeeper/pkg/config"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 )
 
 type IpcListener struct {

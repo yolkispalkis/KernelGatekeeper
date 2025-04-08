@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/yolki/kernelgatekeeper/pkg/ebpf"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/ebpf"
 )
 
 const (

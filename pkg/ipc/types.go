@@ -3,7 +3,7 @@ package ipc
 import (
 	"encoding/json"
 
-	"github.com/yolki/kernelgatekeeper/pkg/config"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 )
 
 type Command struct {

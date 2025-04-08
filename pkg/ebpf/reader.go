@@ -12,7 +12,7 @@ import (
 
 	"github.com/cilium/ebpf/ringbuf"
 
-	"github.com/yolki/kernelgatekeeper/pkg/bpfutil"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/bpfutil"
 )
 
 func (m *BPFManager) readNotifications(ctx context.Context) {

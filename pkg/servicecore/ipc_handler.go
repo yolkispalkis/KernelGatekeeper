@@ -10,9 +10,9 @@ import (
 	"net"
 	"time"
 
-	"github.com/yolki/kernelgatekeeper/pkg/bpfutil"
-	"github.com/yolki/kernelgatekeeper/pkg/common"
-	"github.com/yolki/kernelgatekeeper/pkg/ipc"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/bpfutil"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/common"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/ipc"
 )
 
 const (

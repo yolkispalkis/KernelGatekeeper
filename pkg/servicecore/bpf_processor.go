@@ -8,9 +8,9 @@ import (
 	"net"
 	"time"
 
-	"github.com/yolki/kernelgatekeeper/pkg/common"
-	"github.com/yolki/kernelgatekeeper/pkg/ebpf"
-	"github.com/yolki/kernelgatekeeper/pkg/ipc"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/common"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/ebpf"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/ipc"
 )
 
 const (

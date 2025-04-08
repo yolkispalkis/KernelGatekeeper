@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/yolki/kernelgatekeeper/pkg/common"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/common"
 )
 
 func IpFromInt(ipInt uint32) net.IP {

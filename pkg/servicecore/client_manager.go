@@ -12,8 +12,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/yolki/kernelgatekeeper/pkg/common"
-	"github.com/yolki/kernelgatekeeper/pkg/ipc"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/common"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/ipc"
 )
 
 const (

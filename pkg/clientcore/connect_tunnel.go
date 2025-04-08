@@ -14,8 +14,8 @@ import (
 
 	"github.com/jcmturner/gokrb5/v8/spnego"
 
-	"github.com/yolki/kernelgatekeeper/pkg/common"
-	"github.com/yolki/kernelgatekeeper/pkg/kerb"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/common"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/kerb"
 )
 
 // Version needs to be accessible, assuming it's passed or globally available (adjust as needed)

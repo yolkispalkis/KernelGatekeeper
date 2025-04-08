@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yolki/kernelgatekeeper/pkg/ipc"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/ipc"
 )
 
 const (

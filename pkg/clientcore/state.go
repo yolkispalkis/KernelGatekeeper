@@ -6,9 +6,9 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/yolki/kernelgatekeeper/pkg/config"
-	"github.com/yolki/kernelgatekeeper/pkg/kerb"
-	"github.com/yolki/kernelgatekeeper/pkg/proxy"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/kerb"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/proxy"
 )
 
 type StateManager struct {

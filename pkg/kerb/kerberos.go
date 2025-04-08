@@ -17,7 +17,7 @@ import (
 	"github.com/jcmturner/gokrb5/v8/credentials"
 	"github.com/jcmturner/gokrb5/v8/spnego"
 
-	appconfig "github.com/yolki/kernelgatekeeper/pkg/config"
+	appconfig "github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 )
 
 type KerberosClient struct {

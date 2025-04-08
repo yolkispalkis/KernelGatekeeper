@@ -11,10 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yolki/kernelgatekeeper/pkg/bpfutil"
-	"github.com/yolki/kernelgatekeeper/pkg/config"
-	"github.com/yolki/kernelgatekeeper/pkg/ebpf"
-	"github.com/yolki/kernelgatekeeper/pkg/logging"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/bpfutil"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/ebpf"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/logging"
 )
 
 const (

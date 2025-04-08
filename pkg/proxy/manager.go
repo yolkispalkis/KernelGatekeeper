@@ -22,8 +22,8 @@ import (
 	"golang.org/x/net/html/charset"
 	"golang.org/x/text/transform"
 
-	appconfig "github.com/yolki/kernelgatekeeper/pkg/config"
-	"github.com/yolki/kernelgatekeeper/pkg/pac"
+	appconfig "github.com/yolkispalkis/kernelgatekeeper/pkg/config"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/pac"
 )
 
 const (
