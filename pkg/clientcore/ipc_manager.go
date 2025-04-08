@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/common"
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/ipc"
 )
 
@@ -30,9 +29,9 @@ type IPCManager struct {
 	socketPath       string
 	connectTimeout   time.Duration
 	conn             atomic.Pointer[net.Conn]
-	state            atomic.Int32 // 0 = disconnected, 1 = connected
-	stateChan        chan bool    // Signals connection state changes
-	stateManager     *StateManager
+	state            atomic.Int32  // 0 = disconnected, 1 = connected
+	stateChan        chan bool     // Signals connection state changes
+	stateManager     *StateManager // Still needed for WaitGroup and ActiveConnections for Ping
 	ctx              context.Context
 	cancel           context.CancelFunc
 	wg               sync.WaitGroup
@@ -46,7 +45,7 @@ func NewIPCManager(ctx context.Context, stateMgr *StateManager, socketPath strin
 		socketPath:     socketPath,
 		connectTimeout: timeout,
 		stateChan:      make(chan bool, 1),
-		stateManager:   stateMgr,
+		stateManager:   stateMgr, // Pass StateManager
 		ctx:            mgrCtx,
 		cancel:         mgrCancel,
 	}
@@ -95,6 +94,10 @@ func (m *IPCManager) WaitForInitialConnection(timeout time.Duration) error {
 	select {
 	case isConnected := <-m.stateChan:
 		if !isConnected {
+			// Check context error first
+			if m.ctx.Err() != nil {
+				return fmt.Errorf("shutdown initiated before initial connection completed: %w", m.ctx.Err())
+			}
 			return errors.New("initial connection to service failed")
 		}
 		slog.Info("Successfully connected to service IPC.")
@@ -120,7 +123,15 @@ func (m *IPCManager) manageConnection() {
 			conn, err := net.DialTimeout("unix", m.socketPath, m.connectTimeout)
 
 			if err != nil {
-				slog.Warn("Failed to connect to service IPC", "error", err)
+				logMsg := "Failed to connect to service IPC"
+				// Check context error before logging reconnect details
+				if m.ctx.Err() != nil {
+					logMsg = "Connection attempt cancelled during shutdown"
+					slog.Info(logMsg, "error", err)
+					m.setConnectionState(false, nil) // Ensure state reflects disconnect on shutdown path
+					return                           // Exit loop on shutdown
+				}
+				slog.Warn(logMsg, "error", err)
 				m.setConnectionState(false, nil)
 
 				currentDelay = time.Duration(math.Pow(2, float64(common.Min(attempt, 6)))) * baseReconnectDelay
@@ -139,12 +150,11 @@ func (m *IPCManager) manageConnection() {
 				slog.Error("Failed to register with service after connection", "error", err)
 				conn.Close()
 				m.setConnectionState(false, nil)
-				currentDelay = baseReconnectDelay
+				currentDelay = baseReconnectDelay // Retry quickly after registration failure
 				continue
 			}
 			slog.Info("Client registered with service", "pid", os.Getpid())
 
-			// Start listening for notifications on this connection
 			listenerWg := sync.WaitGroup{}
 			listenerWg.Add(1)
 			go func(currentConn net.Conn) {
@@ -152,13 +162,19 @@ func (m *IPCManager) manageConnection() {
 				m.listenIPCNotifications(currentConn)
 			}(conn)
 
-			// Wait for disconnect or context cancellation
 			m.waitForConnectionClose(conn)
-			listenerWg.Wait() // Ensure listener goroutine exits
+			listenerWg.Wait()
+
+			// Check context error before logging reconnect
+			if m.ctx.Err() != nil {
+				slog.Info("IPC connection closed during shutdown.")
+				m.setConnectionState(false, nil) // Ensure state is disconnected on shutdown
+				return                           // Exit loop on shutdown
+			}
 
 			slog.Warn("IPC connection lost. Preparing to reconnect...")
 			m.setConnectionState(false, nil)
-			currentDelay = baseReconnectDelay
+			currentDelay = baseReconnectDelay // Reset delay for immediate retry
 		}
 	}
 }
@@ -169,18 +185,16 @@ func (m *IPCManager) setConnectionState(connected bool, newConn *net.Conn) {
 		newState = 1
 	}
 
-	// Close old connection before storing new one
 	oldConnPtr := m.conn.Swap(newConn)
 	if oldConnPtr != nil && *oldConnPtr != nil {
 		(*oldConnPtr).Close()
 	}
 
-	// Update atomic state and notify channel
 	oldState := m.state.Swap(newState)
 	if oldState != newState {
 		select {
 		case m.stateChan <- connected:
-		default:
+		default: // Avoid blocking if channel buffer is full (e.g., rapid connect/disconnect)
 		}
 	}
 }
@@ -195,25 +209,16 @@ func (m *IPCManager) waitForConnectionClose(conn net.Conn) {
 	for {
 		select {
 		case <-m.ctx.Done():
-			return
+			return // Stop probing on shutdown
 		case <-probeTicker.C:
-			one := make([]byte, 1)
-			if err := conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
-				if !common.IsConnectionClosedErr(err) {
-					slog.Warn("Error setting read deadline for IPC probe", "error", err)
-				}
+			// Simple check if connection is still valid (without full read probe)
+			if m.GetConnection() != conn {
+				slog.Debug("IPC connection changed during probing, stopping probe for old connection.")
 				return
 			}
-			_, err := conn.Read(one)
-			_ = conn.SetReadDeadline(time.Time{})
-
-			if err != nil {
-				if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || common.IsTimeoutError(err) || common.IsConnectionClosedErr(err) {
-					slog.Debug("IPC connection probe detected closure or error", "error", err)
-					return
-				}
-				slog.Warn("IPC connection probe encountered unexpected error", "error", err)
-			}
+			// Optional: Add a minimal write probe (e.g., send a known no-op command or byte)
+			// Be careful not to interfere with normal IPC traffic.
+			// For now, rely on read errors in listenIPCNotifications and connection change detection.
 		}
 	}
 }
@@ -249,6 +254,9 @@ func (m *IPCManager) registerWithService(conn net.Conn) error {
 		if common.IsConnectionClosedErr(err) {
 			return fmt.Errorf("IPC connection closed while waiting for register_client response: %w", err)
 		}
+		if common.IsTimeoutError(err) {
+			return fmt.Errorf("timeout waiting for register_client response: %w", err)
+		}
 		return fmt.Errorf("failed to decode register response: %w", err)
 	}
 
@@ -258,55 +266,8 @@ func (m *IPCManager) registerWithService(conn net.Conn) error {
 	return nil
 }
 
-// GetConfigFromService fetches configuration using the current connection.
-func (m *IPCManager) GetConfigFromService() (*config.Config, error) {
-	conn := m.GetConnection()
-	if conn == nil {
-		return nil, errors.New("cannot get config, not connected to service")
-	}
+// Removed GetConfigFromService
 
-	cmd, err := ipc.NewCommand("get_config", nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create get_config command: %w", err)
-	}
-
-	encoder := json.NewEncoder(conn)
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	err = encoder.Encode(cmd)
-	conn.SetWriteDeadline(time.Time{})
-	if err != nil {
-		if common.IsConnectionClosedErr(err) {
-			return nil, fmt.Errorf("IPC connection closed before sending get_config: %w", err)
-		}
-		return nil, fmt.Errorf("failed to send get_config command: %w", err)
-	}
-
-	decoder := json.NewDecoder(conn)
-	var resp ipc.Response
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	err = decoder.Decode(&resp)
-	conn.SetReadDeadline(time.Time{})
-	if err != nil {
-		if common.IsConnectionClosedErr(err) {
-			return nil, fmt.Errorf("IPC connection closed while waiting for get_config response: %w", err)
-		}
-		return nil, fmt.Errorf("failed to decode get_config response: %w", err)
-	}
-
-	if resp.Status != ipc.StatusOK {
-		return nil, fmt.Errorf("service returned error for get_config: %s", resp.Error)
-	}
-
-	var data ipc.GetConfigData
-	if err := ipc.DecodeData(resp.Data, &data); err != nil {
-		return nil, fmt.Errorf("failed to decode config data from response: %w", err)
-	}
-
-	slog.Debug("Successfully retrieved config from service via IPC.")
-	return &data.Config, nil
-}
-
-// SendIPCCommand sends a command to the service.
 func (m *IPCManager) SendIPCCommand(cmd *ipc.Command) error {
 	conn := m.GetConnection()
 	if conn == nil {
@@ -318,7 +279,8 @@ func (m *IPCManager) SendIPCCommand(cmd *ipc.Command) error {
 	conn.SetWriteDeadline(time.Time{})
 	if err != nil {
 		if common.IsConnectionClosedErr(err) {
-			m.setConnectionState(false, nil) // Reflect disconnect
+			// Connection closed, trigger reconnect logic by setting state
+			m.setConnectionState(false, nil)
 			return fmt.Errorf("IPC connection closed while sending command %s: %w", cmd.Command, err)
 		}
 		return fmt.Errorf("failed to send command %s: %w", cmd.Command, err)
@@ -329,9 +291,9 @@ func (m *IPCManager) SendIPCCommand(cmd *ipc.Command) error {
 func (m *IPCManager) listenIPCNotifications(conn net.Conn) {
 	slog.Info("Starting IPC notification listener for connection.")
 	decoder := json.NewDecoder(conn)
-	// localListener is retrieved inside the loop now if needed
 
 	for {
+		// Check context before attempting to read
 		select {
 		case <-m.ctx.Done():
 			slog.Info("Stopping IPC notification listener due to context cancellation.")
@@ -339,35 +301,40 @@ func (m *IPCManager) listenIPCNotifications(conn net.Conn) {
 		default:
 		}
 
+		// Check if the connection we are listening on is still the active one
 		if conn == nil || m.GetConnection() != conn {
-			slog.Info("IPC connection changed or closed, stopping listener for this connection.")
-			return // Exit if connection changed or is nil
+			slog.Info("IPC connection changed or closed, stopping listener for this specific connection.")
+			return
 		}
 
 		var cmd ipc.Command
-		// Use a longer timeout for general listening
 		if err := conn.SetReadDeadline(time.Now().Add(statusPingInterval + 30*time.Second)); err != nil {
 			if !common.IsConnectionClosedErr(err) {
 				slog.Warn("Error setting read deadline for IPC notification listener", "error", err)
 			}
-			return // Assume connection is bad
+			// Don't return immediately, let Decode handle the error
 		}
 		err := decoder.Decode(&cmd)
-		_ = conn.SetReadDeadline(time.Time{})
+		_ = conn.SetReadDeadline(time.Time{}) // Clear deadline immediately
 
 		if err != nil {
+			// Check context again after Decode returns
 			if m.ctx.Err() != nil {
-				return // Exit if context cancelled during decode
+				slog.Info("Stopping IPC notification listener due to context cancellation during/after decode.")
+				return
 			}
 			logMsg := "IPC error while reading notifications."
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || common.IsConnectionClosedErr(err) {
 				logMsg = "IPC connection closed while reading notifications."
 			} else if common.IsTimeoutError(err) {
-				logMsg = "IPC connection timed out waiting for notifications."
+				logMsg = "IPC connection timed out waiting for notifications/ping."
 			}
 			slog.Warn(logMsg, "error", err)
-			// Let manageConnection handle reconnect logic. Stop this listener.
-			return // Exit this listener goroutine
+			// Let manageConnection handle reconnect logic by returning from this listener.
+			// Close the connection locally to ensure manageConnection notices.
+			conn.Close()
+			m.setConnectionState(false, nil) // Reflect disconnect
+			return
 		}
 
 		switch cmd.Command {
@@ -376,7 +343,6 @@ func (m *IPCManager) listenIPCNotifications(conn net.Conn) {
 				slog.Error("Received 'notify_accept' but no handler is registered")
 				continue
 			}
-			// Get the listener instance for this specific notification *before* the goroutine
 			currentListener := m.listenerCallback()
 			if currentListener == nil {
 				slog.Error("Received 'notify_accept' but local listener is not available")
@@ -390,49 +356,53 @@ func (m *IPCManager) listenIPCNotifications(conn net.Conn) {
 			}
 			slog.Info("Received 'notify_accept' from service", "src", data.SrcIP, "dport", data.DstPort, "orig_dst", data.DstIP)
 
-			// Spawn a goroutine to handle the accept and callback
-			// Pass the retrieved listener instance to the goroutine
+			// Add to waitgroup *before* starting goroutine
+			m.stateManager.AddWaitGroup(1)
 			go func(d ipc.NotifyAcceptData, listenerToUse net.Listener) {
+				defer m.stateManager.WaitGroupDone() // Use StateManager's WaitGroup
+
+				// Context check inside the goroutine
+				if m.ctx.Err() != nil {
+					slog.Info("Accept goroutine cancelled before Accept()", "error", m.ctx.Err())
+					return
+				}
+
 				if tcpListener, ok := listenerToUse.(*net.TCPListener); ok {
 					acceptDeadline := time.Now().Add(5 * time.Second)
 					if err := tcpListener.SetDeadline(acceptDeadline); err != nil {
-						slog.Warn("Failed to set accept deadline on local listener", "error", err)
+						if !common.IsConnectionClosedErr(err) { // Don't warn if listener is already closing
+							slog.Warn("Failed to set accept deadline on local listener", "error", err)
+						}
+						// Don't return immediately, let Accept handle the error
 					}
-					defer tcpListener.SetDeadline(time.Time{})
+					defer tcpListener.SetDeadline(time.Time{}) // Ensure deadline is cleared
 				}
 
 				acceptedConn, acceptErr := listenerToUse.Accept()
 				if acceptErr != nil {
+					// Check context error first during accept failure
+					if m.ctx.Err() != nil {
+						slog.Info("Accept goroutine cancelled during Accept()", "error", m.ctx.Err())
+						return
+					}
 					if errors.Is(acceptErr, net.ErrClosed) {
 						slog.Info("Local listener closed while attempting to accept BPF connection (likely shutdown).")
-					} else if netErr, ok := acceptErr.(net.Error); ok && netErr.Timeout() {
+					} else if common.IsTimeoutError(acceptErr) {
 						slog.Error("Timeout accepting connection from BPF sockmap", "error", acceptErr)
-					} else if !errors.Is(acceptErr, context.Canceled) { // Avoid logging error on clean shutdown
+					} else {
 						slog.Error("Failed to accept connection from BPF sockmap", "error", acceptErr)
 					}
-					return
+					return // Don't proceed if accept failed
 				}
 				slog.Debug("Accepted connection from BPF sockmap", "local", acceptedConn.LocalAddr(), "remote", acceptedConn.RemoteAddr())
 
 				// Pass the accepted connection and original destination data to the handler callback
+				// Use the manager's context which might be cancelled
 				m.acceptCallback(m.ctx, acceptedConn, d)
 
-			}(data, currentListener) // Pass the listener instance
+			}(data, currentListener)
 
-		case "config_updated":
-			slog.Info("Received 'config_updated' notification from service. Triggering refresh.")
-			// Use the StateManager to access the BackgroundTasks interface
-			bgTasks := m.stateManager.GetBackgroundTasks()
-			if bgTasks != nil {
-				// Run refresh in a goroutine to avoid blocking the IPC listener
-				m.stateManager.AddWaitGroup(1) // Add to waitgroup for graceful shutdown
-				go func() {
-					defer m.stateManager.WaitGroupDone()
-					bgTasks.RefreshConfiguration()
-				}()
-			} else {
-				slog.Error("Cannot refresh configuration: background task runner not available via StateManager")
-			}
+		// Removed config_updated case
 		default:
 			slog.Warn("Received unknown command from service via IPC", "command", cmd.Command)
 		}

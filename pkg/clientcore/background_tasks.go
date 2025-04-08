@@ -3,7 +3,6 @@ package clientcore
 import (
 	"context"
 	"log/slog"
-	"reflect"
 	"sync"
 	"time"
 
@@ -12,13 +11,13 @@ import (
 
 const (
 	kerberosCheckInterval = 5 * time.Minute
-	configRefreshInterval = 15 * time.Minute
+	// Removed configRefreshInterval
 	// statusPingInterval is defined in ipc_manager.go
 )
 
 type BackgroundTasks struct {
-	stateManager *StateManager
-	ipcManager   *IPCManager
+	stateManager *StateManager // Needs access to KerberosClient and connection count
+	ipcManager   *IPCManager   // Needs access to send pings
 	ctx          context.Context
 	wg           *sync.WaitGroup // Use stateManager's WaitGroup
 }
@@ -42,28 +41,21 @@ func (bt *BackgroundTasks) Run() {
 }
 
 func (bt *BackgroundTasks) runLoop() {
-	configRefreshTicker := time.NewTicker(configRefreshInterval)
-	defer configRefreshTicker.Stop()
+	// Removed configRefreshTicker
 	kerbCheckTicker := time.NewTicker(kerberosCheckInterval)
 	defer kerbCheckTicker.Stop()
 	statusPingTicker := time.NewTicker(statusPingInterval)
 	defer statusPingTicker.Stop()
 
-	// Run initial checks immediately if possible after setup
-	if err := bt.stateManager.WaitForInitialSetup(); err == nil {
-		bt.RefreshConfiguration() // Run first refresh after setup succeeds
-		bt.checkKerberosTicket()
-	} else {
-		slog.Warn("Skipping initial background checks due to setup error", "error", err)
-	}
+	// Run initial Kerberos check immediately after setup (which now happens in main)
+	bt.checkKerberosTicket()
 
 	for {
 		select {
 		case <-bt.ctx.Done():
 			return
 
-		case <-configRefreshTicker.C:
-			bt.RefreshConfiguration()
+		// Removed config refresh case
 
 		case <-kerbCheckTicker.C:
 			bt.checkKerberosTicket()
@@ -74,31 +66,7 @@ func (bt *BackgroundTasks) runLoop() {
 	}
 }
 
-func (bt *BackgroundTasks) RefreshConfiguration() {
-	slog.Info("Attempting configuration refresh...")
-	if !bt.ipcManager.IsConnected() {
-		slog.Warn("Cannot refresh config, IPC disconnected.")
-		return
-	}
-
-	newCfg, err := bt.ipcManager.GetConfigFromService()
-	if err != nil {
-		slog.Error("Failed to refresh configuration from service", "error", err)
-		// IPCManager's connection loop will handle disconnects
-		return
-	}
-
-	currentCfg := bt.stateManager.GetConfig()
-	configChanged := !reflect.DeepEqual(currentCfg.Proxy, newCfg.Proxy) ||
-		!reflect.DeepEqual(currentCfg.Kerberos, newCfg.Kerberos)
-
-	if configChanged {
-		slog.Info("Configuration change detected, applying...")
-		bt.stateManager.Reconfigure(newCfg) // Use StateManager method to reconfigure
-	} else {
-		slog.Info("Configuration unchanged after refresh check.")
-	}
-}
+// Removed RefreshConfiguration
 
 func (bt *BackgroundTasks) checkKerberosTicket() {
 	kc := bt.stateManager.GetKerberosClient()
@@ -109,12 +77,14 @@ func (bt *BackgroundTasks) checkKerberosTicket() {
 		} else {
 			slog.Debug("Kerberos ticket check/refresh successful.")
 		}
+	} else {
+		slog.Debug("Skipping Kerberos check: client not initialized.")
 	}
 }
 
 func (bt *BackgroundTasks) sendClientStatusPing() {
 	if !bt.ipcManager.IsConnected() {
-		slog.Warn("Cannot send status ping, IPC disconnected.")
+		slog.Debug("Cannot send status ping, IPC disconnected.") // Debug level as it's expected often
 		return
 	}
 	slog.Debug("Sending status ping to service...")
@@ -139,12 +109,9 @@ func (bt *BackgroundTasks) sendClientStatusPing() {
 	}
 
 	if err := bt.ipcManager.SendIPCCommand(cmd); err != nil {
-		// Error is logged within SendIPCCommand if needed
-		slog.Error("Failed to send status ping to service", "error", err)
+		// Error is logged within SendIPCCommand if connection drops etc.
+		slog.Warn("Failed to send status ping to service", "error", err) // Warn level for send failure
 	} else {
 		slog.Debug("Status ping sent successfully.")
 	}
 }
-
-// Add this method to StateManager struct definition in state.go
-// backgroundTasks BackgroundTasks

@@ -1,15 +1,15 @@
 [Unit]
 Description=KernelGatekeeper Client-Side Proxy Listener (SockOps Model)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target user-runtime-dir@%i.service # Use %i for UID
+Wants=network-online.target user-runtime-dir@%i.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/kernelgatekeeper-client -socket=/var/run/kernelgatekeeper.sock
+ExecStart=/usr/local/bin/kernelgatekeeper-client -config=/etc/kernelgatekeeper/config.yaml -socket=/var/run/kernelgatekeeper.sock
 Restart=on-failure
 RestartSec=5s
 AmbientCapabilities=
 CapabilityBoundingSet=
 
 [Install]
-WantedBy=default.target
+WantedBy=default.target # Standard target for user services

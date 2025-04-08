@@ -2,7 +2,6 @@ package clientcore
 
 import (
 	"log/slog"
-	"reflect"
 	"sync"
 	"sync/atomic"
 
@@ -11,29 +10,23 @@ import (
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/proxy"
 )
 
-// BackgroundTasksRefresher defines the interface needed by StateManager/IPCManager
-// to trigger configuration refreshes.
-type BackgroundTasksRefresher interface {
-	RefreshConfiguration()
-}
-
 type StateManager struct {
-	configPtr        atomic.Pointer[config.Config]
-	kerberosClient   atomic.Pointer[kerb.KerberosClient]
-	proxyManager     atomic.Pointer[proxy.ProxyManager]
-	activeConns      atomic.Int64
-	wg               sync.WaitGroup
-	initialSetupDone chan struct{}
-	initialSetupErr  atomic.Pointer[error]    // Store error during setup
-	backgroundTasks  BackgroundTasksRefresher // Dependency for config refresh
+	configPtr      atomic.Pointer[config.Config]
+	kerberosClient atomic.Pointer[kerb.KerberosClient]
+	proxyManager   atomic.Pointer[proxy.ProxyManager]
+	activeConns    atomic.Int64
+	wg             sync.WaitGroup
+	// Removed initialSetupDone and initialSetupErr as setup happens synchronously in main
 }
 
 func NewStateManager(initialConfig *config.Config) *StateManager {
-	sm := &StateManager{
-		initialSetupDone: make(chan struct{}),
-	}
+	sm := &StateManager{}
 	if initialConfig != nil {
-		sm.SetConfig(initialConfig)
+		sm.configPtr.Store(initialConfig)
+	} else {
+		// Store an empty config to avoid nil panics, though main should provide one
+		sm.configPtr.Store(&config.Config{})
+		slog.Error("StateManager initialized with nil configuration!")
 	}
 	return sm
 }
@@ -41,22 +34,43 @@ func NewStateManager(initialConfig *config.Config) *StateManager {
 func (sm *StateManager) GetConfig() *config.Config {
 	cfg := sm.configPtr.Load()
 	if cfg == nil {
-		return &config.Config{} // Return empty config if not set
+		// Should not happen
+		return &config.Config{}
 	}
-	// Return a copy to prevent modification? For now, assume caller doesn't modify.
-	return cfg
+	// Return a shallow copy for safety, deep copy if needed later
+	cfgCopy := *cfg
+	if cfg.EBPF.TargetPorts != nil {
+		cfgCopy.EBPF.TargetPorts = make([]int, len(cfg.EBPF.TargetPorts))
+		copy(cfgCopy.EBPF.TargetPorts, cfg.EBPF.TargetPorts)
+	} else {
+		cfgCopy.EBPF.TargetPorts = []int{}
+	}
+	return &cfgCopy
 }
 
+// SetConfig allows updating the configuration, e.g., if client reloads its own config file.
 func (sm *StateManager) SetConfig(cfg *config.Config) {
 	sm.configPtr.Store(cfg)
+	slog.Info("Client configuration updated in StateManager.")
+	// Re-initialize Kerberos and Proxy Managers based on the new config?
+	// This logic might need to be added if client-side config reload is implemented.
+	// For now, assume config is set once at startup.
 }
 
 func (sm *StateManager) GetKerberosClient() *kerb.KerberosClient {
 	return sm.kerberosClient.Load()
 }
 
+func (sm *StateManager) SetKerberosClient(k *kerb.KerberosClient) {
+	sm.kerberosClient.Store(k)
+}
+
 func (sm *StateManager) GetProxyManager() *proxy.ProxyManager {
 	return sm.proxyManager.Load()
+}
+
+func (sm *StateManager) SetProxyManager(p *proxy.ProxyManager) {
+	sm.proxyManager.Store(p)
 }
 
 func (sm *StateManager) IncActiveConnections() {
@@ -79,58 +93,7 @@ func (sm *StateManager) WaitGroupDone() {
 	sm.wg.Done()
 }
 
-// PerformInitialSetup retrieves config via IPC and initializes Kerberos/Proxy managers.
-// It signals completion or error via initialSetupDone and initialSetupErr.
-func (sm *StateManager) PerformInitialSetup(ipc *IPCManager) {
-	var setupErr error
-	defer func() {
-		if setupErr != nil {
-			sm.initialSetupErr.Store(&setupErr)
-		}
-		close(sm.initialSetupDone) // Signal completion regardless of error
-	}()
-
-	slog.Info("Performing initial setup...")
-	initialConfig, err := ipc.GetConfigFromService()
-	if err != nil {
-		setupErr = err
-		slog.Error("Failed to get initial config from service", "error", setupErr)
-		return
-	}
-	sm.SetConfig(initialConfig)
-
-	kClient, kerr := kerb.NewKerberosClient(&initialConfig.Kerberos)
-	if kerr != nil {
-		setupErr = kerr
-		slog.Error("Failed to initialize Kerberos client", "error", setupErr)
-		return
-	}
-	sm.kerberosClient.Store(kClient)
-	slog.Info("Kerberos client initialized.")
-
-	pMgr, perr := proxy.NewProxyManager(&initialConfig.Proxy)
-	if perr != nil {
-		setupErr = perr
-		slog.Error("Failed to initialize Proxy Manager", "error", setupErr)
-		if kClient != nil {
-			kClient.Close()
-		}
-		sm.kerberosClient.Store(nil)
-		return
-	}
-	sm.proxyManager.Store(pMgr)
-	slog.Info("Proxy Manager initialized.")
-}
-
-// WaitForInitialSetup blocks until initial setup is complete and returns any error.
-func (sm *StateManager) WaitForInitialSetup() error {
-	<-sm.initialSetupDone
-	errPtr := sm.initialSetupErr.Load()
-	if errPtr != nil {
-		return *errPtr
-	}
-	return nil
-}
+// Removed PerformInitialSetup and WaitForInitialSetup
 
 func (sm *StateManager) Cleanup() {
 	slog.Debug("Waiting for all client goroutines to complete...")
@@ -153,55 +116,5 @@ func (sm *StateManager) Cleanup() {
 	}
 }
 
-// Reconfigure applies changes from a new configuration.
-func (sm *StateManager) Reconfigure(newCfg *config.Config) {
-	currentCfg := sm.GetConfig()
-
-	// Apply Proxy changes
-	if !reflect.DeepEqual(currentCfg.Proxy, newCfg.Proxy) {
-		slog.Info("Proxy configuration changed, re-initializing proxy manager.")
-		oldPM := sm.proxyManager.Load()
-		if oldPM != nil {
-			oldPM.Close()
-		}
-		newPM, err := proxy.NewProxyManager(&newCfg.Proxy)
-		if err != nil {
-			slog.Error("Failed to re-initialize proxy manager after config refresh", "error", err)
-			sm.proxyManager.Store(nil) // Ensure old one isn't used
-		} else {
-			sm.proxyManager.Store(newPM)
-			slog.Info("Proxy manager re-initialized.")
-		}
-	}
-
-	// Apply Kerberos changes
-	if !reflect.DeepEqual(currentCfg.Kerberos, newCfg.Kerberos) {
-		slog.Info("Kerberos configuration changed, re-initializing Kerberos client.")
-		oldKC := sm.kerberosClient.Load()
-		if oldKC != nil {
-			oldKC.Close()
-		}
-		newKC, err := kerb.NewKerberosClient(&newCfg.Kerberos)
-		if err != nil {
-			slog.Error("Failed to re-initialize Kerberos client after config refresh", "error", err)
-			sm.kerberosClient.Store(nil)
-		} else {
-			sm.kerberosClient.Store(newKC)
-			slog.Info("Kerberos client re-initialized.")
-		}
-	}
-
-	// Update the config atomically
-	sm.SetConfig(newCfg)
-	slog.Info("Client configuration updated.")
-}
-
-// SetBackgroundTasks stores a reference to the background task runner.
-func (sm *StateManager) SetBackgroundTasks(bg BackgroundTasksRefresher) {
-	sm.backgroundTasks = bg
-}
-
-// GetBackgroundTasks returns the stored background task runner reference.
-func (sm *StateManager) GetBackgroundTasks() BackgroundTasksRefresher {
-	return sm.backgroundTasks
-}
+// Removed Reconfigure, SetBackgroundTasks, GetBackgroundTasks as config refresh via IPC is removed.
+// Background tasks still run but don't need explicit linking for config updates this way.
