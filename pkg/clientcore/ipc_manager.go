@@ -329,7 +329,7 @@ func (m *IPCManager) SendIPCCommand(cmd *ipc.Command) error {
 func (m *IPCManager) listenIPCNotifications(conn net.Conn) {
 	slog.Info("Starting IPC notification listener for connection.")
 	decoder := json.NewDecoder(conn)
-	localListener := m.listenerCallback() // Get listener via callback
+	// localListener is retrieved inside the loop now if needed
 
 	for {
 		select {
@@ -376,10 +376,13 @@ func (m *IPCManager) listenIPCNotifications(conn net.Conn) {
 				slog.Error("Received 'notify_accept' but no handler is registered")
 				continue
 			}
-			if localListener == nil {
+			// Get the listener instance for this specific notification *before* the goroutine
+			currentListener := m.listenerCallback()
+			if currentListener == nil {
 				slog.Error("Received 'notify_accept' but local listener is not available")
 				continue
 			}
+
 			var data ipc.NotifyAcceptData
 			if err := ipc.DecodeData(cmd.Data, &data); err != nil {
 				slog.Error("Failed to decode notify_accept data", "error", err)
@@ -388,14 +391,9 @@ func (m *IPCManager) listenIPCNotifications(conn net.Conn) {
 			slog.Info("Received 'notify_accept' from service", "src", data.SrcIP, "dport", data.DstPort, "orig_dst", data.DstIP)
 
 			// Spawn a goroutine to handle the accept and callback
-			go func(d ipc.NotifyAcceptData) {
-				listener := m.listenerCallback()
-				if listener == nil {
-					slog.Error("Cannot handle notify_accept: listener not available")
-					return
-				}
-
-				if tcpListener, ok := listener.(*net.TCPListener); ok {
+			// Pass the retrieved listener instance to the goroutine
+			go func(d ipc.NotifyAcceptData, listenerToUse net.Listener) {
+				if tcpListener, ok := listenerToUse.(*net.TCPListener); ok {
 					acceptDeadline := time.Now().Add(5 * time.Second)
 					if err := tcpListener.SetDeadline(acceptDeadline); err != nil {
 						slog.Warn("Failed to set accept deadline on local listener", "error", err)
@@ -403,13 +401,13 @@ func (m *IPCManager) listenIPCNotifications(conn net.Conn) {
 					defer tcpListener.SetDeadline(time.Time{})
 				}
 
-				acceptedConn, acceptErr := listener.Accept()
+				acceptedConn, acceptErr := listenerToUse.Accept()
 				if acceptErr != nil {
 					if errors.Is(acceptErr, net.ErrClosed) {
 						slog.Info("Local listener closed while attempting to accept BPF connection (likely shutdown).")
 					} else if netErr, ok := acceptErr.(net.Error); ok && netErr.Timeout() {
 						slog.Error("Timeout accepting connection from BPF sockmap", "error", acceptErr)
-					} else {
+					} else if !errors.Is(acceptErr, context.Canceled) { // Avoid logging error on clean shutdown
 						slog.Error("Failed to accept connection from BPF sockmap", "error", acceptErr)
 					}
 					return
@@ -419,7 +417,7 @@ func (m *IPCManager) listenIPCNotifications(conn net.Conn) {
 				// Pass the accepted connection and original destination data to the handler callback
 				m.acceptCallback(m.ctx, acceptedConn, d)
 
-			}(data)
+			}(data, currentListener) // Pass the listener instance
 
 		case "config_updated":
 			slog.Info("Received 'config_updated' notification from service. Triggering refresh.")

@@ -1,7 +1,6 @@
 proxy:
-  type: http
-  url: "http://proxy.example.com:3128"
-  wpad_url: "http://wpad.example.com/wpad.dat"
+  type: wpad
+  wpad_url: "http://wpad/wpad.dat"
   connection_timeout: 10
   request_timeout: 30
   max_retries: 3
@@ -9,7 +8,6 @@ proxy:
   pac_execution_timeout: 5
 
 kerberos:
-  realm: "EXAMPLE.COM"
   enable_cache: true
 
 ebpf:

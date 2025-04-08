@@ -87,19 +87,30 @@ func determineEffectiveCacheName(configCachePath string) string {
 }
 
 func loadMinimalKrb5Config(cfg *appconfig.KerberosConfig) (*krb5config.Config, error) {
-	c, err := krb5config.Load("")
-	if err == nil && c != nil {
-		slog.Info("Loaded system Kerberos configuration for client context")
+	// Explicitly try loading the standard system path first
+	systemConfigPath := "/etc/krb5.conf"
+	c, err := krb5config.Load(systemConfigPath)
+	// Also check if the loaded config is minimally useful (e.g., has a default realm)
+	if err == nil && c != nil && c.LibDefaults.DefaultRealm != "" {
+		slog.Info("Loaded system Kerberos configuration for client context", "path", systemConfigPath)
 		if cfg.Realm != "" && c.LibDefaults.DefaultRealm != cfg.Realm {
 			slog.Debug("Overriding default_realm from system config", "system", c.LibDefaults.DefaultRealm, "app", cfg.Realm)
 			c.LibDefaults.DefaultRealm = cfg.Realm
 		}
 		return c, nil
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		slog.Warn("Error loading system krb5.conf", "error", err)
+		// Log error if it's not "file not found"
+		slog.Warn("Error loading system krb5.conf", "path", systemConfigPath, "error", err)
+	} else if errors.Is(err, os.ErrNotExist) {
+		// Log specifically if the explicit path doesn't exist
+		slog.Info("System krb5.conf not found at explicit path", "path", systemConfigPath)
+	} else if err == nil && (c == nil || c.LibDefaults.DefaultRealm == "") {
+		// Log if load succeeded but config seems empty/useless
+		slog.Info("System krb5.conf loaded but appears empty or lacks default_realm", "path", systemConfigPath)
 	}
 
-	slog.Info("No system krb5.conf found or load failed, creating minimal config for client.")
+	// Fallback to minimal config generation
+	slog.Info("No valid system krb5.conf found or load failed, creating minimal config for client.")
 	confStr := "[libdefaults]\n"
 	realmSet := false
 	if cfg.Realm != "" {
