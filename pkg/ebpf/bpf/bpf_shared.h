@@ -39,8 +39,8 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_SOCKMAP);
     __uint(max_entries, 8192); // Should ideally match connection_details_map size
-    __type(key, __u64);        // Socket cookie (of the original connection)
-    __type(value, __u64);      // Socket cookie (value is also cookie for sockmap)
+    __type(key, __u32);        // Key type for sockmap should be u32 (index/hash)
+    __type(value, __u32);      // Value type for sockmap should be u32 (socket FD/ref)
 } proxy_sock_map SEC(".maps");
 
 // Ring buffer for sending notifications (connection tuples) to the userspace service
