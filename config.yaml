@@ -1,0 +1,25 @@
+proxy:
+  type: http
+  url: "http://proxy.example.com:3128"
+  wpad_url: "http://wpad.example.com/wpad.dat"
+  connection_timeout: 10
+  request_timeout: 30
+  max_retries: 3
+  pac_charset: ""
+  pac_execution_timeout: 5
+
+kerberos:
+  realm: "EXAMPLE.COM"
+  enable_cache: true
+
+ebpf:
+  target_ports: [80, 443]
+  allow_dynamic_ports: true
+  stats_interval: 15
+  notification_channel_size: 4096
+
+log_level: "info"
+log_path: "/var/log/kernelgatekeeper.log"
+
+shutdown_timeout: 30
+socket_path: "/var/run/kernelgatekeeper.sock"

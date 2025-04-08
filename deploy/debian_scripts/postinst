@@ -1,0 +1,43 @@
+#!/bin/bash
+set -e
+
+LOG_FILE=/var/log/kernelgatekeeper.log
+if [ ! -f "$LOG_FILE" ]; then
+    touch "$LOG_FILE"
+    chmod 640 "$LOG_FILE"
+fi
+
+CONFIG_FILE=/etc/kernelgatekeeper/config.yaml
+CONFIG_EXAMPLE=$CONFIG_FILE.example
+if [ "$1" = "configure" ] && [ ! -e "$CONFIG_FILE" ] && [ -e "$CONFIG_EXAMPLE" ]; then
+    echo "Installing default configuration file..."
+    cp "$CONFIG_EXAMPLE" "$CONFIG_FILE"
+    chmod 640 "$CONFIG_FILE"
+fi
+
+if command -v systemctl >/dev/null; then
+    systemctl daemon-reload || true
+fi
+
+if [ "$1" = "configure" ]; then
+    if command -v systemctl >/dev/null && ! systemctl is-enabled --quiet kernelgatekeeper.service 2>/dev/null; then
+        echo "Enabling and starting kernelgatekeeper system service..."
+        systemctl enable kernelgatekeeper.service || true
+        systemctl start kernelgatekeeper.service || echo "Warning: Failed to start system service, check logs."
+    elif command -v systemctl >/dev/null; then
+        echo "Kernelgatekeeper system service already enabled."
+    fi
+fi
+
+echo "---------------------------------------------------------------"
+echo "KernelGatekeeper installed."
+echo "System service (kernelgatekeeper.service) enabled/started."
+echo "The client service (kernelgatekeeper-client.service) will attempt"
+echo "to enable itself automatically the first time a user starts a"
+echo "login shell (terminal, SSH). This might not work reliably on"
+echo "the very first graphical login after installation."
+echo "You can check the user service status with:"
+echo "  systemctl --user status kernelgatekeeper-client.service"
+echo "---------------------------------------------------------------"
+
+exit 0

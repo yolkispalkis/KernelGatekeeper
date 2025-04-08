@@ -1,0 +1,32 @@
+[Unit]
+Description=KernelGatekeeper Service (BPF SockOps Manager)
+After=network-online.target cgroup.target local-fs.target
+Wants=network-online.target
+ConditionPathExists=/sys/fs/cgroup
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/kernelgatekeeper-service -config=/etc/kernelgatekeeper/config.yaml
+Restart=on-failure
+RestartSec=5s
+User=root
+Group=root
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/run /var/log/kernelgatekeeper.log /etc/kernelgatekeeper/config.yaml
+DevicePolicy=closed
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
