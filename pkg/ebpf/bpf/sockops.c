@@ -28,10 +28,10 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
 
 	#ifdef DEBUG
 	// Log general sockops entry details in debug mode
-	// Note: IPs and ports might be 0 depending on the 'op'
-	//       For ACTIVE_ESTABLISHED_CB, remote_ip4 and remote_port should be set.
+	// remote_port is already network byte order, convert with ntohs for display.
+	// local_port is host byte order, cast directly for display.
 	bpf_printk("SOCKOPS_DEBUG: family=%u op=%u lport=%u rport=%u lip4=%x rip4=%x reply=%u pid=%llu\n",
-			   skops->family, op, (__u16)skops->local_port, bpf_ntohs(skops->remote_port_opt), // Use remote_port_opt for network byte order port
+			   skops->family, op, (__u16)skops->local_port, bpf_ntohs(skops->remote_port),
 			   skops->local_ip4, skops->remote_ip4, skops->reply, bpf_get_current_pid_tgid());
 	#endif
 
@@ -111,9 +111,11 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
 		// Populate the notification data
 		event_data->pid_tgid      = details->pid_tgid;
 		event_data->src_ip        = skops->local_ip4;          // Use actual local IP from sock_ops
-		event_data->src_port      = skops->local_port_opt;     // Use actual local port (network byte order)
+		// event_data->src_port must be in network byte order.
+		// skops->local_port is in host byte order, so convert it using bpf_htons.
+		event_data->src_port      = bpf_htons((__u16)skops->local_port);
 		event_data->orig_dst_ip   = details->orig_dst_ip;      // Original destination IP from connect4 map
-		event_data->orig_dst_port = details->orig_dst_port;    // Original destination port from connect4 map
+		event_data->orig_dst_port = details->orig_dst_port;    // Original destination port from connect4 map (already network byte order)
 		event_data->protocol      = details->protocol;         // Protocol (TCP)
 
 		// Ensure padding is zeroed (good practice)
