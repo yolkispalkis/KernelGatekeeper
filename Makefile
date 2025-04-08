@@ -112,7 +112,7 @@ deb: clean generate build # Ensure generate runs before build for deb
 	# --- Копирование файлов приложения ---
 	cp $(DESTDIR)/$(SERVICE_BINARY) $(DEB_ROOT)/usr/local/bin/
 	cp $(DESTDIR)/$(CLIENT_BINARY) $(DEB_ROOT)/usr/local/bin/
-	cp config.yaml $(DEB_ROOT)/etc/kernelgatekeeper/config.yaml.example # Install as example, postinst copies if main is missing
+	cp config.yaml $(DEB_ROOT)/etc/kernelgatekeeper/config.yaml
 	cp deploy/kernelgatekeeper.service $(DEB_ROOT)/etc/systemd/system/
 	cp deploy/kernelgatekeeper-client.service $(DEB_ROOT)/usr/lib/systemd/user/
 
