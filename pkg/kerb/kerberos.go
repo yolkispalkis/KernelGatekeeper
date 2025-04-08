@@ -17,6 +17,7 @@ import (
 	krb5config "github.com/jcmturner/gokrb5/v8/config"
 	"github.com/jcmturner/gokrb5/v8/credentials"
 	"github.com/jcmturner/gokrb5/v8/spnego"
+	"github.com/jcmturner/gokrb5/v8/types" // Import types for Ticket
 
 	appconfig "github.com/yolki/kernelgatekeeper/pkg/config"
 )
@@ -207,14 +208,28 @@ func (k *KerberosClient) initializeFromCCache(effectiveCacheName string) error {
 	k.isInitialized = true
 
 	// Attempt to get the expiry time from the TGT
-	tgt, err := k.client.GetCachedTicket(k.client.Credentials.CName(), k.client.Credentials.Domain(), "krbtgt/"+k.client.Credentials.Domain()+"@"+k.client.Credentials.Domain())
-	if err == nil && tgt.EndTime.After(time.Now()) {
+	// Construct the TGT SPN
+	tgtSPN := fmt.Sprintf("krbtgt/%s@%s", cl.Credentials.Domain(), cl.Credentials.Domain())
+	// Call GetCachedTicket with the SPN string
+	var tgt types.Ticket
+	var ok bool
+	tgt, ok, err = k.client.GetCachedTicket(tgtSPN) // Corrected call
+
+	if err == nil && ok && tgt.EndTime.After(time.Now()) {
 		k.ticketExpiry = tgt.EndTime
 		slog.Info("Kerberos context initialized from ccache", "principal", strings.Join(k.client.Credentials.CName().NameString, "/"), "realm", k.client.Credentials.Realm(), "tgt_expiry", k.ticketExpiry.Format(time.RFC3339))
 	} else {
 		// If unable to get TGT expiry, set a reasonable default (e.g., 8 hours from now) - actual refresh will happen by external tools
 		k.ticketExpiry = time.Now().Add(8 * time.Hour)
-		slog.Warn("Could not determine exact TGT expiry from ccache, using default duration", "principal", strings.Join(k.client.Credentials.CName().NameString, "/"), "realm", k.client.Credentials.Realm(), "assumed_expiry", k.ticketExpiry.Format(time.RFC3339), "error", err)
+		logReason := ""
+		if err != nil {
+			logReason = fmt.Sprintf("error: %v", err)
+		} else if !ok {
+			logReason = "ticket not found in cache"
+		} else if !tgt.EndTime.After(time.Now()) {
+			logReason = "cached ticket already expired"
+		}
+		slog.Warn("Could not determine exact TGT expiry from ccache, using default duration", "principal", strings.Join(k.client.Credentials.CName().NameString, "/"), "realm", k.client.Credentials.Realm(), "assumed_expiry", k.ticketExpiry.Format(time.RFC3339), "reason", logReason)
 	}
 
 	return nil
