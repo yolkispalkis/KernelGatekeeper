@@ -124,7 +124,9 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 		Maps: ebpf.MapOptions{},
 		Programs: ebpf.ProgramOptions{
 			LogLevel: ebpf.LogLevelInstruction,
-			LogSize:  verifierLogSize,
+		},
+		VerifierOptions: ebpf.VerifierOptions{
+			LogSize: verifierLogSize,
 		},
 	}
 

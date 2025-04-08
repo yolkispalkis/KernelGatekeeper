@@ -8,6 +8,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/bpfutil"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/common"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/ebpf"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/ipc"

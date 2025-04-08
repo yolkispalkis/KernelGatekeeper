@@ -19,7 +19,7 @@ import (
 )
 
 // Version needs to be accessible, assuming it's passed or globally available (adjust as needed)
-var clientVersion = "dev" // Placeholder, inject actual version
+var ClientVersion = "dev" // Placeholder, inject actual version
 
 func establishConnectTunnel(ctx context.Context, proxyConn net.Conn, targetAddr string, krbClient *kerb.KerberosClient) error {
 	logCtx := slog.With("target_addr", targetAddr, "proxy_host", proxyConn.RemoteAddr().String())
@@ -50,7 +50,7 @@ func establishConnectTunnel(ctx context.Context, proxyConn net.Conn, targetAddr 
 		connectReq.Host = targetAddr
 		connectReq.URL = &url.URL{Opaque: targetAddr}
 
-		connectReq.Header.Set("User-Agent", fmt.Sprintf("KernelGatekeeper-Client/%s", clientVersion))
+		connectReq.Header.Set("User-Agent", fmt.Sprintf("KernelGatekeeper-Client/%s", ClientVersion))
 		connectReq.Header.Set("Proxy-Connection", "Keep-Alive")
 		connectReq.Header.Set("Connection", "Keep-Alive")
 

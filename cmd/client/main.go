@@ -133,5 +133,5 @@ func parseFlags() clientFlags {
 
 // Inject version info into connect_tunnel.go (replace placeholder)
 func init() {
-	clientcore.clientVersion = version
+	clientcore.ClientVersion = version
 }

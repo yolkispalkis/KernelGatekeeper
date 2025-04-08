@@ -92,7 +92,7 @@ func main() {
 
 	// --- Setup and Start IPC ---
 	ipcHandler := servicecore.NewIpcHandler(stateManager)
-	ipcListener, err := servicecore.NewIpcListener(initialCfg, ipcHandler, &stateManager.wg) // Pass WaitGroup ref
+	ipcListener, err := servicecore.NewIpcListener(initialCfg, ipcHandler, stateManager.WG()) // Pass WaitGroup ref
 	if err != nil {
 		slog.Error("FATAL: Failed to start IPC listener", "error", err)
 		signals.TriggerShutdown(&globalShutdownOnce, rootCancel)
@@ -103,8 +103,8 @@ func main() {
 		stateManager.Wait()
 		os.Exit(1)
 	}
-	stateManager.SetIPCListener(ipcListener.listener) // Store the listener in state for shutdown
-	ipcListener.Run(rootCtx)                          // Start accepting connections
+	stateManager.SetIPCListener(ipcListener.Listener()) // Store the listener in state for shutdown
+	ipcListener.Run(rootCtx)                            // Start accepting connections
 
 	// --- Handle HUP Signal for Config Reload ---
 	hupChan := make(chan os.Signal, 1)

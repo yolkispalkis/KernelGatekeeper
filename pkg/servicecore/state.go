@@ -147,6 +147,11 @@ func (sm *StateManager) WaitGroupDone() {
 	sm.wg.Done()
 }
 
+// WG returns the WaitGroup for managing goroutine lifecycles.
+func (sm *StateManager) WG() *sync.WaitGroup {
+	return &sm.wg
+}
+
 func (sm *StateManager) Wait() {
 	sm.wg.Wait()
 }

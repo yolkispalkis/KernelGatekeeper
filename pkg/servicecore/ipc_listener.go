@@ -112,3 +112,8 @@ func (il *IpcListener) Close() error {
 	}
 	return nil
 }
+
+// Listener returns the underlying network listener.
+func (il *IpcListener) Listener() net.Listener {
+	return il.listener
+}
