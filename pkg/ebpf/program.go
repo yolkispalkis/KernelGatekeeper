@@ -121,14 +121,13 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 	}
 
 	var objs bpfObjects
+	// Base options
 	opts := &ebpf.CollectionOptions{
 		Maps: ebpf.MapOptions{
 			// PinPath: "/sys/fs/bpf/kernelgatekeeper", // Optional: Pin maps for external inspection/reuse
 		},
 		Programs: ebpf.ProgramOptions{
 			LogLevel: ebpf.LogLevelInstruction, // Provides verifier output on failure
-			// LogSize removed as it's deprecated/changed in newer ebpf library versions
-			// LogSize:  ebpf.DefaultVerifierLogSize * 8, // Increase log size - REMOVED
 		},
 	}
 
@@ -139,16 +138,16 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 	}
 	slog.Debug("eBPF sockops objects loaded successfully.")
 
-	// Load skmsg program, potentially reusing maps loaded by sockops spec
-	// Pass reference to existing maps if needed (Viper handles this automatically if map definitions match?)
-	// Or explicitly set replacements in opts.Maps.MapReplacements
-	opts.Maps.MapReplacements = map[string]*ebpf.Map{
+	// Set MapReplacements directly in CollectionOptions for the second load
+	opts.MapReplacements = map[string]*ebpf.Map{
 		"proxy_sock_map":       objs.bpf_sockopsObjects.ProxySockMap,
 		"notification_ringbuf": objs.bpf_sockopsObjects.NotificationRingbuf,
 		"connection_map":       objs.bpf_sockopsObjects.ConnectionMap,
 		"target_ports":         objs.bpf_sockopsObjects.TargetPorts,
 		"global_stats":         objs.bpf_sockopsObjects.GlobalStats,
 	}
+
+	// Load skmsg program, reusing maps via MapReplacements in opts
 	if err := specSkmsg.LoadAndAssign(&objs.bpf_skmsgObjects, opts); err != nil {
 		handleVerifierError("skmsg", err)
 		objs.bpf_sockopsObjects.Close() // Clean up already loaded objects
