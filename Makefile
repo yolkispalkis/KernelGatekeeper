@@ -12,13 +12,14 @@ DEB_FILENAME=$(DEB_PACKAGE_NAME)_$(VERSION)_$(ARCH).deb
 # Путь к исходным файлам для DEB
 DEB_SCRIPTS_SRC=deploy/debian_scripts
 
-# BPF related - BPF_C_SRC will pick up the new .c file automatically
+# BPF related
 BPF_C_SRC=$(wildcard pkg/ebpf/bpf/*.c)
 BPF_HEADER_DIR=pkg/ebpf/bpf
 # Output files go directly into pkg/ebpf/ by bpf2go
 CLANG ?= clang
-# Removed -I/usr/include as it's usually covered by system includes
-CFLAGS ?= -O2 -g -Wall -Werror -target bpf -I./ -I/usr/include/bpf
+# Include local bpf dir and system bpf include dir
+# Remove -I/usr/include if it causes issues, usually not needed for standard headers
+CFLAGS ?= -O2 -g -Wall -Werror -target bpf -DDEBUG -I./pkg/ebpf/bpf -I/usr/include/bpf
 DESTDIR ?= bin
 GO_CMD=go
 GOLANGCILINT = $(shell command -v golangci-lint 2> /dev/null)
@@ -35,12 +36,12 @@ build-service: $(DESTDIR) generate
 	@echo "Building service application..."
 	$(GO_CMD) build -ldflags="-s -w" -v -o $(DESTDIR)/$(SERVICE_BINARY) ./cmd/service
 
-build-client: $(DESTDIR)
+build-client: $(DESTDIR) generate
 	@echo "Building client application..."
 	$(GO_CMD) build -ldflags="-s -w" -v -o $(DESTDIR)/$(CLIENT_BINARY) ./cmd/client
 
-# NOTE: generate target does not need changes as go:generate handles it
-# It depends on the source files to ensure regeneration if they change.
+# generate target depends on source files to ensure regeneration if they change.
+# Ensure all relevant C and Go files influencing generation are listed.
 generate: $(BPF_HEADER_DIR)/bpf_shared.h $(BPF_C_SRC) pkg/ebpf/program.go
 	@echo "Generating Go wrappers and compiling eBPF C code (via go generate)..."
 	$(GO_CMD) generate ./pkg/ebpf/...
@@ -51,7 +52,7 @@ deps:
 	$(GO_CMD) mod tidy
 	$(GO_CMD) mod verify
 
-test:
+test: generate # Ensure BPF code is generated before running tests that might use it
 	@echo "Running tests..."
 	$(GO_CMD) test -v -race ./...
 
@@ -67,7 +68,7 @@ else
 	$(GOLANGCILINT) run ./...
 endif
 
-# MODIFIED clean target to include bpf_connect4_bpf.go
+# MODIFIED clean target to include all generated BPF Go files
 clean:
 	@echo "Cleaning up..."
 	rm -rf $(DESTDIR) $(DEB_ROOT) $(DEB_FILENAME)
@@ -97,7 +98,7 @@ install: build
 
 
 # --- Сборка DEB пакета ---
-deb: clean build
+deb: clean generate build # Ensure generate runs before build for deb
 	@echo "Building DEB package..."
 	# --- Создание каталогов ---
 	mkdir -p $(DEB_ROOT)/DEBIAN
@@ -133,7 +134,7 @@ deb: clean build
 	@echo "Maintainer: Karim Zabbarov <me@w3h.su>" >> $(DEB_ROOT)/DEBIAN/control # Update maintainer if needed
 	@echo "Description: Transparent Kerberos proxy using eBPF sockops." >> $(DEB_ROOT)/DEBIAN/control
 	@echo " Provides transparent proxying for user applications by leveraging" >> $(DEB_ROOT)/DEBIAN/control
-	@echo " eBPF connect4/sockops/sockmap hooks to redirect traffic and performing Kerberos" >> $(DEB_ROOT)/DEBIAN/control # Updated description slightly
+	@echo " eBPF connect4/sockops/skmsg hooks to redirect traffic and performing Kerberos" >> $(DEB_ROOT)/DEBIAN/control # Updated description slightly
 	@echo " authentication via a user-specific client process." >> $(DEB_ROOT)/DEBIAN/control
 
 	# --- Установка прав на выполнение ---
