@@ -33,6 +33,9 @@ func NewBpfProcessor(stateMgr *StateManager) *BpfProcessor {
 }
 
 func (bp *BpfProcessor) Run(ctx context.Context) {
+	cfg := bp.stateManager.GetConfig()
+	excludedPaths := cfg.EBPF.Excluded
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -46,7 +49,6 @@ func (bp *BpfProcessor) Run(ctx context.Context) {
 
 			pidTgid := notification.PidTgid
 			pid := uint32(pidTgid & 0xFFFFFFFF)
-			tgid := uint32(pidTgid >> 32)
 
 			logCtx := slog.With(
 				"src_ip", notification.SrcIP.String(),
@@ -54,7 +56,6 @@ func (bp *BpfProcessor) Run(ctx context.Context) {
 				"orig_dst_port", notification.OrigDstPort,
 				"src_port", notification.SrcPort,
 				"pid", pid,
-				"tgid", tgid,
 			)
 			logCtx.Debug("Received BPF notification tuple")
 
@@ -63,20 +64,28 @@ func (bp *BpfProcessor) Run(ctx context.Context) {
 				continue
 			}
 
-			// UID lookup now likely done in ClientManager when adding client?
-			// If not, it needs bpfutil.GetUidFromPid(pid) here.
-			// Assuming UID is readily available via client manager state.
+			if len(excludedPaths) > 0 {
+				execPath, err := bpfutil.GetExecutablePathFromPid(pid)
+				if err != nil {
+					logCtx.Warn("Could not get executable path for PID, proceeding with potential proxying", "error", err)
+				} else {
+					logCtx = logCtx.With("exec_path", execPath)
+					isExcluded := false
+					for _, excluded := range excludedPaths {
+						if execPath == excluded {
+							isExcluded = true
+							break
+						}
+						// Potential future enhancement: filepath.Match(excluded, execPath)
+					}
 
-			// Find client by PID/TGID or UID (ClientManager needs methods for this)
-			// Placeholder: Assume finding by PID for now
-			// uid, err := bpfutil.GetUidFromPid(pid)
-			// if err != nil {
-			//	 logCtx.Warn("Could not get UID for PID (process likely exited?)", "error", err)
-			//	 continue
-			// }
-			// clientConn := bp.clientMgr.FindClientConnByUID(uid) // Use UID
+					if isExcluded {
+						logCtx.Info("Ignoring connection from excluded executable")
+						continue
+					}
+				}
+			}
 
-			// Let's assume we need UID lookup here for simplicity now
 			uid, err := bpfutil.GetUidFromPid(pid)
 			if err != nil {
 				logCtx.Warn("Could not get UID for PID (process likely exited?)", "error", err)
@@ -107,9 +116,29 @@ func (bp *BpfProcessor) Run(ctx context.Context) {
 				continue
 			}
 
-			bp.sendToClient(clientConn, ipcCmd, uid) // Pass UID for logging
+			bp.sendToClient(clientConn, ipcCmd, uid)
+		case <-time.After(1 * time.Second):
+			newCfg := bp.stateManager.GetConfig()
+			newExcludedPaths := newCfg.EBPF.Excluded
+			if !stringSlicesEqual(excludedPaths, newExcludedPaths) {
+				slog.Info("Reloading executable exclusion paths", "count", len(newExcludedPaths))
+				excludedPaths = newExcludedPaths
+			}
 		}
 	}
+}
+
+// Helper function to compare string slices (order matters)
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (bp *BpfProcessor) sendToClient(conn net.Conn, cmd *ipc.Command, uid uint32) {
@@ -127,7 +156,6 @@ func (bp *BpfProcessor) sendToClient(conn net.Conn, cmd *ipc.Command, uid uint32
 			} else {
 				logCtx.Warn("Failed to send command to client, removing client.", "error", err)
 			}
-			// Remove client on any send error
 			bp.clientMgr.RemoveClientConn(c)
 		} else {
 			logCtx.Debug("Sent command to client successfully.")

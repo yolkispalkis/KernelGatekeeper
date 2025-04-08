@@ -32,41 +32,42 @@ type Config struct {
 	Proxy           ProxyConfig    `mapstructure:"proxy"`
 	Kerberos        KerberosConfig `mapstructure:"kerberos"`
 	EBPF            EBPFConfig     `mapstructure:"ebpf"`
-	LogLevel        string         `mapstructure:"log_level"`
-	LogPath         string         `mapstructure:"log_path"`
-	ShutdownTimeout time.Duration  `mapstructure:"shutdown_timeout"`
-	SocketPath      string         `mapstructure:"socket_path"`
+	LogLevel        string         `mapstructure:"logLevel"`
+	LogPath         string         `mapstructure:"logPath"`
+	ShutdownTimeout time.Duration  `mapstructure:"shutdownTimeout"`
+	SocketPath      string         `mapstructure:"socketPath"`
 }
 
 type ProxyConfig struct {
 	Type                string `mapstructure:"type"`
 	URL                 string `mapstructure:"url"`
-	WpadURL             string `mapstructure:"wpad_url"`
-	ConnectionTimeout   int    `mapstructure:"connection_timeout"`
-	RequestTimeout      int    `mapstructure:"request_timeout"`
-	MaxRetries          int    `mapstructure:"max_retries"`
-	PacCharset          string `mapstructure:"pac_charset"`
-	PacExecutionTimeout int    `mapstructure:"pac_execution_timeout"`
+	WpadURL             string `mapstructure:"wpadUrl"`
+	ConnectionTimeout   int    `mapstructure:"connectionTimeout"`
+	RequestTimeout      int    `mapstructure:"requestTimeout"`
+	MaxRetries          int    `mapstructure:"maxRetries"`
+	PacCharset          string `mapstructure:"pacCharset"`
+	PacExecutionTimeout int    `mapstructure:"pacExecutionTimeout"`
 }
 
 type KerberosConfig struct {
 	Realm          string `mapstructure:"realm"`
-	KDCHost        string `mapstructure:"kdc_host"`
+	KDCHost        string `mapstructure:"kdcHost"`
 	Principal      string `mapstructure:"principal"`
-	KeytabPath     string `mapstructure:"keytab_path"`
-	EnableCache    bool   `mapstructure:"enable_cache"`
-	TicketLifetime int    `mapstructure:"ticket_lifetime"`
-	CachePath      string `mapstructure:"cache_path"`
+	KeytabPath     string `mapstructure:"keytabPath"`
+	EnableCache    bool   `mapstructure:"enableCache"`
+	TicketLifetime int    `mapstructure:"ticketLifetime"`
+	CachePath      string `mapstructure:"cachePath"`
 }
 
 type EBPFConfig struct {
-	Interface               string `mapstructure:"interface"`
-	ProgramPath             string `mapstructure:"program_path"`
-	TargetPorts             []int  `mapstructure:"target_ports"`
-	LoadMode                string `mapstructure:"load_mode"`
-	AllowDynamicPorts       bool   `mapstructure:"allow_dynamic_ports"`
-	StatsInterval           int    `mapstructure:"stats_interval"`
-	NotificationChannelSize int    `mapstructure:"notification_channel_size"`
+	Interface               string   `mapstructure:"interface"`
+	ProgramPath             string   `mapstructure:"programPath"`
+	TargetPorts             []int    `mapstructure:"targetPorts"`
+	LoadMode                string   `mapstructure:"loadMode"`
+	AllowDynamicPorts       bool     `mapstructure:"allowDynamicPorts"`
+	StatsInterval           int      `mapstructure:"statsInterval"`
+	NotificationChannelSize int      `mapstructure:"notificationChannelSize"`
+	Excluded                []string `mapstructure:"excluded"`
 }
 
 func LoadConfig(configPath string) (*Config, error) {
@@ -83,7 +84,7 @@ func LoadConfig(configPath string) (*Config, error) {
 	setDefaults(v)
 
 	v.SetEnvPrefix("KG")
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_")) // May not work well with camelCase keys
 	v.AutomaticEnv()
 
 	err = v.ReadInConfig()
@@ -102,7 +103,8 @@ func LoadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to decode configuration: %w", err)
 	}
 
-	config.ShutdownTimeout = time.Duration(v.GetInt("shutdown_timeout")) * time.Second
+	// Viper doesn't automatically handle time.Duration from ints in seconds via mapstructure
+	config.ShutdownTimeout = time.Duration(v.GetInt("shutdownTimeout")) * time.Second
 
 	if err := validateConfig(&config); err != nil {
 		return nil, fmt.Errorf("configuration validation failed: %w", err)
@@ -121,19 +123,19 @@ func validateConfig(cfg *Config) error {
 		return errors.New("proxy.url is required when proxy.type is http or https")
 	}
 	if proxyType == "wpad" && cfg.Proxy.WpadURL == "" {
-		return errors.New("proxy.wpad_url is required when proxy.type is wpad")
+		return errors.New("proxy.wpadUrl is required when proxy.type is wpad")
 	}
 	if cfg.Proxy.ConnectionTimeout <= 0 {
-		return errors.New("proxy.connection_timeout must be a positive number of seconds")
+		return errors.New("proxy.connectionTimeout must be a positive number of seconds")
 	}
 	if cfg.Proxy.RequestTimeout <= 0 {
-		return errors.New("proxy.request_timeout must be a positive number of seconds")
+		return errors.New("proxy.requestTimeout must be a positive number of seconds")
 	}
 	if cfg.Proxy.MaxRetries < 0 {
-		return errors.New("proxy.max_retries cannot be negative")
+		return errors.New("proxy.maxRetries cannot be negative")
 	}
 	if cfg.Proxy.PacExecutionTimeout <= 0 {
-		return errors.New("proxy.pac_execution_timeout must be positive")
+		return errors.New("proxy.pacExecutionTimeout must be positive")
 	}
 
 	if cfg.Kerberos.Realm == "" {
@@ -141,25 +143,39 @@ func validateConfig(cfg *Config) error {
 	}
 
 	if len(cfg.EBPF.TargetPorts) == 0 {
-		slog.Warn("ebpf.target_ports is empty, BPF sockops will not redirect any connections.")
+		slog.Warn("ebpf.targetPorts is empty, BPF sockops will not redirect any connections.")
 	}
 	for i, port := range cfg.EBPF.TargetPorts {
 		if port <= 0 || port > 65535 {
-			return fmt.Errorf("invalid port %d found at index %d in ebpf.target_ports (must be 1-65535)", port, i)
+			return fmt.Errorf("invalid port %d found at index %d in ebpf.targetPorts (must be 1-65535)", port, i)
 		}
 	}
 	if cfg.EBPF.StatsInterval <= 0 {
-		return errors.New("ebpf.stats_interval must be a positive number of seconds")
+		return errors.New("ebpf.statsInterval must be a positive number of seconds")
 	}
 	if cfg.EBPF.NotificationChannelSize <= 0 {
-		return errors.New("ebpf.notification_channel_size must be positive")
+		return errors.New("ebpf.notificationChannelSize must be positive")
+	}
+
+	cleanedPaths := make([]string, 0, len(cfg.EBPF.Excluded))
+	for _, p := range cfg.EBPF.Excluded {
+		cleaned := filepath.Clean(p)
+		if cleaned != "" && cleaned != "." && cleaned != "/" {
+			cleanedPaths = append(cleanedPaths, cleaned)
+		} else {
+			slog.Warn("Ignoring invalid or potentially insecure excluded path", "path", p)
+		}
+	}
+	cfg.EBPF.Excluded = cleanedPaths
+	if len(cfg.EBPF.Excluded) > 0 {
+		slog.Info("Executable exclusion paths loaded", "paths", cfg.EBPF.Excluded)
 	}
 
 	if cfg.SocketPath == "" {
-		return errors.New("socket_path must be specified for IPC")
+		return errors.New("socketPath must be specified for IPC")
 	}
 	if cfg.ShutdownTimeout <= 0 {
-		return errors.New("shutdown_timeout must be a positive number of seconds")
+		return errors.New("shutdownTimeout must be a positive number of seconds")
 	}
 
 	return nil
@@ -168,31 +184,32 @@ func validateConfig(cfg *Config) error {
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("proxy.type", DefaultProxyType)
 	v.SetDefault("proxy.url", "")
-	v.SetDefault("proxy.wpad_url", "")
-	v.SetDefault("proxy.connection_timeout", DefaultProxyConnectionTimeout)
-	v.SetDefault("proxy.request_timeout", DefaultProxyRequestTimeout)
-	v.SetDefault("proxy.max_retries", DefaultProxyMaxRetries)
-	v.SetDefault("proxy.pac_charset", "utf-8")
-	v.SetDefault("proxy.pac_execution_timeout", 5)
+	v.SetDefault("proxy.wpadUrl", "")
+	v.SetDefault("proxy.connectionTimeout", DefaultProxyConnectionTimeout)
+	v.SetDefault("proxy.requestTimeout", DefaultProxyRequestTimeout)
+	v.SetDefault("proxy.maxRetries", DefaultProxyMaxRetries)
+	v.SetDefault("proxy.pacCharset", "utf-8")
+	v.SetDefault("proxy.pacExecutionTimeout", 5)
 
 	v.SetDefault("kerberos.realm", "")
-	v.SetDefault("kerberos.kdc_host", "")
+	v.SetDefault("kerberos.kdcHost", "")
 	v.SetDefault("kerberos.principal", "")
-	v.SetDefault("kerberos.keytab_path", "")
-	v.SetDefault("kerberos.enable_cache", DefaultKerberosEnableCache)
-	v.SetDefault("kerberos.ticket_lifetime", 24)
-	v.SetDefault("kerberos.cache_path", "")
+	v.SetDefault("kerberos.keytabPath", "")
+	v.SetDefault("kerberos.enableCache", DefaultKerberosEnableCache)
+	v.SetDefault("kerberos.ticketLifetime", 24)
+	v.SetDefault("kerberos.cachePath", "")
 
 	v.SetDefault("ebpf.interface", DefaultEBPFInterface)
-	v.SetDefault("ebpf.program_path", "")
-	v.SetDefault("ebpf.target_ports", []int{80, 443})
-	v.SetDefault("ebpf.load_mode", DefaultEBPFLoadMode)
-	v.SetDefault("ebpf.allow_dynamic_ports", DefaultEBPFAllowDynamicPorts)
-	v.SetDefault("ebpf.stats_interval", DefaultEBPFStatsInterval)
-	v.SetDefault("ebpf.notification_channel_size", DefaultEBPFNotifChanSize)
+	v.SetDefault("ebpf.programPath", "")
+	v.SetDefault("ebpf.targetPorts", []int{80, 443})
+	v.SetDefault("ebpf.loadMode", DefaultEBPFLoadMode)
+	v.SetDefault("ebpf.allowDynamicPorts", DefaultEBPFAllowDynamicPorts)
+	v.SetDefault("ebpf.statsInterval", DefaultEBPFStatsInterval)
+	v.SetDefault("ebpf.notificationChannelSize", DefaultEBPFNotifChanSize)
+	v.SetDefault("ebpf.excluded", []string{})
 
-	v.SetDefault("log_level", DefaultLogLevel)
-	v.SetDefault("log_path", DefaultLogPath)
-	v.SetDefault("shutdown_timeout", DefaultShutdownTimeout)
-	v.SetDefault("socket_path", DefaultSocketPath)
+	v.SetDefault("logLevel", DefaultLogLevel)
+	v.SetDefault("logPath", DefaultLogPath)
+	v.SetDefault("shutdownTimeout", DefaultShutdownTimeout)
+	v.SetDefault("socketPath", DefaultSocketPath)
 }

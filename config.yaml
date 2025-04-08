@@ -1,23 +1,19 @@
 proxy:
   type: wpad
-  wpad_url: "http://wpad/wpad.dat"
-  connection_timeout: 10
-  request_timeout: 30
-  max_retries: 3
-  pac_charset: ""
-  pac_execution_timeout: 5
+  wpadUrl: "http://wpad/wpad.dat"
 
 kerberos:
-  enable_cache: true
+  enableCache: true
 
 ebpf:
-  target_ports: [80, 443]
-  allow_dynamic_ports: true
-  stats_interval: 15
-  notification_channel_size: 4096
+  targetPorts: [80, 443]
+  excluded:
+    - "/usr/local/bin/kernelgatekeeper-service"
+    - "/usr/local/bin/kernelgatekeeper-client"
+    - "/opt/cisco/secureclient/bin/vpnagentd"
 
-log_level: "info"
-log_path: "/var/log/kernelgatekeeper.log"
+logLevel: "debug"
+logPath: "/var/log/kernelgatekeeper.log"
 
-shutdown_timeout: 30
-socket_path: "/var/run/kernelgatekeeper.sock"
+shutdownTimeout: 30
+socketPath: "/var/run/kernelgatekeeper.sock"
