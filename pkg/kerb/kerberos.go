@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jcmturner/gokrb5/v8/client"
+	gokrb5client "github.com/jcmturner/gokrb5/v8/client" // Alias for gokrb5 client type
 	krb5config "github.com/jcmturner/gokrb5/v8/config"
 	"github.com/jcmturner/gokrb5/v8/credentials"
 	"github.com/jcmturner/gokrb5/v8/spnego"
@@ -24,7 +24,7 @@ import (
 type KerberosClient struct {
 	config        *appconfig.KerberosConfig
 	krb5Config    *krb5config.Config
-	client        *client.Client
+	client        *gokrb5client.Client // Use the aliased type here
 	mu            sync.Mutex
 	ticketExpiry  time.Time
 	stopCh        chan struct{}
@@ -186,7 +186,7 @@ func (k *KerberosClient) initializeFromCCache(effectiveCacheName string) error {
 	// Create client FROM the loaded ccache. The client itself will select the appropriate TGT.
 	// Set DisablePAFXFAST to potentially improve compatibility with some KDCs.
 	// Pass k.krb5Config to provide context like default realm if needed.
-	cl, err := client.NewFromCCache(cc, k.krb5Config, client.DisablePAFXFAST(true))
+	cl, err := gokrb5client.NewFromCCache(cc, k.krb5Config, gokrb5client.DisablePAFXFAST(true))
 	if err != nil {
 		k.isInitialized = false // Ensure flag is false on failure
 		slog.Error("Failed to create client from ccache", "error", err)
@@ -206,16 +206,34 @@ func (k *KerberosClient) initializeFromCCache(effectiveCacheName string) error {
 	k.client = cl
 	k.isInitialized = true
 
-	// We can't directly access the ticket expiry time in this version of the library
-	// Setting a reasonable default (8 hours from now) - actual refresh will happen by external tools
-	k.ticketExpiry = time.Now().Add(8 * time.Hour)
-	slog.Info("Kerberos context initialized from ccache", "principal", strings.Join(k.client.Credentials.CName().NameString, "/"), "realm", k.client.Credentials.Realm(), "tgt_expiry", k.ticketExpiry.Format(time.RFC3339))
+	// Attempt to get the expiry time from the TGT
+	tgt, err := k.client.GetCachedTicket(k.client.Credentials.CName(), k.client.Credentials.Domain(), "krbtgt/"+k.client.Credentials.Domain()+"@"+k.client.Credentials.Domain())
+	if err == nil && tgt.EndTime.After(time.Now()) {
+		k.ticketExpiry = tgt.EndTime
+		slog.Info("Kerberos context initialized from ccache", "principal", strings.Join(k.client.Credentials.CName().NameString, "/"), "realm", k.client.Credentials.Realm(), "tgt_expiry", k.ticketExpiry.Format(time.RFC3339))
+	} else {
+		// If unable to get TGT expiry, set a reasonable default (e.g., 8 hours from now) - actual refresh will happen by external tools
+		k.ticketExpiry = time.Now().Add(8 * time.Hour)
+		slog.Warn("Could not determine exact TGT expiry from ccache, using default duration", "principal", strings.Join(k.client.Credentials.CName().NameString, "/"), "realm", k.client.Credentials.Realm(), "assumed_expiry", k.ticketExpiry.Format(time.RFC3339), "error", err)
+	}
+
 	return nil
+}
+
+// Gokrb5Client returns the underlying gokrb5 client instance.
+// This is needed for operations like generating SPNEGO tokens directly.
+func (k *KerberosClient) Gokrb5Client() *gokrb5client.Client {
+	k.mu.Lock() // Lock needed if client can be mutated concurrently
+	defer k.mu.Unlock()
+	return k.client
 }
 
 // CreateProxyTransport creates an http.RoundTripper that wraps the provided base transport
 // and automatically handles SPNEGO authentication using the initialized Kerberos client.
+// DEPRECATED: The logic was moved to establishConnectTunnel in the client. This function is no longer used there.
+// It's kept here for potential future use or reference.
 func (k *KerberosClient) CreateProxyTransport(baseTransport *http.Transport) (http.RoundTripper, error) {
+	slog.Warn("KerberosClient.CreateProxyTransport is deprecated and likely unused.")
 	// Check if the current ticket is valid before creating the transport
 	if err := k.CheckAndRefreshClient(); err != nil {
 		slog.Warn("Kerberos ticket potentially invalid before creating SPNEGO transport", "error", err)
@@ -223,16 +241,18 @@ func (k *KerberosClient) CreateProxyTransport(baseTransport *http.Transport) (ht
 	}
 
 	k.mu.Lock()
-	defer k.mu.Unlock()
+	gokrbCl := k.client // Get client under lock
+	isInit := k.isInitialized
+	k.mu.Unlock()
 
-	if !k.isInitialized || k.client == nil {
+	if !isInit || gokrbCl == nil {
 		return nil, errors.New("kerberos client not initialized or ticket invalid, cannot create SPNEGO transport")
 	}
 
 	// Create a custom roundtripper that wraps the base transport and adds SPNEGO authentication headers
 	spnegoTransport := &spnegoRoundTripper{
 		base:   baseTransport,
-		client: k.client,
+		client: gokrbCl, // Pass the fetched client
 	}
 	slog.Info("Created SPNEGO HTTP transport wrapper using user credentials")
 
@@ -240,12 +260,14 @@ func (k *KerberosClient) CreateProxyTransport(baseTransport *http.Transport) (ht
 }
 
 // spnegoRoundTripper is a custom http.RoundTripper that adds SPNEGO authentication headers
+// DEPRECATED: See CreateProxyTransport deprecation notice.
 type spnegoRoundTripper struct {
 	base   *http.Transport
-	client *client.Client
+	client *gokrb5client.Client // Use aliased type
 }
 
 // RoundTrip implements the http.RoundTripper interface
+// DEPRECATED: See CreateProxyTransport deprecation notice.
 func (s *spnegoRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Clone the request to avoid modifying the original
 	reqCopy := req.Clone(req.Context())

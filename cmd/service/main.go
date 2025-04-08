@@ -36,8 +36,9 @@ var (
 const (
 	defaultNotificationChanSize = 4096 // Default if not in config
 	ipcWriteTimeout             = 2 * time.Second
-	ipcReadTimeout              = 10 * time.Second // Allow some buffer for client processing status ping etc.
-	statsLogInterval            = 5 * time.Minute  // Interval for logging channel/client stats
+	ipcReadIdleTimeout          = 90 * time.Second  // Max time to wait for *any* client command
+	statsLogInterval            = 5 * time.Minute   // Interval for logging channel/client stats
+	clientStatusTTL             = 150 * time.Second // How long client status reports are considered valid
 )
 
 // ClientState holds runtime information about a connected client.
@@ -85,7 +86,7 @@ func main() {
 
 	// Load initial configuration
 	// Use default path if flag isn't set correctly (though flag has default)
-	cfgPath := config.DefaultConfigPath
+	cfgPath := "/etc/kernelgatekeeper/config.yaml" // Default path
 	if configPath != nil && *configPath != "" {
 		cfgPath = *configPath
 	}
@@ -386,7 +387,7 @@ func (s *Service) sendToClient(conn net.Conn, cmd *ipc.Command) {
 		if err != nil {
 			// Log error and remove the client connection
 			// Don't log error if it's just context cancellation during shutdown
-			if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+			if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) || isConnectionClosedErr(err) {
 				logCtx.Info("IPC send cancelled or connection closed during send (likely shutdown)", "error", err)
 			} else {
 				logCtx.Warn("Failed to send command to client, removing client.", "error", err)
@@ -578,7 +579,7 @@ func (s *Service) handleIPCConnection(ctx context.Context, conn net.Conn) {
 
 		var cmd ipc.Command
 		// Set read deadline to detect inactive/hung clients
-		conn.SetReadDeadline(time.Now().Add(ipcReadTimeout + statusPingInterval)) // e.g., 10s + 60s
+		conn.SetReadDeadline(time.Now().Add(ipcReadIdleTimeout)) // Use the defined constant
 		err := decoder.Decode(&cmd)
 		conn.SetReadDeadline(time.Time{}) // Clear deadline
 
@@ -663,16 +664,17 @@ func (s *Service) processIPCCommand(conn net.Conn, cmd *ipc.Command, clientInfo 
 			return nil, errors.New("cannot verify client credentials")
 		}
 		uid := peerCred.Uid
-		pid := peerCred.Pid // Get PID from credentials as well
+		pid := peerCred.Pid // Get PID from credentials as well (int32)
 
 		// Check if PID from credentials matches PID from message (optional sanity check)
-		if uint32(data.PID) != pid {
+		// Cast both to int32 for comparison
+		if int32(data.PID) != pid {
 			slog.Warn("Client reported PID differs from socket credential PID", "reported_pid", data.PID, "credential_pid", pid)
 			// Decide whether to reject or just log. Using credential PID is safer.
 		}
 
-		// Add client to the map
-		s.addClientConn(conn, uid, pid)
+		// Add client to the map - cast pid to uint32 here
+		s.addClientConn(conn, uid, uint32(pid))
 
 		// Update the clientInfo pointer in the caller (handleIPCConnection)
 		s.ipcClientsMu.RLock()
@@ -777,19 +779,16 @@ func getPeerCredFromConn(conn net.Conn) (*unix.Ucred, error) {
 		return ucred, nil
 	}
 
-	// It's already a UnixConn, get credentials directly
-	ucred, err := unix.GetsockoptUcred(unixConn.RemoteAddr().(*net.UnixAddr).Net, unix.SOL_SOCKET, unix.SO_PEERCRED)
+	// It's already a UnixConn, get credentials via File() method which is more reliable.
+	file, fileErr := unixConn.File()
+	if fileErr != nil {
+		return nil, fmt.Errorf("failed to get file descriptor from unixConn: %w", fileErr)
+	}
+	defer file.Close()
+
+	ucred, err := unix.GetsockoptUcred(int(file.Fd()), unix.SOL_SOCKET, unix.SO_PEERCRED)
 	if err != nil {
-		// Fallback via File() if direct getsockopt fails (less common)
-		file, fileErr := unixConn.File()
-		if fileErr != nil {
-			return nil, fmt.Errorf("getsockopt SO_PEERCRED failed directly and failed to get file descriptor: %w (file err: %v)", err, fileErr)
-		}
-		defer file.Close()
-		ucred, err = unix.GetsockoptUcred(int(file.Fd()), unix.SOL_SOCKET, unix.SO_PEERCRED)
-		if err != nil {
-			return nil, fmt.Errorf("getsockopt SO_PEERCRED failed via file descriptor after direct failure: %w", err)
-		}
+		return nil, fmt.Errorf("getsockopt SO_PEERCRED failed via file descriptor: %w", err)
 	}
 	return ucred, nil
 }
@@ -805,7 +804,7 @@ func (s *Service) getStatusResponse() (*ipc.Response, error) {
 	for _, state := range s.ipcClients {
 		clientDetails = append(clientDetails, ipc.ClientInfo{PID: state.PID, UID: state.UID})
 		// Only include Kerberos status if the client reported it recently
-		if time.Since(state.LastPing) < 2*statusPingInterval { // e.g., within last 2 minutes
+		if time.Since(state.LastPing) < clientStatusTTL { // Use the defined constant
 			clientKerberosStates[state.UID] = state.LastStatus.KerberosStatus
 		}
 	}

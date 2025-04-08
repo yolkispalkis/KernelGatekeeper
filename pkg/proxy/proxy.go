@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -69,8 +70,13 @@ type wpadCacheEntry struct {
 type retrySettings struct {
 	maxRetries     int
 	retryDelay     time.Duration
-	connectTimeout time.Duration // Timeout for connecting to the proxy itself
+	connectTimeout time.Duration // Timeout for connecting to the proxy itself or fetching PAC
 	pacExecTimeout time.Duration // Timeout for executing PAC script
+}
+
+// Initialize random number generator used for jitter
+func init() {
+	rand.New(rand.NewSource(time.Now().UnixNano()))
 }
 
 // NewProxyManager creates and initializes a ProxyManager.
@@ -81,7 +87,7 @@ func NewProxyManager(cfg *appconfig.ProxyConfig) (*ProxyManager, error) {
 		"wpad_url", cfg.WpadURL)
 
 	connectTimeout := time.Duration(cfg.ConnectionTimeout) * time.Second
-	pacExecTimeout := time.Duration(cfg.Proxy.PacExecutionTimeout) * time.Second
+	pacExecTimeout := time.Duration(cfg.PacExecutionTimeout) * time.Second // Use correct field
 
 	// Basic transport for fetching PAC file (no proxy, specific timeouts)
 	pacTransport := &http.Transport{
@@ -194,8 +200,8 @@ func (pm *ProxyManager) updateProxySettings(initial bool) error {
 
 	if changed {
 		slog.Info("Effective proxy setting changed",
-			"old_type", pm.effectiveProxy.Type, "old_proxies", urlsToStrings(pm.effectiveProxy.Proxies),
-			"new_type", newResult.Type, "new_proxies", urlsToStrings(newResult.Proxies))
+			"old_type", pm.effectiveProxy.Type, "old_proxies", UrlsToStrings(pm.effectiveProxy.Proxies),
+			"new_type", newResult.Type, "new_proxies", UrlsToStrings(newResult.Proxies))
 		pm.effectiveProxy = newResult
 	} else {
 		slog.Debug("Effective proxy setting remains unchanged.")
@@ -249,7 +255,7 @@ func (pm *ProxyManager) GetEffectiveProxyForURL(targetURL *url.URL) (ProxyResult
 
 		// Parse the result string (e.g., "PROXY proxy:port; DIRECT")
 		parsedResult := pm.parsePacResult(resultString)
-		slog.Debug("PAC execution result for URL", "target_url", targetURL.String(), "result_string", resultString, "parsed_type", parsedResult.Type, "parsed_proxies", urlsToStrings(parsedResult.Proxies))
+		slog.Debug("PAC execution result for URL", "target_url", targetURL.String(), "result_string", resultString, "parsed_type", parsedResult.Type, "parsed_proxies", UrlsToStrings(parsedResult.Proxies))
 		return parsedResult, nil
 	default:
 		// Should not happen if validation is correct
@@ -276,7 +282,16 @@ func (pm *ProxyManager) GetEffectiveProxyURL() *url.URL {
 // wpadRefresher periodically calls updateProxySettings for WPAD type.
 func (pm *ProxyManager) wpadRefresher() {
 	// Use a slightly jittered interval based on cache duration
-	interval := wpadCacheDuration - (5 * time.Minute) + (time.Duration(10*time.Minute.Nanoseconds()) * time.Duration(time.Now().UnixNano()%100/100))
+	baseInterval := wpadCacheDuration
+	minInterval := baseInterval - (5 * time.Minute)
+	jitterRange := (10 * time.Minute).Nanoseconds() // 10 min jitter range
+	jitter := time.Duration(rand.Int63n(jitterRange))
+	interval := minInterval + jitter
+
+	if interval <= 0 { // Ensure positive interval
+		interval = 30 * time.Minute // Fallback to 30 mins if calculation is bad
+	}
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -289,6 +304,15 @@ func (pm *ProxyManager) wpadRefresher() {
 			if err := pm.updateProxySettings(false); err != nil {
 				slog.Error("Error during periodic WPAD refresh", "error", err)
 			}
+			// Reset ticker with new jittered interval
+			jitter = time.Duration(rand.Int63n(jitterRange))
+			interval = minInterval + jitter
+			if interval <= 0 {
+				interval = 30 * time.Minute
+			}
+			ticker.Reset(interval)
+			slog.Debug("WPAD refresher interval reset", "new_interval", interval)
+
 		case <-pm.stopChan:
 			slog.Info("Stopping WPAD refresh background task.")
 			return
@@ -305,7 +329,7 @@ func (pm *ProxyManager) getProxyFromWPAD(wpadURL string, force bool) (ProxyResul
 	if !force && pm.wpadCache.url == wpadURL && time.Since(pm.wpadCache.timestamp) < wpadCacheDuration {
 		cachedResult := pm.wpadCache.result
 		pm.wpadCache.mu.RUnlock()
-		slog.Debug("Using cached WPAD result", "type", cachedResult.Type, "proxies", urlsToStrings(cachedResult.Proxies))
+		slog.Debug("Using cached WPAD result", "type", cachedResult.Type, "proxies", UrlsToStrings(cachedResult.Proxies))
 		return cachedResult, nil
 	}
 	pm.wpadCache.mu.RUnlock()
@@ -340,7 +364,7 @@ func (pm *ProxyManager) getProxyFromWPAD(wpadURL string, force bool) (ProxyResul
 	// 4. Update cache
 	pm.updateWpadCache(wpadURL, parsedResult)
 
-	slog.Info("WPAD initial execution complete", "result_type", parsedResult.Type, "proxies", urlsToStrings(parsedResult.Proxies))
+	slog.Info("WPAD initial execution complete", "result_type", parsedResult.Type, "proxies", UrlsToStrings(parsedResult.Proxies))
 	return parsedResult, nil
 }
 
@@ -425,71 +449,93 @@ func (pm *ProxyManager) executePacScript(script, targetURL, targetHost string) (
 	defer pm.ottoVMMutex.Unlock()
 
 	// Set a timeout for the script execution
-	vm := pm.ottoVM // Use the pre-initialized VM
-	interrupt := make(chan func())
-	vm.Interrupt = interrupt
-	defer func() {
-		vm.Interrupt = nil // Clean up interrupt channel
-	}()
+	vm := pm.ottoVM             // Use the pre-initialized VM
+	halt := make(chan struct{}) // Channel to signal completion or timeout
+	defer close(halt)           // Ensure halt channel is closed eventually
+
+	vm.Interrupt = make(chan func()) // Interrupt channel for this execution
 
 	// Timeout goroutine
 	timeoutCtx, cancelTimeout := context.WithTimeout(context.Background(), pm.retryConfig.pacExecTimeout)
 	defer cancelTimeout()
+
 	go func() {
 		select {
 		case <-timeoutCtx.Done():
 			if timeoutCtx.Err() == context.DeadlineExceeded {
 				slog.Warn("PAC script execution timed out", "timeout", pm.retryConfig.pacExecTimeout)
 				// Send interrupt signal to Otto
-				interrupt <- func() {
+				vm.Interrupt <- func() {
 					panic(errors.New("pac script execution timeout"))
 				}
 			}
-		// If the interrupt channel is closed before timeout, just exit
-		case <-interrupt: // Check if already closed
+		case <-halt: // Exit if main function completes or panics first
 			return
 		}
 	}()
 
-	// Load the script (it might have changed since last execution)
-	// This replaces any previously loaded script in the shared VM.
-	_, err := vm.Run(script)
-	if err != nil {
-		// Check if the error was our timeout panic
-		if strings.Contains(err.Error(), "pac script execution timeout") {
-			return "", fmt.Errorf("pac script execution timed out after %s", pm.retryConfig.pacExecTimeout)
+	var resultString string
+	var err error
+
+	// Use a separate goroutine for the actual Otto execution
+	// to allow the timeout mechanism to interrupt it.
+	execDone := make(chan struct{})
+	go func() {
+		defer func() {
+			// Catch potential panic from timeout or script error
+			if r := recover(); r != nil {
+				if errStr, ok := r.(string); ok && strings.Contains(errStr, "pac script execution timeout") {
+					err = fmt.Errorf("pac script execution timed out after %s", pm.retryConfig.pacExecTimeout)
+				} else {
+					err = fmt.Errorf("panic during PAC script execution: %v", r)
+				}
+			}
+			close(execDone) // Signal completion or panic
+		}()
+
+		// Load the script (it might have changed since last execution)
+		// This replaces any previously loaded script in the shared VM.
+		_, loadErr := vm.Run(script)
+		if loadErr != nil {
+			panic(fmt.Errorf("failed to load PAC script into JS VM: %w", loadErr)) // Panic to be caught
 		}
-		return "", fmt.Errorf("failed to load PAC script into JS VM: %w", err)
+
+		// Prepare the function call string
+		call := fmt.Sprintf(`FindProxyForURL("%s", "%s")`, targetURL, targetHost) // Basic quoting
+
+		// Execute FindProxyForURL
+		value, runErr := vm.Run(call)
+		if runErr != nil {
+			// Check if FindProxyForURL is undefined
+			if strings.Contains(runErr.Error(), "ReferenceError:") && strings.Contains(runErr.Error(), "FindProxyForURL") {
+				panic(errors.New("function 'FindProxyForURL' not found in PAC script"))
+			}
+			panic(fmt.Errorf("failed to execute FindProxyForURL in PAC script: %w", runErr))
+		}
+
+		// Convert result to string
+		resStr, convErr := value.ToString()
+		if convErr != nil {
+			panic(fmt.Errorf("failed to convert PAC result to string: %w", convErr))
+		}
+		resultString = resStr
+	}()
+
+	// Wait for execution to finish or timeout context to cancel
+	select {
+	case <-execDone:
+		// Execution finished (or panicked), err will be set if panic occurred
+	case <-timeoutCtx.Done():
+		// This case might be hit if the timeout occurs just as execDone is closing,
+		// but the primary timeout mechanism is the interrupt.
+		if err == nil { // Ensure we report timeout if no panic captured
+			err = fmt.Errorf("pac script execution timed out after %s (context signal)", pm.retryConfig.pacExecTimeout)
+		}
 	}
 
-	// Prepare the function call string
-	// Ensure proper escaping if URL/host contain special characters, though unlikely for standard usage.
-	// Otto's Run handles basic string evaluation.
-	call := fmt.Sprintf(`FindProxyForURL("%s", "%s")`, targetURL, targetHost) // Basic quoting
+	vm.Interrupt = nil // Clean up interrupt channel
 
-	// Execute FindProxyForURL
-	value, err := vm.Run(call)
-	close(interrupt) // Signal timeout goroutine to exit
-
-	if err != nil {
-		// Check for timeout error again
-		if strings.Contains(err.Error(), "pac script execution timeout") {
-			return "", fmt.Errorf("pac script execution timed out after %s", pm.retryConfig.pacExecTimeout)
-		}
-		// Check if FindProxyForURL is undefined
-		if strings.Contains(err.Error(), "ReferenceError:") && strings.Contains(err.Error(), "FindProxyForURL") {
-			return "", fmt.Errorf("function 'FindProxyForURL' not found in PAC script")
-		}
-		return "", fmt.Errorf("failed to execute FindProxyForURL in PAC script: %w", err)
-	}
-
-	// Convert result to string
-	resultString, err := value.ToString()
-	if err != nil {
-		return "", fmt.Errorf("failed to convert PAC result to string: %w", err)
-	}
-
-	return resultString, nil
+	return resultString, err
 }
 
 // parsePacResult converts the string output of FindProxyForURL into a ProxyResult.
@@ -634,7 +680,15 @@ func (pm *ProxyManager) pacIsPlainHostName(call otto.FunctionCall) otto.Value {
 func (pm *ProxyManager) pacDnsDomainIs(call otto.FunctionCall) otto.Value {
 	host, _ := call.Argument(0).ToString()
 	domain, _ := call.Argument(1).ToString()
-	result := strings.HasSuffix(strings.ToLower(host), strings.ToLower(domain))
+	// Ensure domain starts with a dot for proper suffix matching unless it's an exact match
+	hostLower := strings.ToLower(host)
+	domainLower := strings.ToLower(domain)
+	var result bool
+	if strings.HasPrefix(domainLower, ".") {
+		result = strings.HasSuffix(hostLower, domainLower)
+	} else {
+		result = hostLower == domainLower || strings.HasSuffix(hostLower, "."+domainLower)
+	}
 	v, _ := pm.ottoVM.ToValue(result)
 	return v
 }
@@ -653,7 +707,9 @@ func (pm *ProxyManager) pacLocalHostOrDomainIs(call otto.FunctionCall) otto.Valu
 func (pm *ProxyManager) pacIsResolvable(call otto.FunctionCall) otto.Value {
 	host, _ := call.Argument(0).ToString()
 	// Simple check: try to resolve
-	_, err := net.LookupHost(host)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second) // Short timeout for resolvability check
+	defer cancel()
+	_, err := net.DefaultResolver.LookupHost(ctx, host)
 	result := err == nil
 	v, _ := pm.ottoVM.ToValue(result)
 	return v
@@ -661,7 +717,9 @@ func (pm *ProxyManager) pacIsResolvable(call otto.FunctionCall) otto.Value {
 
 func (pm *ProxyManager) pacDnsResolve(call otto.FunctionCall) otto.Value {
 	host, _ := call.Argument(0).ToString()
-	addrs, err := net.LookupHost(host)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second) // Short timeout for DNS resolve check
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
 	if err != nil || len(addrs) == 0 {
 		return otto.NullValue() // Return null on failure as per spec
 	}
@@ -746,8 +804,8 @@ func (pm *ProxyManager) Close() error {
 	return nil
 }
 
-// Helper to convert URL slice to string slice for logging.
-func urlsToStrings(urls []*url.URL) []string {
+// UrlsToStrings converts URL slice to string slice for logging (Exported).
+func UrlsToStrings(urls []*url.URL) []string {
 	if urls == nil {
 		return nil
 	}
@@ -771,14 +829,37 @@ func reflectDeepEqualProxyResult(a, b ProxyResult) bool {
 		return false
 	}
 	// Compare proxies by string representation as url.URL deep equal is tricky
-	aStrs := urlsToStrings(a.Proxies)
-	bStrs := urlsToStrings(b.Proxies)
-	if len(aStrs) != len(bStrs) { // Should be caught by len check above, but double-check
+	aStrs := UrlsToStrings(a.Proxies) // Use exported version
+	bStrs := UrlsToStrings(b.Proxies) // Use exported version
+	if len(aStrs) != len(bStrs) {     // Should be caught by len check above, but double-check
 		return false
 	}
 	// Order matters here - PAC results are ordered preference
 	for i := range aStrs {
 		if aStrs[i] != bStrs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Helper function for comparing url.URL slices (order matters)
+func reflectDeepEqualURLSlice(a, b []*url.URL) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		// Compare string representations for simplicity, as reflect.DeepEqual doesn't work well
+		// with unexported fields in url.URL.
+		aStr := ""
+		bStr := ""
+		if a[i] != nil {
+			aStr = a[i].String()
+		}
+		if b[i] != nil {
+			bStr = b[i].String()
+		}
+		if aStr != bStr {
 			return false
 		}
 	}

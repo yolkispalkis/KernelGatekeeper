@@ -27,6 +27,7 @@ import (
 	"time"
 	"unsafe"
 
+	// Import gokrb5 client specifically
 	"github.com/jcmturner/gokrb5/v8/spnego"
 	"github.com/yolki/kernelgatekeeper/pkg/config"
 	"github.com/yolki/kernelgatekeeper/pkg/ipc"
@@ -711,7 +712,7 @@ func handleAcceptedConnection(ctx context.Context, acceptedConn net.Conn, origin
 			logCtx.Error("Proxy result indicates PROXY but list is empty. Closing connection.")
 			return
 		}
-		logCtx.Info("Proxy determined for target", "proxies", proxy.UrlsToStringsForLog(proxyResult.Proxies)) // Use helper for logging
+		logCtx.Info("Proxy determined for target", "proxies", proxy.UrlsToStrings(proxyResult.Proxies)) // Use exported helper for logging
 
 		var proxyConn net.Conn
 		var selectedProxyURL *url.URL
@@ -799,7 +800,7 @@ func establishConnectTunnel(ctx context.Context, proxyConn net.Conn, targetAddr 
 		connectReq.Header.Set("Connection", "Keep-Alive")       // Optional
 
 		// Add Kerberos / SPNEGO header if available and required (or on 2nd attempt)
-		needsAuth := (attempt > 1) // Always attempt auth on 2nd try
+		// NOTE: Removed unused `needsAuth` variable
 		if krbClient != nil {
 			// Check ticket validity before attempting SPNEGO (non-fatal warning if fails)
 			if kerr := krbClient.CheckAndRefreshClient(); kerr != nil {
@@ -809,7 +810,23 @@ func establishConnectTunnel(ctx context.Context, proxyConn net.Conn, targetAddr 
 			// Use gokrb5's SPNEGO helper to add the header
 			// It's okay if CheckAndRefreshClient warned, SetSPNEGOHeader will use the available TGT
 			// Pass empty service principal name "" for standard HTTP proxy SPN (HTTP/proxy.host@REALM)
-			spnegoErr := spnego.SetSPNEGOHeader(krbClient.GetClient(), connectReq, "") // Get underlying client
+			gokrbCl := krbClient.Gokrb5Client() // Get the underlying client using the new exported method
+			if gokrbCl == nil && attempt > 1 {
+				// If we need auth on 2nd attempt but Kerberos client isn't initialized internally
+				lastErr = errors.New("kerberos client not initialized internally, cannot add SPNEGO header on retry")
+				logCtx.Error("Cannot add SPNEGO header", "error", lastErr)
+				continue // Try next proxy? Or return error? Return error.
+				// return lastErr
+			}
+
+			var spnegoErr error
+			if gokrbCl != nil { // Only attempt if the underlying client is available
+				spnegoErr = spnego.SetSPNEGOHeader(gokrbCl, connectReq, "")
+			} else if attempt > 1 {
+				// If we must authenticate but underlying client is nil
+				spnegoErr = errors.New("kerberos client not initialized internally, cannot generate SPNEGO token")
+			}
+
 			if spnegoErr != nil {
 				// Log error but continue without header if it fails? Or fail hard?
 				// Let's fail hard on 2nd attempt if SPNEGO header fails.
@@ -822,7 +839,7 @@ func establishConnectTunnel(ctx context.Context, proxyConn net.Conn, targetAddr 
 				}
 			} else if connectReq.Header.Get("Proxy-Authorization") != "" {
 				logCtx.Debug("SPNEGO Proxy-Authorization header added", "attempt", attempt)
-				needsAuth = true // We added an auth header
+				// needsAuth = true // We added an auth header - needsAuth is unused
 			} else if attempt > 1 {
 				logCtx.Warn("SPNEGO did not add Proxy-Authorization header on retry attempt")
 			}
@@ -1307,7 +1324,9 @@ var nativeEndian binary.ByteOrder
 // Initialize nativeEndian.
 func init() {
 	// Seed random number generator used for jitter
-	rand.Seed(time.Now().UnixNano())
+	// Use crypto/rand for better seeding in production, but math/rand is okay for simple jitter
+	// rand.Seed(time.Now().UnixNano()) // Already done in proxy/proxy.go, avoid re-seeding
+	rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	// Determine byte order
 	buf := [2]byte{}
