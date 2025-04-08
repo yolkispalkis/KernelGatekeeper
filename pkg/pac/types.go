@@ -5,37 +5,30 @@ import (
 	"time"
 )
 
-// ResultType indicates the outcome of PAC evaluation for a URL.
 type ResultType int
 
 const (
-	ResultUnknown ResultType = iota // Error or undetermined
-	ResultDirect                    // "DIRECT"
-	ResultProxy                     // One or more proxies specified
+	ResultUnknown ResultType = iota
+	ResultDirect
+	ResultProxy
 )
 
-// ProxyInfo describes a single proxy server returned by PAC.
 type ProxyInfo struct {
-	Scheme string // "http", "https" (SOCKS not currently supported by kernelgatekeeper client)
-	Host   string // "hostname:port"
+	Scheme string
+	Host   string
 }
 
-// PacResult represents the fully parsed outcome of FindProxyForURL.
 type PacResult struct {
 	Type    ResultType
-	Proxies []ProxyInfo // Ordered list if Type is ResultProxy. Empty for ResultDirect.
+	Proxies []ProxyInfo
 }
 
-// dnsCacheEntry stores a resolved IP and its expiry time.
 type dnsCacheEntry struct {
-	ip     string // Store as string for simplicity with PAC
+	ip     string
 	expiry time.Time
 }
 
-// Helper to convert internal ProxyInfo to net/url.URL (best effort)
 func (p ProxyInfo) URL() (*url.URL, error) {
-	// Ensure host contains port. If not, assign default? For now, assume valid.
-	// Construct the full URL string before parsing
 	urlString := p.Scheme + "://" + p.Host
 	return url.Parse(urlString)
 }

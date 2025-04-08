@@ -185,3 +185,4 @@ socket_path: "/var/run/kernelgatekeeper.sock" # Путь к Unix-сокету д
 ## Лицензия
 
 MIT
+

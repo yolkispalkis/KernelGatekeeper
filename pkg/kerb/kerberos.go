@@ -1,4 +1,3 @@
-// pkg/kerb/kerberos.go
 package kerb
 
 import (
@@ -13,13 +12,10 @@ import (
 	"sync"
 	"time"
 
-	gokrb5client "github.com/jcmturner/gokrb5/v8/client" // Alias for gokrb5 client type
+	gokrb5client "github.com/jcmturner/gokrb5/v8/client"
 	krb5config "github.com/jcmturner/gokrb5/v8/config"
 	"github.com/jcmturner/gokrb5/v8/credentials"
 	"github.com/jcmturner/gokrb5/v8/spnego"
-
-	// NOTE: No longer need types.Ticket directly here
-	// "github.com/jcmturner/gokrb5/v8/types"
 
 	appconfig "github.com/yolki/kernelgatekeeper/pkg/config"
 )
@@ -27,23 +23,18 @@ import (
 type KerberosClient struct {
 	config        *appconfig.KerberosConfig
 	krb5Config    *krb5config.Config
-	client        *gokrb5client.Client // Use the aliased type here
+	client        *gokrb5client.Client
 	mu            sync.Mutex
-	ticketExpiry  time.Time // Stores an estimated expiry time
-	stopCh        chan struct{}
+	ticketExpiry  time.Time
 	isInitialized bool
 }
 
-// NewKerberosClient initializes a Kerberos client primarily using the user's credential cache (ccache).
-// Configuration hints like realm are used, but the actual TGT is expected to be managed externally (e.g., via kinit).
 func NewKerberosClient(cfg *appconfig.KerberosConfig) (*KerberosClient, error) {
 	slog.Info("Initializing Kerberos client for user", "realm", cfg.Realm)
 
 	effectiveCacheName := determineEffectiveCacheName(cfg.CachePath)
 	slog.Debug("Determined effective ccache name pattern", "pattern", effectiveCacheName)
 
-	// Load system krb5.conf if available, otherwise create a minimal one.
-	// This provides context like default_realm if not specified or for DNS lookups.
 	krbConf, err := loadMinimalKrb5Config(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed load krb5 config: %w", err)
@@ -52,43 +43,34 @@ func NewKerberosClient(cfg *appconfig.KerberosConfig) (*KerberosClient, error) {
 	k := &KerberosClient{
 		config:     cfg,
 		krb5Config: krbConf,
-		stopCh:     make(chan struct{}),
 	}
 
-	// Attempt initial setup from the credential cache.
 	if err := k.initializeFromCCache(effectiveCacheName); err != nil {
 		slog.Warn("Initial Kerberos client setup from ccache failed", "error", err, "advice", "Ensure 'kinit' has been run or ccache is valid.")
-		// Continue even if initial load fails; CheckAndRefreshClient might succeed later.
 	} else {
 		slog.Info("Kerberos client successfully initialized from ccache.")
 	}
 
-	// Note: This client relies on external tools (kinit, sssd) to manage the TGT in the ccache.
-	// It only reads the cache, it doesn't perform kinit itself.
 	slog.Warn("Automatic ticket renewal is handled by system tools (e.g., kinit, sssd) when using user credential cache (ccache).")
 
 	return k, nil
 }
 
-// determineEffectiveCacheName figures out the ccache path based on environment, config, or defaults.
 func determineEffectiveCacheName(configCachePath string) string {
 	cachePath := os.Getenv("KRB5CCNAME")
 	source := "environment (KRB5CCNAME)"
 
-	// If KRB5CCNAME is not set, try the path from the application config
 	if cachePath == "" && configCachePath != "" && !strings.Contains(configCachePath, "%{null}") {
 		cachePath = configCachePath
 		source = "config (kerberos.cache_path)"
 	}
 
-	// If still no path, use the default pattern /tmp/krb5cc_%{uid}
 	if cachePath == "" {
 		uidStr := strconv.Itoa(os.Getuid())
 		cachePath = fmt.Sprintf("FILE:/tmp/krb5cc_%s", uidStr)
 		source = "default pattern"
 	}
 
-	// Replace placeholders like %{uid} or %{USERID}
 	if strings.Contains(cachePath, "%{uid}") {
 		cachePath = strings.ReplaceAll(cachePath, "%{uid}", strconv.Itoa(os.Getuid()))
 	}
@@ -96,7 +78,6 @@ func determineEffectiveCacheName(configCachePath string) string {
 		cachePath = strings.ReplaceAll(cachePath, "%{USERID}", strconv.Itoa(os.Getuid()))
 	}
 
-	// Ensure the path starts with a type prefix (e.g., FILE:) if not already present.
 	if !strings.HasPrefix(cachePath, "FILE:") && !strings.HasPrefix(cachePath, "DIR:") && !strings.HasPrefix(cachePath, "API:") && !strings.HasPrefix(cachePath, "KEYRING:") && !strings.HasPrefix(cachePath, "KCM:") {
 		cachePath = "FILE:" + cachePath
 	}
@@ -105,26 +86,19 @@ func determineEffectiveCacheName(configCachePath string) string {
 	return cachePath
 }
 
-// loadMinimalKrb5Config tries to load the system /etc/krb5.conf.
-// If that fails or doesn't exist, it constructs a minimal config string
-// based on the application config (or guesses the realm).
 func loadMinimalKrb5Config(cfg *appconfig.KerberosConfig) (*krb5config.Config, error) {
-	// Try loading the system default krb5.conf first
-	c, err := krb5config.Load("") // Passing "" loads default paths like /etc/krb5.conf
+	c, err := krb5config.Load("")
 	if err == nil && c != nil {
 		slog.Info("Loaded system Kerberos configuration for client context")
-		// If a realm is specified in our app config, ensure it overrides the system default
 		if cfg.Realm != "" && c.LibDefaults.DefaultRealm != cfg.Realm {
 			slog.Debug("Overriding default_realm from system config", "system", c.LibDefaults.DefaultRealm, "app", cfg.Realm)
 			c.LibDefaults.DefaultRealm = cfg.Realm
 		}
 		return c, nil
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		// Log if there was an error other than file not found
 		slog.Warn("Error loading system krb5.conf", "error", err)
 	}
 
-	// If system config failed or didn't exist, create a minimal one
 	slog.Info("No system krb5.conf found or load failed, creating minimal config for client.")
 	confStr := "[libdefaults]\n"
 	realmSet := false
@@ -132,7 +106,6 @@ func loadMinimalKrb5Config(cfg *appconfig.KerberosConfig) (*krb5config.Config, e
 		confStr += fmt.Sprintf("  default_realm = %s\n", cfg.Realm)
 		realmSet = true
 	} else {
-		// Try to guess realm from the current username (e.g., user@REALM.COM)
 		currentUser, userErr := user.Current()
 		if userErr == nil && strings.Contains(currentUser.Username, "@") {
 			parts := strings.SplitN(currentUser.Username, "@", 2)
@@ -149,10 +122,9 @@ func loadMinimalKrb5Config(cfg *appconfig.KerberosConfig) (*krb5config.Config, e
 		return nil, errors.New("kerberos realm is not configured and could not be guessed")
 	}
 
-	// Add basic defaults for KDC lookup via DNS
 	confStr += "  dns_lookup_kdc = true\n"
-	confStr += "  dns_lookup_realm = false\n" // Usually false, realm is known
-	confStr += "  rdns = false\n"             // Avoid reverse DNS lookups
+	confStr += "  dns_lookup_realm = false\n"
+	confStr += "  rdns = false\n"
 
 	slog.Debug("Using minimal generated krb5 config string", "config", confStr)
 	newConf, configErr := krb5config.NewFromString(confStr)
@@ -162,13 +134,10 @@ func loadMinimalKrb5Config(cfg *appconfig.KerberosConfig) (*krb5config.Config, e
 	return newConf, nil
 }
 
-// initializeFromCCache attempts to load credentials from the specified ccache path
-// and create a gokrb5 client instance. It updates the client's state.
 func (k *KerberosClient) initializeFromCCache(effectiveCacheName string) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 
-	// If a client already exists, destroy it first
 	if k.client != nil {
 		k.client.Destroy()
 		k.client = nil
@@ -178,40 +147,34 @@ func (k *KerberosClient) initializeFromCCache(effectiveCacheName string) error {
 
 	slog.Info("Attempting Kerberos init using credential cache", "name", effectiveCacheName)
 
-	// Load the credential cache file/resource
 	cc, err := credentials.LoadCCache(effectiveCacheName)
 	if err != nil {
-		k.isInitialized = false // Ensure flag is false on failure
+		k.isInitialized = false
 		slog.Error("Failed to load user ccache", "name", effectiveCacheName, "error", err)
 		return fmt.Errorf("failed load user ccache '%s': %w", effectiveCacheName, err)
 	}
 
-	// Create client FROM the loaded ccache. The client itself will select the appropriate TGT.
-	// Set DisablePAFXFAST to potentially improve compatibility with some KDCs.
-	// Pass k.krb5Config to provide context like default realm if needed.
 	cl, err := gokrb5client.NewFromCCache(cc, k.krb5Config, gokrb5client.DisablePAFXFAST(true))
 	if err != nil {
-		k.isInitialized = false // Ensure flag is false on failure
+		k.isInitialized = false
 		slog.Error("Failed to create client from ccache", "error", err)
 		return fmt.Errorf("failed create client from ccache: %w", err)
 	}
 
-	// Validate the TGT within the client's credentials
 	if cl.Credentials == nil {
-		k.isInitialized = false // Ensure flag is false if TGT is bad
-		cl.Destroy()            // Clean up the partially created client
+		k.isInitialized = false
+		cl.Destroy()
 		errMsg := "no valid credentials found in loaded ccache"
 		slog.Error(errMsg)
 		return errors.New(errMsg)
 	}
 
-	// Success! Store the client and update state.
 	k.client = cl
 	k.isInitialized = true
 
-	// Estimate expiry time. Cannot reliably get actual TGT expiry from client object.
-	// Using a default of 8 hours. CheckAndRefreshClient relies on reloading the ccache.
-	k.ticketExpiry = time.Now().Add(8 * time.Hour)
+	// Cannot reliably get TGT expiry from client object after loading from ccache.
+	// Set a reasonable default or use a heuristic. Rely on CheckAndRefreshClient.
+	k.ticketExpiry = time.Now().Add(8 * time.Hour) // Default 8 hours estimate
 	slog.Info("Kerberos context initialized from ccache",
 		"principal", strings.Join(k.client.Credentials.CName().NameString, "/"),
 		"realm", k.client.Credentials.Realm(),
@@ -220,28 +183,21 @@ func (k *KerberosClient) initializeFromCCache(effectiveCacheName string) error {
 	return nil
 }
 
-// Gokrb5Client returns the underlying gokrb5 client instance.
-// This is needed for operations like generating SPNEGO tokens directly.
 func (k *KerberosClient) Gokrb5Client() *gokrb5client.Client {
-	k.mu.Lock() // Lock needed if client can be mutated concurrently
+	k.mu.Lock()
 	defer k.mu.Unlock()
 	return k.client
 }
 
-// CreateProxyTransport creates an http.RoundTripper that wraps the provided base transport
-// and automatically handles SPNEGO authentication using the initialized Kerberos client.
-// DEPRECATED: The logic was moved to establishConnectTunnel in the client. This function is no longer used there.
-// It's kept here for potential future use or reference.
+// CreateProxyTransport is deprecated
 func (k *KerberosClient) CreateProxyTransport(baseTransport *http.Transport) (http.RoundTripper, error) {
 	slog.Warn("KerberosClient.CreateProxyTransport is deprecated and likely unused.")
-	// Check if the current ticket is valid before creating the transport
 	if err := k.CheckAndRefreshClient(); err != nil {
 		slog.Warn("Kerberos ticket potentially invalid before creating SPNEGO transport", "error", err)
-		// Don't necessarily fail here, let SPNEGO attempt auth, but log the warning.
 	}
 
 	k.mu.Lock()
-	gokrbCl := k.client // Get client under lock
+	gokrbCl := k.client
 	isInit := k.isInitialized
 	k.mu.Unlock()
 
@@ -249,36 +205,30 @@ func (k *KerberosClient) CreateProxyTransport(baseTransport *http.Transport) (ht
 		return nil, errors.New("kerberos client not initialized or ticket invalid, cannot create SPNEGO transport")
 	}
 
-	// Create a custom roundtripper that wraps the base transport and adds SPNEGO authentication headers
 	spnegoTransport := &spnegoRoundTripper{
 		base:   baseTransport,
-		client: gokrbCl, // Pass the fetched client
+		client: gokrbCl,
 	}
 	slog.Info("Created SPNEGO HTTP transport wrapper using user credentials")
 
 	return spnegoTransport, nil
 }
 
-// spnegoRoundTripper is a custom http.RoundTripper that adds SPNEGO authentication headers
-// DEPRECATED: See CreateProxyTransport deprecation notice.
+// spnegoRoundTripper is deprecated
 type spnegoRoundTripper struct {
 	base   *http.Transport
-	client *gokrb5client.Client // Use aliased type
+	client *gokrb5client.Client
 }
 
-// RoundTrip implements the http.RoundTripper interface
-// DEPRECATED: See CreateProxyTransport deprecation notice.
+// RoundTrip is deprecated
 func (s *spnegoRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Clone the request to avoid modifying the original
 	reqCopy := req.Clone(req.Context())
 
-	// Add SPNEGO authorization header
 	err := spnego.SetSPNEGOHeader(s.client, reqCopy, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to set SPNEGO header: %w", err)
 	}
 
-	// Use the base transport to perform the actual request
 	resp, err := s.base.RoundTrip(reqCopy)
 	if err != nil {
 		return nil, err
@@ -287,37 +237,31 @@ func (s *spnegoRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	return resp, nil
 }
 
-// CheckAndRefreshClient checks if the Kerberos TGT is valid based on estimated expiry.
-// If needed, it attempts to re-initialize the client by reloading the credential cache.
 func (k *KerberosClient) CheckAndRefreshClient() error {
 	k.mu.Lock()
 	isInit := k.isInitialized
 	expiry := k.ticketExpiry
-	ccName := determineEffectiveCacheName(k.config.CachePath) // Get current effective ccache path
+	ccName := determineEffectiveCacheName(k.config.CachePath)
 	k.mu.Unlock()
 
-	// Determine if a refresh attempt is needed: not initialized, or estimated expiry is near.
 	needsRefresh := !isInit || expiry.IsZero() || time.Now().Add(5*time.Minute).After(expiry)
 
 	if needsRefresh {
 		slog.Info("Kerberos ticket check: attempting refresh by reloading ccache...", "ccache", ccName, "reason_needs_init", !isInit, "reason_expiry_near", !expiry.IsZero() && time.Now().Add(5*time.Minute).After(expiry))
 
-		// Attempt to reload the ccache and re-initialize the client
 		err := k.initializeFromCCache(ccName)
 		if err != nil {
-			// Log the error but don't necessarily prevent operation if a previous ticket existed
 			slog.Error("Failed to refresh Kerberos client from ccache", "error", err)
-			return fmt.Errorf("ccache reload failed: %w", err) // Return error as refresh failed
+			return fmt.Errorf("ccache reload failed: %w", err)
 		}
 		slog.Info("Kerberos client state refreshed from ccache.")
-		return nil // Refresh successful
+		return nil
 	}
 
 	slog.Debug("Kerberos ticket check: OK (based on estimated expiry)")
-	return nil // Ticket is assumed okay based on estimate
+	return nil
 }
 
-// GetStatus returns the current status of the Kerberos client.
 func (k *KerberosClient) GetStatus() map[string]interface{} {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -328,13 +272,12 @@ func (k *KerberosClient) GetStatus() map[string]interface{} {
 		"initialized":           k.isInitialized,
 		"principal":             "N/A",
 		"realm":                 "N/A",
-		"tgt_expiry":            "N/A (estimated)", // Indicate expiry is estimated
+		"tgt_expiry":            "N/A (estimated)",
 		"tgt_time_left":         "N/A (estimated)",
-		"source":                "ccache", // This client always uses ccache
+		"source":                "ccache",
 		"effective_ccache_path": ccName,
 	}
 
-	// If initialized and client/credentials exist, populate details
 	if k.isInitialized && k.client != nil && k.client.Credentials != nil {
 		status["principal"] = strings.Join(k.client.Credentials.CName().NameString, "/")
 		status["realm"] = k.client.Credentials.Realm()
@@ -351,18 +294,16 @@ func (k *KerberosClient) GetStatus() map[string]interface{} {
 	return status
 }
 
-// Close destroys the Kerberos client session.
 func (k *KerberosClient) Close() {
 	slog.Info("Closing Kerberos client (user context)...")
 	k.mu.Lock()
 	defer k.mu.Unlock()
 
-	// Destroy the underlying gokrb5 client session if it exists
 	if k.client != nil {
 		k.client.Destroy()
 		k.client = nil
 		slog.Debug("Kerberos client session destroyed.")
 	}
-	k.isInitialized = false // Mark as not initialized
+	k.isInitialized = false
 	slog.Info("Kerberos client closed.")
 }
