@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -910,51 +909,4 @@ func ipIsInNet(ipStr, patternStr, maskStr string) bool {
 		slog.Warn("PAC isInNet: IP address versions mismatch or invalid mask format", "ip", ipStr, "pattern", patternStr, "mask", maskStr)
 		return false
 	}
-}
-
-// shExpMatchToRegexp converts a shell glob pattern to a Go regexp pattern.
-// Handles * and ? wildcards, escapes regex metacharacters.
-func shExpMatchToRegexp(pattern string) (string, error) {
-	var result strings.Builder
-	result.WriteString("^") // Anchor at the start
-
-	for i := 0; i < len(pattern); i++ {
-		char := pattern[i]
-		switch char {
-		case '*':
-			result.WriteString(".*") // Match zero or more characters
-		case '?':
-			result.WriteString(".") // Match any single character
-		// Escape regex metacharacters
-		case '.', '+', '{', '}', '(', ')', '[', ']', '\\', '^', '$', '|':
-			result.WriteByte('\\')
-			result.WriteByte(char)
-		default:
-			result.WriteByte(char)
-		}
-	}
-
-	result.WriteString("$") // Anchor at the end
-	return result.String(), nil
-}
-
-// Simplified shExpMatch using regexp (Alternative to filepath.Match for potentially better performance)
-func pacShExpMatchRegexp(call otto.FunctionCall) otto.Value {
-	str, _ := call.Argument(0).ToString()
-	pattern, _ := call.Argument(1).ToString()
-
-	regexpPattern, err := shExpMatchToRegexp(pattern)
-	if err != nil {
-		slog.Warn("Error converting shExp pattern to regexp", "pattern", pattern, "error", err)
-		return otto.FalseValue()
-	}
-
-	matched, err := regexp.MatchString(regexpPattern, str)
-	if err != nil {
-		slog.Warn("Error evaluating regexp in shExpMatch", "regexp", regexpPattern, "string", str, "error", err)
-		return otto.FalseValue()
-	}
-
-	v, _ := call.Otto.ToValue(matched)
-	return v
 }
