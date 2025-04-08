@@ -1,7 +1,7 @@
-// pkg/proxy/proxy.go
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,67 +11,45 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os" // Needed for file reading
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
-	"github.com/robertkrimen/otto"         // JavaScript engine for PAC
-	"golang.org/x/text/encoding/ianaindex" // For PAC charset decoding
+	"golang.org/x/text/encoding/ianaindex"
 	"golang.org/x/text/transform"
 
+	// "github.com/robertkrimen/otto" // No longer needed directly here
+
 	appconfig "github.com/yolki/kernelgatekeeper/pkg/config"
+	"github.com/yolki/kernelgatekeeper/pkg/pac" // Import the new PAC package
 )
 
-// ProxyResult represents the outcome of executing FindProxyForURL.
-type ProxyResult struct {
-	Type    ProxyResultType
-	Proxies []*url.URL // List of proxies if Type is ProxyResultProxy
-}
-
-// ProxyResultType indicates whether to use a proxy or connect directly.
-type ProxyResultType int
-
-const (
-	ProxyResultUnknown ProxyResultType = iota
-	ProxyResultDirect                  // "DIRECT"
-	ProxyResultProxy                   // "PROXY host:port; ..."
-	ProxyResultError                   // Error during PAC execution or parsing
-)
-
-const (
-	wpadCacheDuration = 1 * time.Hour   // How long to cache WPAD results
-	pacMaxSizeBytes   = 1 * 1024 * 1024 // 1MB limit for PAC file size
-)
+// ProxyResultType and ProxyResult are moved to pkg/pac/types.go
+// Constants like wpadCacheDuration, pacMaxSizeBytes can remain or move to pac pkg
 
 // ProxyManager handles obtaining and managing proxy settings, including WPAD/PAC.
 type ProxyManager struct {
 	config           *appconfig.ProxyConfig
-	effectiveProxy   ProxyResult // Stores the result for non-WPAD or the cached WPAD result
+	effectiveProxy   pac.PacResult // Stores the static or default WPAD result (use pac.PacResult type)
+	wpadPacScript    string        // Stores the content of the fetched PAC script for WPAD
 	proxyMutex       sync.RWMutex
-	baseTransport    *http.Transport // Used for fetching PAC files
-	ottoVM           *otto.Otto      // Reusable JS VM instance
-	ottoVMMutex      sync.Mutex      // Protects ottoVM access (otto is not thread-safe)
-	wpadCache        wpadCacheEntry
-	retryConfig      retrySettings
+	pacEngine        *pac.Engine  // Use the PAC engine
+	httpClientForPAC *http.Client // Dedicated client for fetching PAC
+	wpadCacheExpiry  time.Time    // When the fetched wpadPacScript expires
 	stopChan         chan struct{}
 	stopOnce         sync.Once
-	httpClientForPAC *http.Client // Dedicated client for fetching PAC
+	retryConfig      retrySettings // Keep retry settings
 }
 
-type wpadCacheEntry struct {
-	url       string
-	result    ProxyResult
-	timestamp time.Time
-	mu        sync.RWMutex
-}
-
+// retrySettings struct remains the same
 type retrySettings struct {
 	maxRetries     int
 	retryDelay     time.Duration
-	connectTimeout time.Duration // Timeout for connecting to the proxy itself or fetching PAC
-	pacExecTimeout time.Duration // Timeout for executing PAC script
+	connectTimeout time.Duration
+	pacExecTimeout time.Duration // This might be handled within pac.Engine now
 }
 
 // Initialize random number generator used for jitter
@@ -87,20 +65,26 @@ func NewProxyManager(cfg *appconfig.ProxyConfig) (*ProxyManager, error) {
 		"wpad_url", cfg.WpadURL)
 
 	connectTimeout := time.Duration(cfg.ConnectionTimeout) * time.Second
-	pacExecTimeout := time.Duration(cfg.PacExecutionTimeout) * time.Second // Use correct field
+	pacExecTimeout := time.Duration(cfg.PacExecutionTimeout) * time.Second // Default timeout for engine
 
-	// Basic transport for fetching PAC file (no proxy, specific timeouts)
+	// PAC Transport setup (remains the same)
 	pacTransport := &http.Transport{
-		Proxy: nil, // Never use proxy for fetching PAC
+		Proxy: nil,
 		DialContext: (&net.Dialer{
-			Timeout:   connectTimeout, // Use connection timeout for fetching PAC
+			Timeout:   connectTimeout,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          5, // Fewer needed for PAC fetching
+		MaxIdleConns:          5,
 		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	// Create the PAC engine
+	engine, err := pac.NewEngine()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize PAC engine: %w", err)
 	}
 
 	pm := &ProxyManager{
@@ -110,25 +94,19 @@ func NewProxyManager(cfg *appconfig.ProxyConfig) (*ProxyManager, error) {
 			maxRetries:     cfg.MaxRetries,
 			retryDelay:     time.Second * 2,
 			connectTimeout: connectTimeout,
-			pacExecTimeout: pacExecTimeout,
+			pacExecTimeout: pacExecTimeout, // Store for reference if needed
 		},
-		baseTransport: pacTransport, // Use this dedicated transport for PAC fetches
-		httpClientForPAC: &http.Client{ // Client using the PAC transport
+		pacEngine: engine, // Store the engine instance
+		httpClientForPAC: &http.Client{
 			Transport: pacTransport,
-			Timeout:   connectTimeout, // Overall timeout for PAC GET request
+			Timeout:   connectTimeout, // Overall timeout for PAC GET/read request
 		},
-		ottoVM: otto.New(), // Initialize the JS VM
 	}
 
-	// Pre-register basic PAC helper functions (implementations below)
-	if err := pm.registerPacHelpers(); err != nil {
-		return nil, fmt.Errorf("failed to register PAC helper functions: %w", err)
-	}
-
-	// Determine initial effective proxy settings
+	// Determine initial effective proxy settings (fetches/evaluates PAC if needed)
 	if err := pm.updateProxySettings(true); err != nil {
-		// Log error but allow manager to start, maybe it recovers later
-		slog.Error("Initial proxy settings update failed", "error", err)
+		slog.Error("Initial proxy settings update failed, proxy functionality may be impaired", "error", err)
+		// Continue, hoping a later refresh works
 	}
 
 	// Start WPAD refresher goroutine if type is wpad
@@ -140,173 +118,261 @@ func NewProxyManager(cfg *appconfig.ProxyConfig) (*ProxyManager, error) {
 }
 
 // updateProxySettings determines the effective proxy based on config type.
+// For WPAD, it fetches the script and runs it for a dummy URL to get the default.
 // If initial is true, forces WPAD fetch even if cache is valid.
 func (pm *ProxyManager) updateProxySettings(initial bool) error {
 	pm.proxyMutex.Lock()
 	defer pm.proxyMutex.Unlock()
 
-	var newResult ProxyResult
-	var err error
+	var newDefaultResult pac.PacResult // Stores the default result
+	var fetchedScriptContent string    // Store fetched script here for WPAD
+	var wpadErr error
 	proxyType := strings.ToLower(pm.config.Type)
 
 	switch proxyType {
 	case "http", "https":
 		if pm.config.URL == "" {
-			err = errors.New("proxy URL is empty for http/https type")
-			newResult = ProxyResult{Type: ProxyResultError}
+			wpadErr = errors.New("proxy URL is empty for http/https type")
+			newDefaultResult = pac.PacResult{Type: pac.ResultUnknown}
 		} else {
 			parsedURL, parseErr := url.Parse(pm.config.URL)
 			if parseErr != nil {
-				err = fmt.Errorf("invalid proxy URL '%s': %w", pm.config.URL, parseErr)
-				newResult = ProxyResult{Type: ProxyResultError}
+				wpadErr = fmt.Errorf("invalid proxy URL '%s': %w", pm.config.URL, parseErr)
+				newDefaultResult = pac.PacResult{Type: pac.ResultUnknown}
 			} else {
-				newResult = ProxyResult{Type: ProxyResultProxy, Proxies: []*url.URL{parsedURL}}
+				// Determine scheme and host:port from parsed URL
+				scheme := parsedURL.Scheme
+				if scheme == "" {
+					scheme = "http" // Default scheme
+				}
+				host := parsedURL.Host // Should include port if specified
+				if host == "" {
+					wpadErr = fmt.Errorf("proxy URL missing host:port: %s", pm.config.URL)
+					newDefaultResult = pac.PacResult{Type: pac.ResultUnknown}
+				} else {
+					// Ensure port is present if scheme implies it
+					if !strings.Contains(host, ":") {
+						if scheme == "https" {
+							host = net.JoinHostPort(host, "443")
+						} else {
+							host = net.JoinHostPort(host, "80") // Default for http/PROXY
+						}
+					}
+					newDefaultResult = pac.PacResult{
+						Type:    pac.ResultProxy,
+						Proxies: []pac.ProxyInfo{{Scheme: scheme, Host: host}},
+					}
+				}
 			}
 		}
 	case "wpad":
 		if pm.config.WpadURL == "" {
-			err = errors.New("WPAD URL is empty for wpad type")
-			newResult = ProxyResult{Type: ProxyResultError}
+			wpadErr = errors.New("WPAD URL is empty for wpad type")
+			newDefaultResult = pac.PacResult{Type: pac.ResultUnknown}
 		} else {
-			// Fetch from WPAD (using cache logic internally)
-			// Force fetch if it's the initial setup.
-			newResult, err = pm.getProxyFromWPAD(pm.config.WpadURL, initial)
-			if err != nil {
-				// On WPAD error, *keep* the previously known effective proxy setting
-				slog.Warn("Failed to get proxy from WPAD, retaining previous setting", "wpad_url", pm.config.WpadURL, "error", err)
-				err = nil                     // Clear error so we don't return it if keeping old setting
-				newResult = pm.effectiveProxy // Keep old setting
+			// --- WPAD Logic ---
+			// Check cache expiry unless forced
+			needsFetch := initial || time.Now().After(pm.wpadCacheExpiry) || pm.wpadPacScript == ""
+
+			if needsFetch {
+				slog.Info("Fetching/Refreshing WPAD PAC script", "url", pm.config.WpadURL, "force", initial)
+				scriptContent, fetchErr := pm.fetchPACScript(pm.config.WpadURL) // Updated fetch
+				if fetchErr != nil {
+					wpadErr = fmt.Errorf("failed to fetch PAC script from %s: %w", pm.config.WpadURL, fetchErr)
+					// Keep old script and expiry on fetch error? Yes. Log warning.
+					slog.Warn("Failed to fetch new PAC script, using previously cached script (if any)", "error", wpadErr)
+					// Use existing script for evaluation below if available
+					fetchedScriptContent = pm.wpadPacScript
+				} else {
+					fetchedScriptContent = scriptContent
+					pm.wpadPacScript = scriptContent // Store fetched script
+					pm.wpadCacheExpiry = time.Now().Add(wpadCacheDuration)
+					slog.Info("Successfully fetched and cached new PAC script.", "expiry", pm.wpadCacheExpiry.Format(time.RFC3339))
+				}
+			} else {
+				slog.Debug("Using cached WPAD PAC script content.", "expiry", pm.wpadCacheExpiry.Format(time.RFC3339))
+				fetchedScriptContent = pm.wpadPacScript // Use cached script
 			}
+
+			// Evaluate PAC for a dummy URL to get the default proxy setting
+			if fetchedScriptContent == "" {
+				slog.Warn("WPAD PAC script content is empty (fetch failed or empty file?), assuming DIRECT as default")
+				newDefaultResult = pac.PacResult{Type: pac.ResultDirect}
+			} else {
+				dummyURL := "http://example.com" // Standard dummy URL
+				dummyHost := "example.com"
+				slog.Debug("Evaluating PAC script for default proxy", "dummy_url", dummyURL)
+
+				// Create context for execution timeout
+				ctx, cancel := context.WithTimeout(context.Background(), pm.retryConfig.pacExecTimeout)
+
+				resultString, execErr := pm.pacEngine.FindProxyForURL(ctx, fetchedScriptContent, dummyURL, dummyHost)
+				cancel() // Release context resources
+
+				if execErr != nil {
+					// Error during default evaluation, keep old default if possible
+					wpadErr = fmt.Errorf("initial PAC script execution failed for dummy URL: %w", execErr)
+					slog.Warn("Failed to evaluate PAC for default, retaining previous default setting (if any)", "error", wpadErr)
+					newDefaultResult = pm.effectiveProxy // Keep old default
+				} else {
+					newDefaultResult = pac.ParseResult(resultString) // Parse the result
+					slog.Debug("PAC default evaluation result", "result_string", resultString, "parsed_type", newDefaultResult.Type)
+				}
+			}
+			// --- End WPAD Logic ---
 		}
 	case "none":
-		newResult = ProxyResult{Type: ProxyResultDirect} // "none" means DIRECT connection
+		newDefaultResult = pac.PacResult{Type: pac.ResultDirect}
 	default:
-		err = fmt.Errorf("unsupported proxy type: %s", pm.config.Type)
-		newResult = ProxyResult{Type: ProxyResultError}
+		wpadErr = fmt.Errorf("unsupported proxy type: %s", pm.config.Type)
+		newDefaultResult = pac.PacResult{Type: pac.ResultUnknown}
 	}
 
-	if err != nil {
-		slog.Error("Failed to determine effective proxy setting", "type", proxyType, "error", err)
-		// Persist the error state if we couldn't determine a proxy or keep the old one
-		if pm.effectiveProxy.Type != ProxyResultError {
-			slog.Warn("Updating effective proxy state to ERROR")
-			pm.effectiveProxy = ProxyResult{Type: ProxyResultError}
+	// Log errors if they occurred
+	if wpadErr != nil {
+		slog.Error("Error determining effective proxy setting", "type", proxyType, "error", wpadErr)
+		// If we encountered an error, ensure the effective type is Unknown/Error
+		if pm.effectiveProxy.Type != pac.ResultUnknown {
+			slog.Warn("Updating effective proxy state to Unknown/Error")
+			pm.effectiveProxy = pac.PacResult{Type: pac.ResultUnknown} // Reset to error state
 		}
-		return err // Return the error that occurred
+		// Keep existing script/expiry if WPAD fetch/exec failed
+		return wpadErr // Return the error
 	}
 
-	// Check if the effective proxy setting actually changed
-	changed := !reflectDeepEqualProxyResult(pm.effectiveProxy, newResult)
+	// Check if the effective *default* proxy setting actually changed
+	changed := !reflectDeepEqualPacResult(pm.effectiveProxy, newDefaultResult) // Use updated comparison func
 
 	if changed {
-		slog.Info("Effective proxy setting changed",
-			"old_type", pm.effectiveProxy.Type, "old_proxies", UrlsToStrings(pm.effectiveProxy.Proxies),
-			"new_type", newResult.Type, "new_proxies", UrlsToStrings(newResult.Proxies))
-		pm.effectiveProxy = newResult
+		logProxies := pac.UrlsFromPacResult(newDefaultResult) // Convert for logging
+		slog.Info("Effective default proxy setting changed",
+			"old_type", pm.effectiveProxy.Type, "old_proxies", UrlsToStrings(pac.UrlsFromPacResult(pm.effectiveProxy)), // Log old proxies
+			"new_type", newDefaultResult.Type, "new_proxies", UrlsToStrings(logProxies))
+		pm.effectiveProxy = newDefaultResult
 	} else {
-		slog.Debug("Effective proxy setting remains unchanged.")
+		slog.Debug("Effective default proxy setting remains unchanged.")
 	}
 
 	return nil // Success
 }
 
 // GetEffectiveProxyForURL determines the proxy to use for a specific target URL.
-// For WPAD, this executes the PAC script. For other types, it returns the static setting.
-func (pm *ProxyManager) GetEffectiveProxyForURL(targetURL *url.URL) (ProxyResult, error) {
-	pm.proxyMutex.RLock()
-	proxyType := strings.ToLower(pm.config.Type)
-	wpadURL := pm.config.WpadURL
-	staticResult := pm.effectiveProxy // Get the currently configured static/cached result
-	pm.proxyMutex.RUnlock()
-
+// For WPAD, this executes the PAC script using the PAC engine.
+func (pm *ProxyManager) GetEffectiveProxyForURL(targetURL *url.URL) (pac.PacResult, error) {
 	if targetURL == nil {
-		return ProxyResult{Type: ProxyResultError}, errors.New("targetURL cannot be nil")
+		return pac.PacResult{Type: pac.ResultUnknown}, errors.New("targetURL cannot be nil")
 	}
+
+	pm.proxyMutex.RLock() // Read lock needed for config type and script content
+	proxyType := strings.ToLower(pm.config.Type)
+	scriptContent := pm.wpadPacScript // Get cached script content
+	staticResult := pm.effectiveProxy // Get the default result
+	pm.proxyMutex.RUnlock()
 
 	switch proxyType {
 	case "http", "https":
-		// Return the statically configured proxy
-		if staticResult.Type == ProxyResultError {
+		// Return the statically configured proxy default
+		if staticResult.Type == pac.ResultUnknown {
 			return staticResult, errors.New("proxy statically configured but is in error state")
 		}
+		slog.Debug("Using static proxy setting for URL", "url", targetURL, "proxy_type", staticResult.Type, "proxies", UrlsToStrings(pac.UrlsFromPacResult(staticResult)))
 		return staticResult, nil
 	case "none":
 		// Always connect directly
-		return ProxyResult{Type: ProxyResultDirect}, nil
+		slog.Debug("Using DIRECT connection for URL (type=none)", "url", targetURL)
+		return pac.PacResult{Type: pac.ResultDirect}, nil
 	case "wpad":
-		// Need to execute PAC script for the specific URL
-		if wpadURL == "" {
-			return ProxyResult{Type: ProxyResultError}, errors.New("WPAD type configured but WPAD URL is missing")
-		}
-		pacScript, err := pm.fetchPACScript(wpadURL) // Fetch script (uses cache internally)
-		if err != nil {
-			return ProxyResult{Type: ProxyResultError}, fmt.Errorf("failed to fetch PAC script from %s: %w", wpadURL, err)
-		}
-		if pacScript == "" {
-			// Treat empty script as DIRECT? Or error? Let's assume error for now.
-			return ProxyResult{Type: ProxyResultError}, fmt.Errorf("fetched PAC script is empty from %s", wpadURL)
+		// Execute PAC script using the stored content
+		if scriptContent == "" {
+			// If fetch/initial eval failed, we might have no script
+			slog.Warn("WPAD mode active, but no PAC script content available, falling back to default", "url", targetURL, "default_type", staticResult.Type)
+			// Fallback to the cached 'default' result (which might be DIRECT or Unknown/Error)
+			if staticResult.Type == pac.ResultUnknown {
+				return staticResult, errors.New("WPAD mode active, but PAC script unavailable and no valid default")
+			}
+			return staticResult, nil
 		}
 
-		// Execute the PAC script
-		resultString, err := pm.executePacScript(pacScript, targetURL.String(), targetURL.Hostname())
+		slog.Debug("Evaluating WPAD PAC script for URL", "url", targetURL.String())
+		// Create context for execution timeout
+		ctx, cancel := context.WithTimeout(context.Background(), pm.retryConfig.pacExecTimeout) // Use configured timeout
+		defer cancel()
+
+		resultString, err := pm.pacEngine.FindProxyForURL(ctx, scriptContent, targetURL.String(), targetURL.Hostname())
 		if err != nil {
-			return ProxyResult{Type: ProxyResultError}, fmt.Errorf("PAC script execution failed: %w", err)
+			// Error during PAC execution for this specific URL
+			slog.Error("PAC script execution failed for URL", "url", targetURL.String(), "error", err)
+			// Fallback strategy: Use default? Or return error? Return error for now.
+			return pac.PacResult{Type: pac.ResultUnknown}, fmt.Errorf("PAC script execution failed: %w", err)
 		}
 
-		// Parse the result string (e.g., "PROXY proxy:port; DIRECT")
-		parsedResult := pm.parsePacResult(resultString)
-		slog.Debug("PAC execution result for URL", "target_url", targetURL.String(), "result_string", resultString, "parsed_type", parsedResult.Type, "parsed_proxies", UrlsToStrings(parsedResult.Proxies))
+		// Parse the result string
+		parsedResult := pac.ParseResult(resultString)
+		slog.Debug("PAC execution result for URL", "target_url", targetURL.String(), "result_string", resultString, "parsed_type", parsedResult.Type, "parsed_proxies", UrlsToStrings(pac.UrlsFromPacResult(parsedResult)))
+
+		// Handle case where PAC returns nothing valid
+		if parsedResult.Type == pac.ResultUnknown {
+			slog.Warn("PAC script returned invalid/empty directives for URL, treating as error", "url", targetURL.String(), "result_string", resultString)
+			// Return error or fallback? Return error.
+			return parsedResult, fmt.Errorf("PAC script returned invalid result: %q", resultString)
+		}
+
 		return parsedResult, nil
 	default:
-		// Should not happen if validation is correct
-		return ProxyResult{Type: ProxyResultError}, fmt.Errorf("internal error: unsupported proxy type '%s' encountered", proxyType)
+		slog.Error("Internal error: unsupported proxy type encountered in GetEffectiveProxyForURL", "type", proxyType)
+		return pac.PacResult{Type: pac.ResultUnknown}, fmt.Errorf("internal error: unsupported proxy type '%s'", proxyType)
 	}
 }
 
-// GetEffectiveProxyURL is a simplified getter for the static/cached proxy URL.
-// DEPRECATED: Use GetEffectiveProxyForURL for WPAD correctness.
-// This remains for compatibility with the client's initial connection logic
-// where it needs *a* proxy URL before knowing the target. It will return the
-// first proxy from the cached/static list if available.
+// GetEffectiveProxyURL (DEPRECATED but kept for compatibility)
+// Returns the *first* proxy URL from the default/static configuration.
 func (pm *ProxyManager) GetEffectiveProxyURL() *url.URL {
 	pm.proxyMutex.RLock()
 	defer pm.proxyMutex.RUnlock()
-	if pm.effectiveProxy.Type == ProxyResultProxy && len(pm.effectiveProxy.Proxies) > 0 {
-		return pm.effectiveProxy.Proxies[0]
+
+	// Use the stored default result
+	if pm.effectiveProxy.Type == pac.ResultProxy && len(pm.effectiveProxy.Proxies) > 0 {
+		// Try to convert the first ProxyInfo back to url.URL
+		u, err := pm.effectiveProxy.Proxies[0].URL()
+		if err == nil {
+			return u
+		}
+		slog.Warn("Failed to convert default ProxyInfo back to url.URL", "proxy", pm.effectiveProxy.Proxies[0], "error", err)
 	}
-	return nil
+	return nil // Return nil if default is DIRECT, Unknown, or parsing fails
 }
 
 // --- WPAD / PAC Handling ---
 
-// wpadRefresher periodically calls updateProxySettings for WPAD type.
+// wpadRefresher remains largely the same, calls pm.updateProxySettings(false)
 func (pm *ProxyManager) wpadRefresher() {
-	// Use a slightly jittered interval based on cache duration
+	// Calculate jittered interval (same logic as before)
 	baseInterval := wpadCacheDuration
 	minInterval := baseInterval - (5 * time.Minute)
-	jitterRange := (10 * time.Minute).Nanoseconds() // 10 min jitter range
-	jitter := time.Duration(rand.Int63n(jitterRange))
-	interval := minInterval + jitter
-
-	if interval <= 0 { // Ensure positive interval
-		interval = 30 * time.Minute // Fallback to 30 mins if calculation is bad
-	}
+	if minInterval <= 0 {
+		minInterval = baseInterval / 2
+	} // Ensure positive min interval
+	jitterRange := (10 * time.Minute).Nanoseconds()
+	interval := minInterval + time.Duration(rand.Int63n(jitterRange))
+	if interval <= 0 {
+		interval = 30 * time.Minute
+	} // Fallback
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	slog.Info("Starting WPAD refresh background task", "interval", interval)
+	slog.Info("Starting WPAD refresh background task", "initial_interval", interval)
 	for {
 		select {
 		case <-ticker.C:
 			slog.Debug("Performing periodic WPAD refresh...")
-			// Update settings, but don't force fetch (allow cache)
+			// Update settings, don't force fetch (allow time-based cache in updateProxySettings)
 			if err := pm.updateProxySettings(false); err != nil {
 				slog.Error("Error during periodic WPAD refresh", "error", err)
+				// Don't reset interval on error? Or use shorter retry? Keep interval for now.
 			}
 			// Reset ticker with new jittered interval
-			jitter = time.Duration(rand.Int63n(jitterRange))
-			interval = minInterval + jitter
+			interval = minInterval + time.Duration(rand.Int63n(jitterRange))
 			if interval <= 0 {
 				interval = 30 * time.Minute
 			}
@@ -320,491 +386,159 @@ func (pm *ProxyManager) wpadRefresher() {
 	}
 }
 
-// getProxyFromWPAD fetches PAC, executes FindProxyForURL for a dummy URL ("http://example.com")
-// to get the general proxy setting, using caching.
-// If force is true, bypasses the cache time check.
-func (pm *ProxyManager) getProxyFromWPAD(wpadURL string, force bool) (ProxyResult, error) {
-	pm.wpadCache.mu.RLock()
-	// Check cache first (unless forced)
-	if !force && pm.wpadCache.url == wpadURL && time.Since(pm.wpadCache.timestamp) < wpadCacheDuration {
-		cachedResult := pm.wpadCache.result
-		pm.wpadCache.mu.RUnlock()
-		slog.Debug("Using cached WPAD result", "type", cachedResult.Type, "proxies", UrlsToStrings(cachedResult.Proxies))
-		return cachedResult, nil
-	}
-	pm.wpadCache.mu.RUnlock()
+// fetchPACScript fetches the PAC script content from the given URL or local path.
+// Handles potential character encoding issues.
+func (pm *ProxyManager) fetchPACScript(location string) (string, error) {
+	slog.Debug("Attempting to fetch PAC script", "location", location)
+	var contentBytes []byte
+	var err error
+	var contentType string // To store Content-Type for charset detection
 
-	slog.Info("Fetching and parsing WPAD file", "url", wpadURL, "force_fetch", force)
+	parsedURL, urlErr := url.Parse(location)
 
-	// 1. Fetch the PAC script content
-	pacScript, err := pm.fetchPACScript(wpadURL)
-	if err != nil {
-		return ProxyResult{Type: ProxyResultError}, err // Return error result
-	}
-	if pacScript == "" {
-		slog.Warn("Fetched PAC script is empty, treating as DIRECT", "url", wpadURL)
-		// Update cache with DIRECT result
-		result := ProxyResult{Type: ProxyResultDirect}
-		pm.updateWpadCache(wpadURL, result)
-		return result, nil
-	}
+	// Check if it's an HTTP/HTTPS URL
+	if urlErr == nil && (parsedURL.Scheme == "http" || parsedURL.Scheme == "https") {
+		ctx, cancel := context.WithTimeout(context.Background(), pm.retryConfig.connectTimeout) // Timeout for fetch
+		defer cancel()
 
-	// 2. Execute FindProxyForURL for a generic target to determine the default proxy
-	//    Using "http://example.com" as a common practice.
-	dummyURL := "http://example.com"
-	dummyHost := "example.com"
-	resultString, err := pm.executePacScript(pacScript, dummyURL, dummyHost)
-	if err != nil {
-		return ProxyResult{Type: ProxyResultError}, fmt.Errorf("initial PAC script execution failed: %w", err)
-	}
+		req, reqErr := http.NewRequestWithContext(ctx, "GET", location, nil)
+		if reqErr != nil {
+			return "", fmt.Errorf("failed to create PAC request for %s: %w", location, reqErr)
+		}
+		req.Header.Set("User-Agent", "KernelGatekeeper-Client/1.0 (PAC Fetch)")
 
-	// 3. Parse the result string
-	parsedResult := pm.parsePacResult(resultString)
+		resp, doErr := pm.httpClientForPAC.Do(req)
+		if doErr != nil {
+			return "", fmt.Errorf("failed to fetch PAC from %s: %w", location, doErr)
+		}
+		defer resp.Body.Close()
 
-	// 4. Update cache
-	pm.updateWpadCache(wpadURL, parsedResult)
+		if resp.StatusCode != http.StatusOK {
+			// Read some of the body for error context
+			bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			return "", fmt.Errorf("failed to fetch PAC from %s: status %s, body: %s", location, resp.Status, string(bodyPreview))
+		}
 
-	slog.Info("WPAD initial execution complete", "result_type", parsedResult.Type, "proxies", UrlsToStrings(parsedResult.Proxies))
-	return parsedResult, nil
-}
+		contentType = resp.Header.Get("Content-Type") // Get content type for charset detection
+		// Limit reader and read content
+		limitedReader := io.LimitReader(resp.Body, pacMaxSizeBytes)
+		contentBytes, err = io.ReadAll(limitedReader)
+		if err != nil {
+			return "", fmt.Errorf("failed to read PAC content from %s: %w", location, err)
+		}
+		slog.Debug("Fetched PAC script via HTTP(S)", "url", location, "size", len(contentBytes))
 
-// updateWpadCache safely updates the WPAD cache.
-func (pm *ProxyManager) updateWpadCache(wpadURL string, result ProxyResult) {
-	pm.wpadCache.mu.Lock()
-	pm.wpadCache.url = wpadURL
-	pm.wpadCache.result = result
-	pm.wpadCache.timestamp = time.Now()
-	pm.wpadCache.mu.Unlock()
-	slog.Debug("WPAD cache updated", "url", wpadURL, "type", result.Type)
-}
+	} else {
+		// Assume it's a local file path (either file:// scheme or just a path)
+		filePath := location
+		if urlErr == nil && parsedURL.Scheme == "file" {
+			filePath = parsedURL.Path // Use path from file URL
+			// Handle potential windows path conversion if needed:
+			if os.PathSeparator == '\\' && strings.HasPrefix(filePath, "/") {
+				filePath = strings.TrimPrefix(filePath, "/") // Remove leading slash
+				filePath = filepath.FromSlash(filePath)      // Convert slashes
+			}
+		}
 
-// fetchPACScript fetches the PAC script content from the given URL.
-// It handles potential character encoding issues.
-// NOTE: This function does *not* use caching itself; caching is handled by the caller.
-func (pm *ProxyManager) fetchPACScript(pacURL string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), pm.retryConfig.connectTimeout) // Timeout for the fetch operation
-	defer cancel()
+		// Check if file exists and limit reading size
+		fileInfo, statErr := os.Stat(filePath)
+		if statErr != nil {
+			return "", fmt.Errorf("failed to stat PAC file path %s: %w", filePath, statErr)
+		}
+		if fileInfo.Size() > pacMaxSizeBytes {
+			return "", fmt.Errorf("PAC file %s exceeds maximum size limit (%d bytes)", filePath, pacMaxSizeBytes)
+		}
+		if fileInfo.IsDir() {
+			return "", fmt.Errorf("PAC file path %s is a directory, not a file", filePath)
+		}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", pacURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create PAC request for %s: %w", pacURL, err)
-	}
-	req.Header.Set("User-Agent", "KernelGatekeeper-Client/1.0 (WPAD Fetch)")
-
-	resp, err := pm.httpClientForPAC.Do(req) // Use the dedicated client
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch PAC from %s: %w", pacURL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to fetch PAC from %s: status %s", pacURL, resp.Status)
+		contentBytes, err = os.ReadFile(filePath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read PAC file %s: %w", filePath, err)
+		}
+		slog.Debug("Read PAC script from local file", "path", filePath, "size", len(contentBytes))
+		// No content type header for local files, rely on config or UTF-8 default
+		contentType = ""
 	}
 
-	// Limit reader to prevent excessive memory usage
-	limitedReader := io.LimitReader(resp.Body, pacMaxSizeBytes)
-
-	// Handle potential character encoding based on config or Content-Type
-	reader := io.Reader(limitedReader)
-	specifiedCharset := pm.config.PacCharset // Config takes precedence
-	if specifiedCharset == "" {
-		// Try to get charset from Content-Type header
-		contentType := resp.Header.Get("Content-Type")
+	// --- Character Encoding Handling ---
+	reader := bytes.NewReader(contentBytes)
+	var specifiedCharset string
+	// 1. Check config override
+	if pm.config.PacCharset != "" {
+		specifiedCharset = pm.config.PacCharset
+		slog.Debug("Using PAC charset specified in config", "charset", specifiedCharset)
+	} else if contentType != "" {
+		// 2. Try Content-Type header (only for HTTP fetch)
 		if parts := strings.Split(contentType, "charset="); len(parts) == 2 {
 			specifiedCharset = strings.TrimSpace(parts[1])
+			slog.Debug("Detected PAC charset from Content-Type", "charset", specifiedCharset)
 		}
 	}
 
+	var finalReader io.Reader = reader
 	specifiedCharset = strings.ToLower(strings.TrimSpace(specifiedCharset))
 
 	if specifiedCharset != "" && specifiedCharset != "utf-8" && specifiedCharset != "utf8" {
-		slog.Debug("Attempting to decode PAC script", "charset", specifiedCharset)
 		encoding, err := ianaindex.IANA.Encoding(specifiedCharset)
 		if err != nil {
-			slog.Warn("Unsupported PAC charset specified, falling back to UTF-8", "charset", specifiedCharset, "error", err)
+			slog.Warn("Unsupported PAC charset specified or detected, falling back to UTF-8", "charset", specifiedCharset, "error", err)
+			// Use original reader (assuming UTF-8 or binary)
 		} else if encoding != nil {
-			reader = transform.NewReader(reader, encoding.NewDecoder())
+			slog.Debug("Decoding PAC script content", "charset", specifiedCharset)
+			finalReader = transform.NewReader(reader, encoding.NewDecoder())
 		}
+	} else {
+		slog.Debug("Assuming PAC script is UTF-8 (no specific charset detected/configured or explicitly UTF-8)")
 	}
 
 	// Read the potentially decoded content
-	pacContent, err := io.ReadAll(reader)
+	decodedBytes, err := io.ReadAll(finalReader)
 	if err != nil {
-		return "", fmt.Errorf("failed to read PAC content from %s: %w", pacURL, err)
+		// Error during decoding transformation
+		return "", fmt.Errorf("failed to decode PAC content (charset: %s): %w", specifiedCharset, err)
 	}
 
-	// Ensure the result is valid UTF-8, converting if necessary (best effort)
-	if !utf8.Valid(pacContent) {
-		slog.Warn("PAC content is not valid UTF-8 after decoding attempt, forcing conversion", "url", pacURL)
-		pacContent = []byte(strings.ToValidUTF8(string(pacContent), "")) // Replace invalid bytes
+	// Final check: ensure the result is valid UTF-8 for the JS engine
+	if !utf8.Valid(decodedBytes) {
+		slog.Warn("PAC content is not valid UTF-8 after decoding attempt, forcing conversion", "location", location)
+		// Replace invalid bytes with the Unicode replacement character
+		validUTF8String := strings.ToValidUTF8(string(decodedBytes), string(utf8.RuneError))
+		return validUTF8String, nil
 	}
 
-	return string(pacContent), nil
+	return string(decodedBytes), nil
 }
 
-// executePacScript runs the PAC JavaScript code within the Otto VM.
-func (pm *ProxyManager) executePacScript(script, targetURL, targetHost string) (string, error) {
-	// Otto VM is not thread-safe, protect access
-	pm.ottoVMMutex.Lock()
-	defer pm.ottoVMMutex.Unlock()
+// executePacScript is removed - logic moved to pac.Engine.FindProxyForURL
 
-	// Set a timeout for the script execution
-	vm := pm.ottoVM             // Use the pre-initialized VM
-	halt := make(chan struct{}) // Channel to signal completion or timeout
-	defer close(halt)           // Ensure halt channel is closed eventually
+// parsePacResult is removed - logic moved to pac.ParseResult
 
-	vm.Interrupt = make(chan func()) // Interrupt channel for this execution
-
-	// Timeout goroutine
-	timeoutCtx, cancelTimeout := context.WithTimeout(context.Background(), pm.retryConfig.pacExecTimeout)
-	defer cancelTimeout()
-
-	go func() {
-		select {
-		case <-timeoutCtx.Done():
-			if timeoutCtx.Err() == context.DeadlineExceeded {
-				slog.Warn("PAC script execution timed out", "timeout", pm.retryConfig.pacExecTimeout)
-				// Send interrupt signal to Otto
-				vm.Interrupt <- func() {
-					panic(errors.New("pac script execution timeout"))
-				}
-			}
-		case <-halt: // Exit if main function completes or panics first
-			return
-		}
-	}()
-
-	var resultString string
-	var err error
-
-	// Use a separate goroutine for the actual Otto execution
-	// to allow the timeout mechanism to interrupt it.
-	execDone := make(chan struct{})
-	go func() {
-		defer func() {
-			// Catch potential panic from timeout or script error
-			if r := recover(); r != nil {
-				if errStr, ok := r.(string); ok && strings.Contains(errStr, "pac script execution timeout") {
-					err = fmt.Errorf("pac script execution timed out after %s", pm.retryConfig.pacExecTimeout)
-				} else {
-					err = fmt.Errorf("panic during PAC script execution: %v", r)
-				}
-			}
-			close(execDone) // Signal completion or panic
-		}()
-
-		// Load the script (it might have changed since last execution)
-		// This replaces any previously loaded script in the shared VM.
-		_, loadErr := vm.Run(script)
-		if loadErr != nil {
-			panic(fmt.Errorf("failed to load PAC script into JS VM: %w", loadErr)) // Panic to be caught
-		}
-
-		// Prepare the function call string
-		call := fmt.Sprintf(`FindProxyForURL("%s", "%s")`, targetURL, targetHost) // Basic quoting
-
-		// Execute FindProxyForURL
-		value, runErr := vm.Run(call)
-		if runErr != nil {
-			// Check if FindProxyForURL is undefined
-			if strings.Contains(runErr.Error(), "ReferenceError:") && strings.Contains(runErr.Error(), "FindProxyForURL") {
-				panic(errors.New("function 'FindProxyForURL' not found in PAC script"))
-			}
-			panic(fmt.Errorf("failed to execute FindProxyForURL in PAC script: %w", runErr))
-		}
-
-		// Convert result to string
-		resStr, convErr := value.ToString()
-		if convErr != nil {
-			panic(fmt.Errorf("failed to convert PAC result to string: %w", convErr))
-		}
-		resultString = resStr
-	}()
-
-	// Wait for execution to finish or timeout context to cancel
-	select {
-	case <-execDone:
-		// Execution finished (or panicked), err will be set if panic occurred
-	case <-timeoutCtx.Done():
-		// This case might be hit if the timeout occurs just as execDone is closing,
-		// but the primary timeout mechanism is the interrupt.
-		if err == nil { // Ensure we report timeout if no panic captured
-			err = fmt.Errorf("pac script execution timed out after %s (context signal)", pm.retryConfig.pacExecTimeout)
-		}
-	}
-
-	vm.Interrupt = nil // Clean up interrupt channel
-
-	return resultString, err
-}
-
-// parsePacResult converts the string output of FindProxyForURL into a ProxyResult.
-func (pm *ProxyManager) parsePacResult(result string) ProxyResult {
-	result = strings.TrimSpace(result)
-	if result == "" {
-		slog.Warn("PAC script returned empty result, assuming DIRECT")
-		return ProxyResult{Type: ProxyResultDirect}
-	}
-
-	parts := strings.Split(result, ";")
-	var proxies []*url.URL
-	hasDirect := false
-
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		fields := strings.Fields(part) // Split by space
-
-		if len(fields) == 0 {
-			continue
-		}
-
-		proxyType := strings.ToUpper(fields[0])
-
-		switch proxyType {
-		case "DIRECT":
-			hasDirect = true // Note direct is an option
-		case "PROXY", "HTTPS", "HTTP": // Treat HTTP/HTTPS keywords same as PROXY
-			if len(fields) < 2 {
-				slog.Warn("Invalid PAC directive: missing host:port", "directive", part)
-				continue
-			}
-			hostPort := fields[1]
-			// Basic validation: check for colon, but allow just hostname (assume default port later?)
-			// net.SplitHostPort requires a port.
-			host, port, err := net.SplitHostPort(hostPort)
-			if err != nil {
-				// Maybe it's just a hostname? Assume port 80 for PROXY/HTTP, 443 for HTTPS? Risky.
-				// For now, require host:port format.
-				slog.Warn("Invalid PAC proxy format (expected host:port)", "value", hostPort, "error", err)
-				continue
-			}
-			if host == "" || port == "" {
-				slog.Warn("Invalid PAC proxy format (empty host or port)", "value", hostPort)
-				continue
-			}
-
-			// Determine scheme
-			scheme := "http" // Default for PROXY
-			if proxyType == "HTTPS" {
-				scheme = "https"
-			}
-
-			proxyURLStr := fmt.Sprintf("%s://%s", scheme, hostPort)
-			parsedURL, err := url.Parse(proxyURLStr)
-			if err != nil {
-				slog.Warn("Failed to parse proxy URL from PAC directive", "directive", part, "parsed_url", proxyURLStr, "error", err)
-				continue
-			}
-			proxies = append(proxies, parsedURL)
-
-		case "SOCKS", "SOCKS4", "SOCKS5":
-			slog.Warn("SOCKS proxy type found in PAC result, but SOCKS is not supported. Ignoring.", "directive", part)
-			continue // Ignore SOCKS directives
-
-		default:
-			slog.Warn("Unknown PAC directive type encountered", "directive", part)
-		}
-	}
-
-	// Determine final result type
-	if len(proxies) > 0 {
-		// If PROXY directives were found, return them, even if DIRECT was also present.
-		// The client logic will try proxies first.
-		return ProxyResult{Type: ProxyResultProxy, Proxies: proxies}
-	} else if hasDirect {
-		// If only DIRECT was found
-		return ProxyResult{Type: ProxyResultDirect}
-	} else {
-		// If nothing valid was parsed
-		slog.Warn("Failed to parse any valid directives from PAC result", "result_string", result)
-		return ProxyResult{Type: ProxyResultError} // Indicate error if nothing useful found
-	}
-}
-
-// --- PAC Helper Functions for Otto ---
-
-func (pm *ProxyManager) registerPacHelpers() error {
-	vm := pm.ottoVM
-	helpers := map[string]interface{}{
-		// Basic network helpers
-		"isPlainHostName":     pm.pacIsPlainHostName,
-		"dnsDomainIs":         pm.pacDnsDomainIs,
-		"localHostOrDomainIs": pm.pacLocalHostOrDomainIs,
-		"isResolvable":        pm.pacIsResolvable,
-		"dnsResolve":          pm.pacDnsResolve,
-		"myIpAddress":         pm.pacMyIpAddress,
-		"dnsDomainLevels":     pm.pacDnsDomainLevels,
-
-		// Time helpers
-		"weekdayRange": pm.pacWeekdayRange,
-		"dateRange":    pm.pacDateRange,
-		"timeRange":    pm.pacTimeRange,
-
-		// Utility
-		"shExpMatch": pm.pacShExpMatch,
-		"alert":      pm.pacAlert, // Log alerts instead of showing popups
-
-		// IPv6 helpers (implement later if adding IPv6 support)
-		// "myIpAddressEx": pm.pacMyIpAddressEx,
-		// "dnsResolveEx": pm.pacDnsResolveEx,
-		// "isResolvableEx": pm.pacIsResolvableEx,
-		// "isInNetEx": pm.pacIsInNetEx,
-		// "sortIpAddressList": pm.pacSortIpAddressList,
-	}
-
-	for name, fn := range helpers {
-		if err := vm.Set(name, fn); err != nil {
-			return fmt.Errorf("failed to set PAC helper '%s': %w", name, err)
-		}
-	}
-	slog.Debug("Registered PAC helper functions in JS VM.")
-	return nil
-}
-
-// Implementations of PAC helper functions (simplified versions)
-// These need careful implementation to match browser behavior accurately.
-
-func (pm *ProxyManager) pacAlert(call otto.FunctionCall) otto.Value {
-	message, _ := call.Argument(0).ToString()
-	slog.Warn("[PAC Alert]", "message", message)
-	return otto.UndefinedValue()
-}
-
-func (pm *ProxyManager) pacIsPlainHostName(call otto.FunctionCall) otto.Value {
-	host, _ := call.Argument(0).ToString()
-	result := !strings.Contains(host, ".")
-	v, _ := pm.ottoVM.ToValue(result)
-	return v
-}
-
-func (pm *ProxyManager) pacDnsDomainIs(call otto.FunctionCall) otto.Value {
-	host, _ := call.Argument(0).ToString()
-	domain, _ := call.Argument(1).ToString()
-	// Ensure domain starts with a dot for proper suffix matching unless it's an exact match
-	hostLower := strings.ToLower(host)
-	domainLower := strings.ToLower(domain)
-	var result bool
-	if strings.HasPrefix(domainLower, ".") {
-		result = strings.HasSuffix(hostLower, domainLower)
-	} else {
-		result = hostLower == domainLower || strings.HasSuffix(hostLower, "."+domainLower)
-	}
-	v, _ := pm.ottoVM.ToValue(result)
-	return v
-}
-
-func (pm *ProxyManager) pacLocalHostOrDomainIs(call otto.FunctionCall) otto.Value {
-	host, _ := call.Argument(0).ToString()
-	hostdom, _ := call.Argument(1).ToString()
-	// Simplified: check if hostname matches exactly or if it's a suffix match
-	hostLower := strings.ToLower(host)
-	hostdomLower := strings.ToLower(hostdom)
-	result := hostLower == hostdomLower || strings.HasSuffix(hostLower, "."+hostdomLower)
-	v, _ := pm.ottoVM.ToValue(result)
-	return v
-}
-
-func (pm *ProxyManager) pacIsResolvable(call otto.FunctionCall) otto.Value {
-	host, _ := call.Argument(0).ToString()
-	// Simple check: try to resolve
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second) // Short timeout for resolvability check
-	defer cancel()
-	_, err := net.DefaultResolver.LookupHost(ctx, host)
-	result := err == nil
-	v, _ := pm.ottoVM.ToValue(result)
-	return v
-}
-
-func (pm *ProxyManager) pacDnsResolve(call otto.FunctionCall) otto.Value {
-	host, _ := call.Argument(0).ToString()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second) // Short timeout for DNS resolve check
-	defer cancel()
-	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
-	if err != nil || len(addrs) == 0 {
-		return otto.NullValue() // Return null on failure as per spec
-	}
-	// Return the first resolved IP (common practice, though spec is ambiguous)
-	v, _ := pm.ottoVM.ToValue(addrs[0])
-	return v
-}
-
-func (pm *ProxyManager) pacMyIpAddress(call otto.FunctionCall) otto.Value {
-	// Finding the "primary" non-loopback IP is complex. Return first non-loopback IPv4.
-	addrs, err := net.InterfaceAddrs()
-	if err == nil {
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-				if ipnet.IP.To4() != nil {
-					ipStr := ipnet.IP.String()
-					v, _ := pm.ottoVM.ToValue(ipStr)
-					return v
-				}
-			}
-		}
-	}
-	// Fallback or if only IPv6 found
-	v, _ := pm.ottoVM.ToValue("127.0.0.1") // Default fallback
-	return v
-}
-
-func (pm *ProxyManager) pacDnsDomainLevels(call otto.FunctionCall) otto.Value {
-	host, _ := call.Argument(0).ToString()
-	levels := strings.Count(host, ".")
-	v, _ := pm.ottoVM.ToValue(levels)
-	return v
-}
-
-func (pm *ProxyManager) pacShExpMatch(call otto.FunctionCall) otto.Value {
-	str, _ := call.Argument(0).ToString()
-	pattern, _ := call.Argument(1).ToString()
-	// Basic glob matching (convert shExp to regex? or use path.Match)
-	// path.Match is simpler
-	matched, err := filepath.Match(pattern, str) // Note: filepath.Match might not be 100% shExp compatible
-	if err != nil {
-		slog.Warn("Error in shExpMatch", "pattern", pattern, "string", str, "error", err)
-		matched = false
-	}
-	v, _ := pm.ottoVM.ToValue(matched)
-	return v
-}
-
-// TODO: Implement date/time helpers (weekdayRange, dateRange, timeRange)
-// These require careful handling of timezones and formats specified in the PAC standard.
-// Returning false for now to avoid incorrect behavior.
-
-func (pm *ProxyManager) pacWeekdayRange(call otto.FunctionCall) otto.Value {
-	slog.Warn("PAC function 'weekdayRange' not fully implemented, returning false")
-	v, _ := pm.ottoVM.ToValue(false)
-	return v
-}
-func (pm *ProxyManager) pacDateRange(call otto.FunctionCall) otto.Value {
-	slog.Warn("PAC function 'dateRange' not fully implemented, returning false")
-	v, _ := pm.ottoVM.ToValue(false)
-	return v
-}
-func (pm *ProxyManager) pacTimeRange(call otto.FunctionCall) otto.Value {
-	slog.Warn("PAC function 'timeRange' not fully implemented, returning false")
-	v, _ := pm.ottoVM.ToValue(false)
-	return v
-}
+// --- PAC Helper Function Implementations are removed - moved to pac.Engine ---
 
 // --- Utility ---
 
-// Close shuts down the ProxyManager, stopping background tasks.
+// Close shuts down the ProxyManager.
 func (pm *ProxyManager) Close() error {
 	slog.Info("Closing Proxy Manager (Client Side)...")
 	pm.stopOnce.Do(func() {
 		close(pm.stopChan)
+		// Close PAC engine background tasks (like cache cleaner)
+		if pm.pacEngine != nil {
+			pm.pacEngine.Close()
+		}
 		// Close idle connections in the dedicated PAC client transport
-		if pm.baseTransport != nil {
-			pm.baseTransport.CloseIdleConnections()
+		if pm.httpClientForPAC != nil && pm.httpClientForPAC.Transport != nil {
+			if transport, ok := pm.httpClientForPAC.Transport.(*http.Transport); ok {
+				transport.CloseIdleConnections()
+			}
 		}
 	})
 	slog.Info("Proxy Manager closed.")
 	return nil
 }
 
-// UrlsToStrings converts URL slice to string slice for logging (Exported).
+// UrlsToStrings converts []*url.URL to []string for logging.
 func UrlsToStrings(urls []*url.URL) []string {
 	if urls == nil {
 		return nil
@@ -820,46 +554,18 @@ func UrlsToStrings(urls []*url.URL) []string {
 	return strs
 }
 
-// reflectDeepEqualProxyResult compares two ProxyResult structs. Necessary because url.URL contains unexported fields.
-func reflectDeepEqualProxyResult(a, b ProxyResult) bool {
+// reflectDeepEqualPacResult compares two pac.PacResult structs.
+// Necessary because url.URL contains unexported fields.
+func reflectDeepEqualPacResult(a, b pac.PacResult) bool {
 	if a.Type != b.Type {
 		return false
 	}
 	if len(a.Proxies) != len(b.Proxies) {
 		return false
 	}
-	// Compare proxies by string representation as url.URL deep equal is tricky
-	aStrs := UrlsToStrings(a.Proxies) // Use exported version
-	bStrs := UrlsToStrings(b.Proxies) // Use exported version
-	if len(aStrs) != len(bStrs) {     // Should be caught by len check above, but double-check
-		return false
-	}
-	// Order matters here - PAC results are ordered preference
-	for i := range aStrs {
-		if aStrs[i] != bStrs[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// Helper function for comparing url.URL slices (order matters)
-func reflectDeepEqualURLSlice(a, b []*url.URL) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		// Compare string representations for simplicity, as reflect.DeepEqual doesn't work well
-		// with unexported fields in url.URL.
-		aStr := ""
-		bStr := ""
-		if a[i] != nil {
-			aStr = a[i].String()
-		}
-		if b[i] != nil {
-			bStr = b[i].String()
-		}
-		if aStr != bStr {
+	// Compare proxies by Scheme and Host string representation
+	for i := range a.Proxies {
+		if a.Proxies[i].Scheme != b.Proxies[i].Scheme || a.Proxies[i].Host != b.Proxies[i].Host {
 			return false
 		}
 	}
