@@ -78,9 +78,9 @@ func determineEffectiveCacheName(configCachePath string) string {
 		cachePath = strings.ReplaceAll(cachePath, "%{USERID}", strconv.Itoa(os.Getuid()))
 	}
 
-	if !strings.HasPrefix(cachePath, "FILE:") && !strings.HasPrefix(cachePath, "DIR:") && !strings.HasPrefix(cachePath, "API:") && !strings.HasPrefix(cachePath, "KEYRING:") && !strings.HasPrefix(cachePath, "KCM:") {
-		cachePath = "FILE:" + cachePath
-	}
+	// if !strings.HasPrefix(cachePath, "FILE:") && !strings.HasPrefix(cachePath, "DIR:") && !strings.HasPrefix(cachePath, "API:") && !strings.HasPrefix(cachePath, "KEYRING:") && !strings.HasPrefix(cachePath, "KCM:") {
+	// 	cachePath = "FILE:" + cachePath
+	// }
 
 	slog.Debug("Effective ccache name determined", "source", source, "path", cachePath)
 	return cachePath
