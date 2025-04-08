@@ -38,7 +38,6 @@ func main() {
 		if r := recover(); r != nil {
 			fmt.Fprintf(os.Stderr, "CLIENT PANIC: %v\n%s\n", r, string(debug.Stack()))
 			signals.TriggerShutdown(&globalShutdownOnce, rootCancel)
-			// Potentially wait shortly for cleanup, but exit reliably
 			time.Sleep(1 * time.Second)
 			os.Exit(1)
 		}
@@ -52,56 +51,66 @@ func main() {
 	}
 
 	// --- Logging Setup ---
-	// Log to stderr by default for client
-	logging.Setup(os.Getenv("LOG_LEVEL"), "", os.Stderr)
+	logging.Setup(os.Getenv("LOG_LEVEL"), "", os.Stderr) // Client logs to stderr
 	slog.Info("Starting KernelGatekeeper Client (SockOps Model)", "version", version, "pid", os.Getpid())
 
 	// --- Signal Handling ---
 	signals.SetupHandler(ctx, rootCancel, &globalShutdownOnce)
 
 	// --- Core Component Initialization ---
-	stateManager := clientcore.NewStateManager(nil) // Initial config comes from service
+	stateManager := clientcore.NewStateManager(nil) // Config comes from service
 
+	// --- Start Local Listener Early ---
+	// This needs to be ready before BPF might try to connect to it.
+	localListener := clientcore.NewLocalListener()
+	if err := localListener.Start(); err != nil {
+		slog.Error("Failed to start local listener", "address", localListener.Addr(), "error", err)
+		signals.TriggerShutdown(&globalShutdownOnce, rootCancel)
+		stateManager.Cleanup() // Cleanup anything initialized so far
+		os.Exit(1)
+	}
+	defer localListener.Close() // Ensure listener is closed on exit
+
+	// --- Initialize IPC Manager ---
 	ipcManager := clientcore.NewIPCManager(ctx, stateManager, flags.socketPath, flags.connectTimeout)
-	ipcManager.Run() // Start connection management goroutine
+
+	// --- Setup Connection Handler & Set Callbacks BEFORE Run() ---
+	// Callbacks must be set before the IPC manager starts listening for notifications.
+	connectionHandler := clientcore.NewConnectionHandler(stateManager)
+	ipcManager.SetAcceptCallback(connectionHandler.HandleBPFAccept) // Register BPF accept handler
+	ipcManager.SetListenerCallback(localListener.GetListener)       // Provide listener access for accept
+	slog.Debug("IPC callbacks registered.")
+
+	// --- Start IPC Manager ---
+	// This will start trying to connect and eventually listen for IPC messages.
+	ipcManager.Run()
 
 	// --- Wait for Initial IPC Connection ---
+	// This ensures we have a line to the service before proceeding with setup.
 	if err := ipcManager.WaitForInitialConnection(flags.connectTimeout + 5*time.Second); err != nil {
 		slog.Error("Failed to establish initial connection to service", "error", err)
 		signals.TriggerShutdown(&globalShutdownOnce, rootCancel)
 		ipcManager.Stop()
+		localListener.Close()
 		stateManager.Cleanup()
 		os.Exit(1)
 	}
 
 	// --- Perform Initial Setup (Get Config, Init Kerberos/Proxy) ---
-	// Run setup in a goroutine managed by the state manager
+	// This now happens after IPC is connected and callbacks are set.
+	// Run setup in a goroutine managed by the state manager.
 	go stateManager.PerformInitialSetup(ipcManager)
 	if err := stateManager.WaitForInitialSetup(); err != nil {
 		slog.Error("Failed during initial setup after connecting to service", "error", err)
 		signals.TriggerShutdown(&globalShutdownOnce, rootCancel)
 		ipcManager.Stop()
+		localListener.Close()
 		stateManager.Cleanup() // Cleanup resources initialized before failure
 		os.Exit(1)
 	}
 
-	// --- Start Local Listener ---
-	localListener := clientcore.NewLocalListener()
-	if err := localListener.Start(); err != nil {
-		slog.Error("Failed to start local listener", "address", localListener.Addr(), "error", err)
-		signals.TriggerShutdown(&globalShutdownOnce, rootCancel)
-		ipcManager.Stop()
-		stateManager.Cleanup()
-		os.Exit(1)
-	}
-	defer localListener.Close()
-
-	// --- Setup Connection Handler & IPC Callbacks ---
-	connectionHandler := clientcore.NewConnectionHandler(stateManager)
-	ipcManager.SetAcceptCallback(connectionHandler.HandleBPFAccept) // Register callback
-	ipcManager.SetListenerCallback(localListener.GetListener)       // Provide listener access
-
-	// --- Start Background Tasks ---
+	// --- Start Background Tasks (Config Refresh, Kerberos Check) ---
+	// These can start after initial setup is complete.
 	backgroundTasks := clientcore.NewBackgroundTasks(ctx, stateManager, ipcManager)
 	stateManager.SetBackgroundTasks(backgroundTasks) // Link for config refresh notifications
 	backgroundTasks.Run()
@@ -113,11 +122,10 @@ func main() {
 	slog.Info("Shutdown initiated. Waiting for background tasks and connections to complete...")
 
 	// --- Graceful Shutdown ---
-	localListener.Close() // Stop accepting new connections
-	ipcManager.Stop()     // Stop IPC manager loops & close connection
-	// stateManager.Cleanup() will wait for all goroutines added via stateManager.AddWaitGroup
-	// (Connection handlers, background tasks)
-	stateManager.Cleanup()
+	// Order matters: stop accepting new, stop IPC, wait for handlers/tasks.
+	localListener.Close()  // Stop accepting new BPF connections
+	ipcManager.Stop()      // Stop IPC manager loops & close connection
+	stateManager.Cleanup() // Waits for connection handlers & background tasks via WaitGroup
 
 	slog.Info("Client exited gracefully.")
 }

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/jcmturner/gokrb5/v8/spnego"
@@ -18,7 +19,11 @@ import (
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/kerb"
 )
 
-var ClientVersion = "dev" // Placeholder, inject actual version
+var ClientVersion = "dev" // Injected during build
+
+const (
+	maxConnectAttempts = 2 // Try once without auth, once with if needed
+)
 
 func establishConnectTunnel(ctx context.Context, proxyConn net.Conn, targetAddr string, krbClient *kerb.KerberosClient) error {
 	logCtx := slog.With("target_addr", targetAddr, "proxy_host", proxyConn.RemoteAddr().String())
@@ -26,164 +31,166 @@ func establishConnectTunnel(ctx context.Context, proxyConn net.Conn, targetAddr 
 
 	var resp *http.Response
 	var lastErr error
+	attempt := 1
 
-	connectCtx, cancel := context.WithTimeout(ctx, proxyCONNECTTimeout)
-	defer cancel()
+	connectReq, err := http.NewRequestWithContext(ctx, "CONNECT", "http://"+targetAddr, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create CONNECT request object: %w", err)
+	}
+	connectReq.Host = targetAddr
+	connectReq.URL = &url.URL{Opaque: targetAddr}
+	connectReq.Header.Set("User-Agent", fmt.Sprintf("KernelGatekeeper-Client/%s", ClientVersion))
+	connectReq.Header.Set("Proxy-Connection", "Keep-Alive")
+	connectReq.Header.Set("Connection", "Keep-Alive")
 
-	for attempt := 1; attempt <= 2; attempt++ {
+	proxyReader := bufio.NewReader(proxyConn)
+
+	for ; attempt <= maxConnectAttempts; attempt++ {
+		logCtx.Debug("CONNECT attempt", "attempt", attempt)
+
 		select {
-		case <-connectCtx.Done():
-			err := ctx.Err()
-			if err == nil {
-				err = connectCtx.Err()
-			}
-			return fmt.Errorf("connect tunnel cancelled or timeout exceeded before attempt %d: %w", attempt, err)
+		case <-ctx.Done():
+			logCtx.Warn("CONNECT cancelled before attempt", "attempt", attempt, "error", ctx.Err())
+			return ctx.Err()
 		default:
 		}
 
-		logCtx.Debug("CONNECT attempt", "attempt", attempt)
-		connectReq, err := http.NewRequestWithContext(connectCtx, "CONNECT", "http://"+targetAddr, nil)
-		if err != nil {
-			return fmt.Errorf("failed to create CONNECT request object: %w", err)
-		}
-		connectReq.Host = targetAddr
-		connectReq.URL = &url.URL{Opaque: targetAddr} // Use Opaque as per RFC 7231 CONNECT
+		// --- Add Auth Header on Retry ---
+		if attempt > 1 {
+			if krbClient == nil {
+				errMsg := "proxy authentication required (407 received), but Kerberos client is not configured"
+				logCtx.Error(errMsg)
+				if lastErr == nil || !strings.Contains(lastErr.Error(), "407") {
+					lastErr = errors.New(errMsg)
+				}
+				return lastErr
+			}
 
-		connectReq.Header.Set("User-Agent", fmt.Sprintf("KernelGatekeeper-Client/%s", ClientVersion))
-		connectReq.Header.Set("Proxy-Connection", "Keep-Alive")
-		connectReq.Header.Set("Connection", "Keep-Alive")
-
-		useKerberos := krbClient != nil && attempt > 1
-
-		if useKerberos {
 			if refreshErr := krbClient.CheckAndRefreshClient(); refreshErr != nil {
-				logCtx.Error("Kerberos CheckAndRefreshClient failed unexpectedly, cannot authenticate", "error", refreshErr)
-				lastErr = fmt.Errorf("kerberos refresh attempt failed: %w", refreshErr)
-				// Continue without auth header, but store error. Proxy might allow fallback.
-			} else if krbClient.IsInitialized() {
-				gokrbCl := krbClient.Gokrb5Client()
-				if gokrbCl == nil {
-					lastErr = errors.New("internal kerberos error: client is initialized but Gokrb5Client() returned nil")
-					logCtx.Error("Cannot add SPNEGO header", "error", lastErr)
-					// Continue without auth header
+				logCtx.Error("Kerberos CheckAndRefreshClient failed before SPNEGO attempt", "error", refreshErr)
+				if lastErr == nil || !strings.Contains(lastErr.Error(), "407") {
+					lastErr = fmt.Errorf("kerberos refresh failed: %w", refreshErr)
 				} else {
-					spn := "" // Let gokrb5 determine SPN
-					logCtx.Debug("Attempting to set SPNEGO header", "spn_hint", spn)
-					spnegoErr := spnego.SetSPNEGOHeader(gokrbCl, connectReq, spn)
+					lastErr = fmt.Errorf("%w; kerberos refresh failed: %v", lastErr, refreshErr)
+				}
+				return lastErr
+			}
+			if !krbClient.IsInitialized() {
+				errMsg := "proxy authentication required, but Kerberos ticket is not available/valid after refresh"
+				logCtx.Error(errMsg)
+				if lastErr == nil || !strings.Contains(lastErr.Error(), "407") {
+					lastErr = errors.New(errMsg)
+				} else {
+					lastErr = fmt.Errorf("%w; kerberos ticket unavailable after refresh", lastErr)
+				}
+				return lastErr
+			}
 
-					if spnegoErr != nil {
-						lastErr = fmt.Errorf("failed to set SPNEGO header on attempt %d: %w", attempt, spnegoErr)
-						logCtx.Error("SPNEGO header generation failed on retry attempt", "error", lastErr)
-						// Continue without auth header
-					} else if connectReq.Header.Get("Proxy-Authorization") != "" {
-						logCtx.Debug("SPNEGO Proxy-Authorization header added", "attempt", attempt)
-						lastErr = nil // Clear previous non-fatal errors if header was successfully added
-					} else {
-						lastErr = errors.New("failed to generate SPNEGO token for Proxy-Authorization header")
-						logCtx.Warn("SPNEGO did not add Proxy-Authorization header on retry attempt", "error", lastErr)
-						// Continue without auth header
-					}
+			gokrbCl := krbClient.Gokrb5Client()
+			if gokrbCl == nil {
+				errMsg := "internal kerberos error: client is initialized but Gokrb5Client() returned nil"
+				logCtx.Error(errMsg)
+				if lastErr == nil || !strings.Contains(lastErr.Error(), "407") {
+					lastErr = errors.New(errMsg)
+				} else {
+					lastErr = fmt.Errorf("%w; %s", lastErr, errMsg)
 				}
-			} else {
-				logCtx.Warn("Cannot add SPNEGO header: Kerberos client is not initialized (no valid ticket found). Proceeding without auth header.")
-				if lastErr == nil {
-					lastErr = errors.New("kerberos ticket not available for authentication")
-				}
+				return lastErr
 			}
-		} else if krbClient == nil && attempt > 1 {
-			logCtx.Error("Received 407 Proxy Authentication Required, but Kerberos client is not available.")
-			if lastErr == nil {
-				lastErr = errors.New("proxy authentication required, but Kerberos is not configured/initialized")
+
+			spn := "" // Let gokrb5 determine SPN
+			logCtx.Debug("Attempting to set SPNEGO header", "spn_hint", spn)
+
+			spnegoErr := spnego.SetSPNEGOHeader(gokrbCl, connectReq, spn)
+			if spnegoErr != nil {
+				errMsg := fmt.Sprintf("failed to set SPNEGO header on attempt %d: %v", attempt, spnegoErr)
+				logCtx.Error(errMsg)
+				lastErr = fmt.Errorf("proxy auth required (407), but SPNEGO generation failed: %w", spnegoErr)
+				return lastErr
 			}
-			return lastErr // Cannot authenticate
+			if connectReq.Header.Get("Proxy-Authorization") == "" {
+				errMsg := "SPNEGO process did not add Proxy-Authorization header"
+				logCtx.Error(errMsg)
+				lastErr = fmt.Errorf("proxy auth required (407), but %s", errMsg)
+				return lastErr
+			}
+			logCtx.Info("Added Proxy-Authorization header for retry.")
 		}
 
-		// Send request
-		if err := proxyConn.SetWriteDeadline(time.Now().Add(proxyConnectDialTimeout)); err != nil {
-			logCtx.Warn("Failed to set write deadline for CONNECT request", "error", err)
+		// --- Send Request ---
+		writeDeadline := time.Now().Add(proxyConnectDialTimeout)
+		if err := proxyConn.SetWriteDeadline(writeDeadline); err != nil {
+			logCtx.Warn("Failed to set write deadline for CONNECT request", "attempt", attempt, "error", err)
 		}
 		writeErr := connectReq.Write(proxyConn)
-		proxyConn.SetWriteDeadline(time.Time{}) // Clear deadline immediately
+		_ = proxyConn.SetWriteDeadline(time.Time{}) // Clear deadline immediately
 
 		if writeErr != nil {
-			if errors.Is(writeErr, context.Canceled) || errors.Is(writeErr, context.DeadlineExceeded) {
-				return fmt.Errorf("CONNECT write cancelled or timed out (attempt %d): %w", attempt, writeErr)
+			// Handle potential connection reset especially after 407
+			if common.IsConnectionClosedErr(writeErr) && attempt == 2 {
+				logCtx.Warn("Proxy connection closed after 407 before retry could be sent. Aborting.", "error", writeErr)
+				if lastErr == nil {
+					lastErr = errors.New("proxy connection closed after 407")
+				}
+				return lastErr
 			}
-			if common.IsConnectionClosedErr(writeErr) {
-				return fmt.Errorf("proxy connection closed before/during writing CONNECT (attempt %d): %w", attempt, writeErr)
-			}
+			logCtx.Error("Failed to send CONNECT request", "attempt", attempt, "error", writeErr)
 			return fmt.Errorf("failed to send CONNECT request (attempt %d): %w", attempt, writeErr)
 		}
 		logCtx.Debug("CONNECT request sent", "attempt", attempt)
 
-		// Read response
-		proxyReader := bufio.NewReader(proxyConn)
-		readDeadline := time.Now().Add(proxyCONNECTTimeout / 2) // Allow reasonable time for response
+		// --- Read Response ---
+		readDeadline := time.Now().Add(proxyCONNECTTimeout)
 		if err := proxyConn.SetReadDeadline(readDeadline); err != nil {
-			logCtx.Warn("Failed to set read deadline for CONNECT response", "error", err)
+			logCtx.Warn("Failed to set read deadline for CONNECT response", "attempt", attempt, "error", err)
 		}
-		readRespErr := errors.New("proxy read response placeholder error") // Placeholder
-		resp, readRespErr = http.ReadResponse(proxyReader, connectReq)
-		proxyConn.SetReadDeadline(time.Time{}) // Clear deadline immediately
+		resp, err = http.ReadResponse(proxyReader, connectReq)
+		readErr := err                             // Store read error separately
+		_ = proxyConn.SetReadDeadline(time.Time{}) // Clear deadline
 
-		// Handle errors during read *after* checking resp
-		if readRespErr != nil {
-			if errors.Is(readRespErr, context.Canceled) || errors.Is(readRespErr, context.DeadlineExceeded) || common.IsTimeoutError(readRespErr) {
-				logCtx.Error("Timeout or cancellation reading CONNECT response", "attempt", attempt, "error", readRespErr)
-				return fmt.Errorf("CONNECT read cancelled or timed out (attempt %d): %w", attempt, readRespErr)
+		if readErr != nil {
+			logCtx.Error("Failed to read CONNECT response", "attempt", attempt, "error", readErr)
+			// If we failed reading after sending auth, return the combined error
+			if attempt == 2 && lastErr != nil && strings.Contains(lastErr.Error(), "SPNEGO") {
+				return fmt.Errorf("failed reading response after SPNEGO attempt (underlying error: %w): %w", lastErr, readErr)
 			}
-			if common.IsConnectionClosedErr(readRespErr) {
-				logCtx.Error("Proxy closed connection unexpectedly after CONNECT request", "attempt", attempt, "error", readRespErr)
-				return fmt.Errorf("proxy connection closed while reading response (attempt %d): %w", attempt, readRespErr)
-			}
-			logCtx.Error("Failed to read CONNECT response", "attempt", attempt, "error", readRespErr)
-			return fmt.Errorf("failed reading CONNECT response (attempt %d): %w", attempt, readRespErr)
+			return fmt.Errorf("failed reading CONNECT response (attempt %d): %w", attempt, readErr)
 		}
 
-		// Response received, process it
-		logCtx.Debug("Received CONNECT response", "attempt", attempt, "status", resp.StatusCode)
+		// --- Process Response ---
+		logCtx.Info("Received CONNECT response", "attempt", attempt, "status", resp.StatusCode)
+		// Ensure body is read and closed
 		if resp.Body != nil {
-			io.Copy(io.Discard, resp.Body) // Consume and discard any body
-			resp.Body.Close()
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
 		}
 
 		if resp.StatusCode == http.StatusOK {
-			logCtx.Debug("CONNECT tunnel established successfully")
-			return nil // Success
+			logCtx.Info("CONNECT tunnel established successfully")
+			return nil // Success!
 		}
 
 		if resp.StatusCode == http.StatusProxyAuthRequired {
-			if attempt == 1 {
-				if krbClient != nil {
-					logCtx.Info("Received 407 Proxy Authentication Required, will retry with Kerberos auth.")
-					lastErr = fmt.Errorf("proxy authentication required (%s)", resp.Status)
-					continue // Go to next attempt
-				} else {
-					logCtx.Error("Received 407 Proxy Authentication Required, but Kerberos support is not available.")
-					lastErr = fmt.Errorf("proxy authentication required (%s), but Kerberos unavailable", resp.Status)
-					return lastErr // Cannot authenticate
-				}
-			} else { // attempt == 2
-				logCtx.Error("Received 407 Proxy Authentication Required even after attempting Kerberos auth.")
-				if lastErr == nil { // If Kerberos attempt didn't set an error (e.g., ticket was valid but rejected)
-					lastErr = fmt.Errorf("proxy authentication failed (%s) despite Kerberos attempt", resp.Status)
-				} else { // Combine Kerberos issue with 407
-					lastErr = fmt.Errorf("proxy authentication failed (%s) after Kerberos issue: %w", resp.Status, lastErr)
-				}
-				return lastErr // Authentication failed
+			logCtx.Info("Received 407 Proxy Authentication Required", "attempt", attempt)
+			lastErr = errors.New("proxy authentication required (407)") // Store the 407 error
+			if attempt == maxConnectAttempts {
+				logCtx.Error("Authentication failed after retry.")
+				return lastErr // Failed on the last attempt
 			}
+			// Continue loop for the next attempt (will add auth header)
+			continue
 		}
 
-		// Other error status codes
-		errMsg := fmt.Sprintf("proxy CONNECT request failed: %s", resp.Status)
+		// --- Other Status Code ---
+		lastErr = fmt.Errorf("proxy CONNECT request failed with status: %s", resp.Status)
 		logCtx.Error("Proxy returned error for CONNECT", "status", resp.Status)
-		lastErr = errors.New(errMsg)
-		return lastErr // Other proxy error
+		return lastErr
 	}
 
-	// Should not be reached if loop logic is correct, but acts as a fallback
+	// Fallback error if loop finishes unexpectedly
 	if lastErr == nil {
-		lastErr = errors.New("failed to establish CONNECT tunnel after maximum attempts")
+		lastErr = fmt.Errorf("failed to establish CONNECT tunnel after %d attempts (unknown reason)", maxConnectAttempts)
 	}
+	logCtx.Error("CONNECT tunnel establishment failed", "error", lastErr)
 	return lastErr
 }
