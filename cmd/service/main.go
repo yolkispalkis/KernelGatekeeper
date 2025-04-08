@@ -986,7 +986,6 @@ func (s *Service) reloadConfig() error {
 	slog.Info("Logging reconfigured based on reloaded settings.") // Use new logger
 
 	// 2. Update BPF target ports if changed and allowed
-	configChanged := false  // Flag to track if any relevant config changed
 	oldCfg := s.getConfig() // Get copy of old config before swapping
 
 	if newCfg.EBPF.AllowDynamicPorts && !equalIntSliceUnordered(oldCfg.EBPF.TargetPorts, newCfg.EBPF.TargetPorts) {
@@ -997,7 +996,6 @@ func (s *Service) reloadConfig() error {
 				// Decide on error handling: revert? mark degraded? For now, just log.
 			} else {
 				slog.Info("Target ports successfully updated in BPF map.")
-				configChanged = true
 			}
 		} else {
 			slog.Warn("Cannot update target ports: BPF manager not initialized.")
@@ -1020,7 +1018,6 @@ func (s *Service) reloadConfig() error {
 	if oldCfg.ShutdownTimeout != newCfg.ShutdownTimeout {
 		slog.Info("Shutdown timeout updated.", "old", oldCfg.ShutdownTimeout, "new", newCfg.ShutdownTimeout)
 		// No restart needed, will be used on next shutdown
-		configChanged = true
 	}
 
 	// 4. Update the main config struct under lock
