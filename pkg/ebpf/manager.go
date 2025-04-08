@@ -26,7 +26,7 @@ import (
 const (
 	GlobalStatsMatchedIndex uint32 = 1
 	DefaultCgroupPath              = "/sys/fs/cgroup"
-	verifierLogSize                = 2 * 1024 * 1024
+	verifierLogSize                = 2 * 1024 * 1024 // Ensure this is an int or uint, not a specific type incompatible with LogSize if LogSize has a specific underlying type (though it's likely `uint`)
 )
 
 type GlobalStats struct {
@@ -120,11 +120,12 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 	}
 
 	var objs bpfObjects
+	// This structure aligns with cilium/ebpf v0.18.0 documentation
 	opts := &ebpf.CollectionOptions{
 		Maps: ebpf.MapOptions{},
 		Programs: ebpf.ProgramOptions{
 			LogLevel: ebpf.LogLevelInstruction,
-			LogSize:  verifierLogSize, // Set LogSize directly in ProgramOptions
+			LogSize:  verifierLogSize, // LogSize is a field of ProgramOptions
 		},
 	}
 
