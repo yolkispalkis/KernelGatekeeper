@@ -126,8 +126,9 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 			// PinPath: "/sys/fs/bpf/kernelgatekeeper", // Optional: Pin maps for external inspection/reuse
 		},
 		Programs: ebpf.ProgramOptions{
-			LogLevel: ebpf.LogLevelInstruction,        // Provides verifier output on failure
-			LogSize:  ebpf.DefaultVerifierLogSize * 8, // Increase log size
+			LogLevel: ebpf.LogLevelInstruction, // Provides verifier output on failure
+			// LogSize removed as it's deprecated/changed in newer ebpf library versions
+			// LogSize:  ebpf.DefaultVerifierLogSize * 8, // Increase log size - REMOVED
 		},
 	}
 
@@ -139,6 +140,15 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 	slog.Debug("eBPF sockops objects loaded successfully.")
 
 	// Load skmsg program, potentially reusing maps loaded by sockops spec
+	// Pass reference to existing maps if needed (Viper handles this automatically if map definitions match?)
+	// Or explicitly set replacements in opts.Maps.MapReplacements
+	opts.Maps.MapReplacements = map[string]*ebpf.Map{
+		"proxy_sock_map":       objs.bpf_sockopsObjects.ProxySockMap,
+		"notification_ringbuf": objs.bpf_sockopsObjects.NotificationRingbuf,
+		"connection_map":       objs.bpf_sockopsObjects.ConnectionMap,
+		"target_ports":         objs.bpf_sockopsObjects.TargetPorts,
+		"global_stats":         objs.bpf_sockopsObjects.GlobalStats,
+	}
 	if err := specSkmsg.LoadAndAssign(&objs.bpf_skmsgObjects, opts); err != nil {
 		handleVerifierError("skmsg", err)
 		objs.bpf_sockopsObjects.Close() // Clean up already loaded objects
@@ -155,21 +165,28 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 	}
 	manager.statsCache.lastStatsTime = time.Now() // Initialize stats time
 
-	// Validate that required programs and maps were loaded
-	if objs.KernelgatekeeperSockops == nil || objs.KernelgatekeeperSkmsg == nil || objs.ProxySockMap == nil || objs.NotificationRingbuf == nil || objs.ConnectionMap == nil || objs.TargetPorts == nil || objs.GlobalStats == nil {
+	// Validate that required programs and maps were loaded using explicit access
+	// Access shared maps via bpf_sockopsObjects consistently.
+	if objs.KernelgatekeeperSockops == nil ||
+		objs.KernelgatekeeperSkmsg == nil ||
+		objs.bpf_sockopsObjects.ProxySockMap == nil || // Explicit access
+		objs.bpf_sockopsObjects.NotificationRingbuf == nil || // Explicit access
+		objs.bpf_sockopsObjects.ConnectionMap == nil || // Explicit access
+		objs.bpf_sockopsObjects.TargetPorts == nil || // Explicit access
+		objs.bpf_sockopsObjects.GlobalStats == nil { // Explicit access
 		objs.Close() // Clean up partially loaded objects
 		return nil, errors.New("one or more required BPF programs or maps failed to load (check C code and bpf2go output)")
 	}
 
-	// Attach the loaded programs
-	if err := manager.attachPrograms(DefaultCgroupPath, objs.KernelgatekeeperSockops, objs.KernelgatekeeperSkmsg, objs.ProxySockMap); err != nil {
+	// Attach the loaded programs (pass the map explicitly from one object)
+	if err := manager.attachPrograms(DefaultCgroupPath, objs.KernelgatekeeperSockops, objs.KernelgatekeeperSkmsg, objs.bpf_sockopsObjects.ProxySockMap); err != nil {
 		manager.Close() // Clean up loaded objects if attach fails
 		return nil, err // Error already contains context
 	}
 
 	// Create a reader for the ring buffer map used for notifications
 	var ringbufErr error
-	manager.notificationReader, ringbufErr = ringbuf.NewReader(objs.NotificationRingbuf)
+	manager.notificationReader, ringbufErr = ringbuf.NewReader(objs.bpf_sockopsObjects.NotificationRingbuf) // Explicit access
 	if ringbufErr != nil {
 		manager.Close() // Clean up
 		return nil, fmt.Errorf("failed to create ring buffer reader: %w", ringbufErr)
@@ -237,7 +254,7 @@ func (m *BPFManager) attachPrograms(cgroupPath string, sockopsProg *ebpf.Program
 		Program: skmsgProg,
 		Attach:  ebpf.AttachSkMsgVerdict,
 		Target:  sockMap.FD(),
-		Flags:   0,
+		Flags:   0, // Use 0 for modern kernels, BPF_F_REPLACE if replacing needed
 	})
 	if err != nil {
 		m.cgroupLink.Close()
@@ -437,7 +454,9 @@ func (m *BPFManager) updateAndLogStats() error {
 func (m *BPFManager) readGlobalStats(index uint32) (GlobalStats, error) {
 	var aggregate GlobalStats
 
-	if m.objs.GlobalStats == nil {
+	// Use explicit access to the map via one of the embedded objects
+	globalStatsMap := m.objs.bpf_sockopsObjects.GlobalStats
+	if globalStatsMap == nil {
 		return aggregate, errors.New("BPF global_stats map is nil (was it loaded?)")
 	}
 
@@ -447,7 +466,7 @@ func (m *BPFManager) readGlobalStats(index uint32) (GlobalStats, error) {
 	var perCPUValues []bpf_sockopsGlobalStatsT
 
 	// Lookup typically returns ErrKeyNotExist if key is out of bounds for array type.
-	err := m.objs.GlobalStats.Lookup(index, &perCPUValues)
+	err := globalStatsMap.Lookup(index, &perCPUValues)
 	if err != nil {
 		// Distinguish between key not existing and other errors
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
@@ -469,7 +488,9 @@ func (m *BPFManager) UpdateTargetPorts(ports []int) error {
 	m.mu.Lock() // Lock to prevent concurrent updates
 	defer m.mu.Unlock()
 
-	if m.objs.TargetPorts == nil {
+	// Use explicit access
+	targetPortsMap := m.objs.bpf_sockopsObjects.TargetPorts
+	if targetPortsMap == nil {
 		return errors.New("BPF target_ports map not initialized (was it loaded?)")
 	}
 
@@ -477,7 +498,7 @@ func (m *BPFManager) UpdateTargetPorts(ports []int) error {
 	currentPortsMap := make(map[uint16]bool)
 	var mapKey uint16
 	var mapValue uint8 // Value is uint8 in C code
-	iter := m.objs.TargetPorts.Iterate()
+	iter := targetPortsMap.Iterate()
 	for iter.Next(&mapKey, &mapValue) {
 		// Check if value indicates presence (e.g., value is 1)
 		if mapValue == 1 {
@@ -510,7 +531,7 @@ func (m *BPFManager) UpdateTargetPorts(ports []int) error {
 	for portKey := range currentPortsMap {
 		if !desiredPortsSet[portKey] {
 			// Port exists in map but not in the new desired list, delete it.
-			if err := m.objs.TargetPorts.Delete(portKey); err != nil {
+			if err := targetPortsMap.Delete(portKey); err != nil {
 				// Log error if deletion fails (unless key already gone)
 				if !errors.Is(err, ebpf.ErrKeyNotExist) {
 					slog.Error("Failed to delete target port from BPF map", "port", portKey, "error", err)
@@ -530,7 +551,7 @@ func (m *BPFManager) UpdateTargetPorts(ports []int) error {
 	for portKey := range desiredPortsSet {
 		if !currentPortsMap[portKey] {
 			// Port is in desired list but not currently in the map, add it.
-			if err := m.objs.TargetPorts.Put(portKey, mapValueOne); err != nil {
+			if err := targetPortsMap.Put(portKey, mapValueOne); err != nil {
 				slog.Error("Failed to add target port to BPF map", "port", portKey, "error", err)
 				// Consider returning error here? Or just log? Log for now.
 			} else {
@@ -559,7 +580,9 @@ func (m *BPFManager) UpdateTargetPorts(ports []int) error {
 func (m *BPFManager) GetConnectionPID(tuple NotificationTuple) (uint32, error) {
 	// No lock needed for map lookup as it's thread-safe.
 
-	if m.objs.ConnectionMap == nil {
+	// Use explicit access
+	connectionMap := m.objs.bpf_sockopsObjects.ConnectionMap
+	if connectionMap == nil {
 		return 0, errors.New("BPF connection_map not initialized (was it loaded?)")
 	}
 
@@ -577,7 +600,7 @@ func (m *BPFManager) GetConnectionPID(tuple NotificationTuple) (uint32, error) {
 	}
 
 	var state BpfConnectionStateT // Value type from BPF map
-	err := m.objs.ConnectionMap.Lookup(&key, &state)
+	err := connectionMap.Lookup(&key, &state)
 	if err != nil {
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
 			// This is common if the process exits very quickly after connect()
@@ -625,7 +648,7 @@ func (m *BPFManager) Close() error {
 		// 2. Close ring buffer reader (unblocks reader goroutine)
 		if m.notificationReader != nil {
 			slog.Debug("Closing BPF ring buffer reader...")
-			if err := m.notificationReader.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			if err := m.notificationReader.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, ringbuf.ErrClosed) {
 				slog.Error("Error closing BPF ringbuf reader", "error", err)
 				if firstErr == nil {
 					firstErr = fmt.Errorf("ringbuf close: %w", err)
@@ -676,7 +699,6 @@ func (m *BPFManager) Close() error {
 
 // nativeEndian stores the system's byte order, determined at init.
 var nativeEndian binary.ByteOrder
-var errClosed = errors.New("reader closed") // Sentinel error for ringbuf reader closing
 
 // init determines the native byte order of the host system.
 func init() {
