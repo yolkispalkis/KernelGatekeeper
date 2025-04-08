@@ -205,9 +205,13 @@ func triggerShutdown() {
 // cleanupResources closes global resources like Kerberos client and Proxy manager.
 func cleanupResources() {
 	slog.Debug("Cleaning up global resources...")
+	// Close proxy manager first as it might hold PAC engine resources
 	if globalProxyMgr != nil {
-		globalProxyMgr.Close()
-		slog.Debug("Proxy manager closed.")
+		if err := globalProxyMgr.Close(); err != nil {
+			slog.Error("Error closing proxy manager", "error", err)
+		} else {
+			slog.Debug("Proxy manager closed.")
+		}
 	}
 	if globalKerbClient != nil {
 		globalKerbClient.Close()
@@ -375,9 +379,15 @@ func waitForConnectionClose(ctx context.Context, conn net.Conn) {
 		case <-probeTicker.C:
 			one := make([]byte, 1)
 			// Set a very short deadline for the read probe
-			conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+			if err := conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+				if !isConnectionClosedErr(err) { // Log if not already closed
+					slog.Warn("Error setting read deadline for IPC probe", "error", err)
+				}
+				return // Assume connection is bad if setting deadline fails
+			}
 			_, err := conn.Read(one)
-			conn.SetReadDeadline(time.Time{}) // Clear the deadline immediately
+			// Clear the deadline immediately, ignoring error as it might be expected
+			_ = conn.SetReadDeadline(time.Time{})
 
 			if err != nil {
 				// EOF or timeout likely means connection closed or unresponsive
@@ -461,6 +471,10 @@ func performInitialSetup() error {
 	pMgr, err := proxy.NewProxyManager(&initialConfig.Proxy)
 	if err != nil {
 		slog.Error("Failed to initialize Proxy Manager", "error", err)
+		// Clean up Kerberos client if proxy manager fails
+		if globalKerbClient != nil {
+			globalKerbClient.Close()
+		}
 		return fmt.Errorf("Proxy Manager initialization failed: %w", err)
 	}
 	globalProxyMgr = pMgr
@@ -494,7 +508,7 @@ func getConfigFromService() (*config.Config, error) {
 
 	decoder := json.NewDecoder(conn)
 	var resp ipc.Response
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second)) // Slightly longer deadline for config response
 	err = decoder.Decode(&resp)
 	conn.SetReadDeadline(time.Time{})
 	if err != nil {
@@ -569,12 +583,22 @@ func listenIPCNotifications(ctx context.Context, localListener net.Listener) {
 			// Decode command with timeout
 			var cmd ipc.Command
 			// Set a read deadline to prevent blocking forever if connection hangs
+			// Use a longer timeout for general listening than for specific requests
 			if currentConn != nil {
-				currentConn.SetReadDeadline(time.Now().Add(statusPingInterval + 10*time.Second)) // Longer timeout
+				if err := currentConn.SetReadDeadline(time.Now().Add(statusPingInterval + 30*time.Second)); err != nil {
+					if !isConnectionClosedErr(err) {
+						slog.Warn("Error setting read deadline for IPC notification listener", "error", err)
+					}
+					currentConn = nil // Assume connection is bad
+					decoder = nil
+					time.Sleep(1 * time.Second)
+					continue
+				}
 			}
 			err := decoder.Decode(&cmd)
 			if currentConn != nil {
-				currentConn.SetReadDeadline(time.Time{}) // Clear deadline
+				// Clear deadline immediately, ignore error as it might be expected
+				_ = currentConn.SetReadDeadline(time.Time{})
 			}
 
 			if err != nil {
@@ -582,17 +606,20 @@ func listenIPCNotifications(ctx context.Context, localListener net.Listener) {
 					return // Exit if context was cancelled during decode
 				}
 				// Handle errors: EOF/closed likely means disconnect
-				if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || isConnectionClosedErr(err) {
-					slog.Warn("IPC connection lost while reading notifications.", "error", err)
+				if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || isConnectionClosedErr(err) || isTimeoutError(err) {
+					logMsg := "IPC connection lost or timed out while reading notifications."
+					if isTimeoutError(err) {
+						logMsg = "IPC connection timed out waiting for notifications."
+					}
+					slog.Warn(logMsg, "error", err)
 					// Connection manager will handle reconnect
 					currentConn = nil // Ensure decoder is recreated on reconnect
 					decoder = nil
-					// Don't trigger backoff here, manageIPCConnection handles it
 					time.Sleep(500 * time.Millisecond) // Small delay before checking connection again
 				} else {
 					// Log other decoding errors
 					slog.Error("Failed to decode IPC command", "error", err)
-					// Potential stream corruption? Maybe force reconnect?
+					// Potential stream corruption? Force disconnect.
 					if currentConn != nil {
 						currentConn.Close() // Close potentially bad connection
 					}
@@ -611,10 +638,14 @@ func listenIPCNotifications(ctx context.Context, localListener net.Listener) {
 					slog.Error("Failed to decode notify_accept data", "error", err)
 					continue
 				}
-				slog.Info("Received 'notify_accept' from service", "src", data.SrcIP, "dst", data.DstIP, "dport", data.DstPort)
+				slog.Info("Received 'notify_accept' from service", "src", data.SrcIP, "dport", data.DstPort, "orig_dst", data.DstIP)
 				// Accept the connection passed via sockmap
 				handleBPFAccept(ctx, localListener, data)
 			// Handle other commands if needed in the future (e.g., config_updated)
+			case "config_updated": // Example: Service signals config change
+				slog.Info("Received 'config_updated' notification from service. Triggering refresh.")
+				// Trigger an immediate config refresh instead of waiting for the timer
+				go refreshConfiguration() // Run in goroutine to avoid blocking listener
 			default:
 				slog.Warn("Received unknown command from service via IPC", "command", cmd.Command)
 			}
@@ -624,14 +655,27 @@ func listenIPCNotifications(ctx context.Context, localListener net.Listener) {
 
 // handleBPFAccept accepts the connection from the local listener and starts processing.
 func handleBPFAccept(ctx context.Context, listener net.Listener, originalDest ipc.NotifyAcceptData) {
+	// Set a deadline for accepting the connection to prevent blocking indefinitely if BPF/sockmap has issues
+	if tcpListener, ok := listener.(*net.TCPListener); ok {
+		// SetDeadline only works on TCPListener
+		acceptDeadline := time.Now().Add(5 * time.Second) // 5 second timeout to accept
+		if err := tcpListener.SetDeadline(acceptDeadline); err != nil {
+			slog.Warn("Failed to set accept deadline on local listener", "error", err)
+			// Continue without deadline? Or return? Continue for now.
+		}
+		defer tcpListener.SetDeadline(time.Time{}) // Clear deadline afterwards
+	}
+
 	acceptedConn, err := listener.Accept()
 	if err != nil {
 		// Check if the error is due to the listener being closed during shutdown
 		if errors.Is(err, net.ErrClosed) {
 			slog.Info("Local listener closed while attempting to accept BPF connection (likely shutdown).")
-			return
+		} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			slog.Error("Timeout accepting connection from BPF sockmap", "error", err)
+		} else {
+			slog.Error("Failed to accept connection from BPF sockmap", "error", err)
 		}
-		slog.Error("Failed to accept connection from BPF sockmap", "error", err)
 		return
 	}
 	slog.Debug("Accepted connection from BPF sockmap", "local", acceptedConn.LocalAddr(), "remote", acceptedConn.RemoteAddr())
@@ -673,7 +717,7 @@ func handleAcceptedConnection(ctx context.Context, acceptedConn net.Conn, origin
 	if originalDest.DstPort == 443 || originalDest.DstPort == 8443 {
 		scheme = "https"
 	}
-	targetURLStr := fmt.Sprintf("%s://%s", scheme, targetAddr)
+	targetURLStr := fmt.Sprintf("%s://%s", scheme, targetAddr) // Use originalDest.DstIP here
 	targetURL, err := url.Parse(targetURLStr)
 	if err != nil {
 		slog.Error("Failed to parse target address into URL", "target_addr", targetAddr, "error", err)
@@ -692,34 +736,39 @@ func handleAcceptedConnection(ctx context.Context, acceptedConn net.Conn, origin
 	proxyResult, err := globalProxyMgr.GetEffectiveProxyForURL(targetURL)
 	if err != nil {
 		logCtx.Error("Failed to determine effective proxy for target", "error", err)
+		// Should we fallback to DIRECT here? Configurable? For now, fail.
 		return
 	}
 
 	switch proxyResult.Type {
-	case proxy.ProxyResultDirect:
-		// KernelGatekeeper sockops model *cannot* handle DIRECT connections gracefully
-		// because the connection is already intercepted by BPF and sent to this client.
-		// We cannot simply "let it go". Log an error and close.
+	case proxy.ResultDirect:
 		logCtx.Error("PAC script returned DIRECT, but KernelGatekeeper (sockops) cannot bypass proxy once connection is intercepted. Closing connection.", "pac_result", "DIRECT")
 		return // Close the accepted connection
 
-	case proxy.ProxyResultError:
-		logCtx.Error("Error determining proxy from PAC or configuration. Closing connection.", "pac_result", "ERROR")
+	case proxy.ResultUnknown: // Treat Unknown/Error from PAC the same
+		logCtx.Error("Error determining proxy from PAC or configuration. Closing connection.", "pac_result", "UNKNOWN/ERROR")
 		return // Close the accepted connection
 
-	case proxy.ProxyResultProxy:
+	case proxy.ResultProxy:
 		if len(proxyResult.Proxies) == 0 {
 			logCtx.Error("Proxy result indicates PROXY but list is empty. Closing connection.")
 			return
 		}
-		logCtx.Info("Proxy determined for target", "proxies", proxy.UrlsToStrings(proxyResult.Proxies)) // Use exported helper for logging
+		logCtx.Info("Proxy determined for target", "proxies", proxy.UrlsToStrings(pac.UrlsFromPacResult(proxyResult))) // Log parsed URLs
 
 		var proxyConn net.Conn
 		var selectedProxyURL *url.URL
-		var connectErr error
+		connectErr := errors.New("no proxies available or all failed") // Initial error state
 
 		// Try proxies from the list in order
-		for _, currentProxyURL := range proxyResult.Proxies {
+		for _, currentProxyInfo := range proxyResult.Proxies {
+			currentProxyURL, urlErr := currentProxyInfo.URL() // Convert ProxyInfo to url.URL
+			if urlErr != nil {
+				logCtx.Warn("Skipping invalid proxy info from PAC result", "proxy_info", currentProxyInfo, "error", urlErr)
+				connectErr = fmt.Errorf("invalid proxy %v: %w", currentProxyInfo, urlErr) // Update last error
+				continue
+			}
+
 			logCtx.Info("Attempting connection via proxy", "proxy_url", currentProxyURL.String())
 			selectedProxyURL = currentProxyURL // Store the one we are trying
 
@@ -730,7 +779,10 @@ func handleAcceptedConnection(ctx context.Context, acceptedConn net.Conn, origin
 				logCtx.Warn("Failed to connect to proxy server, trying next (if any)", "proxy_url", currentProxyURL.String(), "error", connectErr)
 				continue // Try next proxy
 			}
-			defer proxyConn.Close() // Ensure connection is closed if tunnel fails or relay ends
+			// Ensure connection is closed if tunnel fails or relay ends
+			// Do this inside the loop so only the successful connection's defer runs after the loop
+			// defer proxyConn.Close() // <<< MOVED defer after successful tunnel
+
 			logCtx.Debug("Connected to proxy server", "proxy_url", currentProxyURL.String())
 
 			// Establish CONNECT tunnel
@@ -744,7 +796,8 @@ func handleAcceptedConnection(ctx context.Context, acceptedConn net.Conn, origin
 
 			// Tunnel established successfully
 			logCtx.Info("CONNECT tunnel established via proxy", "proxy_url", currentProxyURL.String())
-			break // Exit loop, we have a working connection
+			defer proxyConn.Close() // <<< Defer close ONLY for the successful connection
+			break                   // Exit loop, we have a working connection
 		}
 
 		// Check if we successfully established a connection and tunnel
@@ -756,14 +809,18 @@ func handleAcceptedConnection(ctx context.Context, acceptedConn net.Conn, origin
 		// Relay data
 		logCtx.Debug("Starting data relay", "selected_proxy", selectedProxyURL.String())
 		relayErr := relayDataBidirectionally(ctx, acceptedConn, proxyConn) // Pass context
-		if relayErr != nil && !isConnectionClosedErr(relayErr) && !errors.Is(relayErr, context.Canceled) {
-			logCtx.Warn("Data relay ended with error", "error", relayErr)
+		if relayErr != nil && !isConnectionClosedErr(relayErr) && !errors.Is(relayErr, context.Canceled) && !isTimeoutError(relayErr) {
+			// Log only unexpected relay errors
+			logCtx.Warn("Data relay ended with unexpected error", "error", relayErr)
+		} else if relayErr != nil {
+			// Log expected closures/timeouts at Debug level
+			logCtx.Debug("Data relay ended", "reason", relayErr)
 		} else {
 			logCtx.Debug("Data relay completed.")
 		}
 
-	default:
-		logCtx.Error("Unknown proxy result type encountered", "type", proxyResult.Type)
+	default: // Should not happen if parsing is correct
+		logCtx.Error("Unknown proxy result type encountered after PAC evaluation", "type", proxyResult.Type)
 	}
 }
 
@@ -783,96 +840,104 @@ func establishConnectTunnel(ctx context.Context, proxyConn net.Conn, targetAddr 
 	for attempt := 1; attempt <= 2; attempt++ {
 		select {
 		case <-connectCtx.Done():
-			return fmt.Errorf("connect tunnel timeout exceeded before attempt %d: %w", attempt, connectCtx.Err())
+			// Use the outer context's error if possible, otherwise the connectCtx error
+			err := ctx.Err()
+			if err == nil {
+				err = connectCtx.Err()
+			}
+			return fmt.Errorf("connect tunnel cancelled or timeout exceeded before attempt %d: %w", attempt, err)
 		default:
 		}
 
 		logCtx.Debug("CONNECT attempt", "attempt", attempt)
 		// Create CONNECT request object
-		connectReq := &http.Request{
-			Method: "CONNECT",
-			URL:    &url.URL{Opaque: targetAddr, Host: targetAddr}, // Opaque for CONNECT target, Host for header
-			Host:   targetAddr,                                     // Specifies the target host for the CONNECT request
-			Header: make(http.Header),
+		connectReq, err := http.NewRequestWithContext(connectCtx, "CONNECT", "http://"+targetAddr, nil) // Use targetAddr as authority part for CONNECT
+		if err != nil {
+			return fmt.Errorf("failed to create CONNECT request object: %w", err)
 		}
+		// The Host header for CONNECT should be the target authority (host:port)
+		connectReq.Host = targetAddr
+		connectReq.URL = &url.URL{Opaque: targetAddr} // Set URL.Opaque for CONNECT method, URL.Host is ignored
+
 		connectReq.Header.Set("User-Agent", fmt.Sprintf("KernelGatekeeper-Client/%s", version))
 		connectReq.Header.Set("Proxy-Connection", "Keep-Alive") // Optional but common
 		connectReq.Header.Set("Connection", "Keep-Alive")       // Optional
 
 		// Add Kerberos / SPNEGO header if available and required (or on 2nd attempt)
-		// NOTE: Removed unused `needsAuth` variable
-		if krbClient != nil {
+		if krbClient != nil && attempt > 1 { // Only add auth header on the second attempt after 407
 			// Check ticket validity before attempting SPNEGO (non-fatal warning if fails)
 			if kerr := krbClient.CheckAndRefreshClient(); kerr != nil {
-				logCtx.Warn("Kerberos ticket potentially invalid before CONNECT", "attempt", attempt, "error", kerr)
+				logCtx.Warn("Kerberos ticket potentially invalid before CONNECT retry", "attempt", attempt, "error", kerr)
 			}
 
-			// Use gokrb5's SPNEGO helper to add the header
-			// It's okay if CheckAndRefreshClient warned, SetSPNEGOHeader will use the available TGT
-			// Pass empty service principal name "" for standard HTTP proxy SPN (HTTP/proxy.host@REALM)
-			gokrbCl := krbClient.Gokrb5Client() // Get the underlying client using the new exported method
-			if gokrbCl == nil && attempt > 1 {
-				// If we need auth on 2nd attempt but Kerberos client isn't initialized internally
+			gokrbCl := krbClient.Gokrb5Client()
+			if gokrbCl == nil {
 				lastErr = errors.New("kerberos client not initialized internally, cannot add SPNEGO header on retry")
 				logCtx.Error("Cannot add SPNEGO header", "error", lastErr)
-				continue // Try next proxy? Or return error? Return error.
-				// return lastErr
+				return lastErr // Fail immediately if Kerberos isn't ready on retry
 			}
 
-			var spnegoErr error
-			if gokrbCl != nil { // Only attempt if the underlying client is available
-				spnegoErr = spnego.SetSPNEGOHeader(gokrbCl, connectReq, "")
-			} else if attempt > 1 {
-				// If we must authenticate but underlying client is nil
-				spnegoErr = errors.New("kerberos client not initialized internally, cannot generate SPNEGO token")
-			}
+			// Pass proxy host as SPN hint (gokrb5 usually derives it correctly as HTTP/proxy.host@REALM)
+			spn := "" // Let gokrb5 determine SPN from request host (proxy host)
+			logCtx.Debug("Attempting to set SPNEGO header", "spn_hint", spn)
+			spnegoErr := spnego.SetSPNEGOHeader(gokrbCl, connectReq, spn) // Use proxyConn.RemoteAddr().String()? No, Host header is proxy host
 
 			if spnegoErr != nil {
-				// Log error but continue without header if it fails? Or fail hard?
-				// Let's fail hard on 2nd attempt if SPNEGO header fails.
-				if attempt > 1 {
-					lastErr = fmt.Errorf("failed to set SPNEGO header on attempt %d: %w", attempt, spnegoErr)
-					logCtx.Error("SPNEGO header generation failed on retry attempt", "error", lastErr)
-					continue // Or return lastErr? Let's try continue first. Maybe proxy doesn't *require* krb?
-				} else {
-					logCtx.Warn("Failed to set SPNEGO header on initial attempt, proceeding without", "error", spnegoErr)
-				}
+				lastErr = fmt.Errorf("failed to set SPNEGO header on attempt %d: %w", attempt, spnegoErr)
+				logCtx.Error("SPNEGO header generation failed on retry attempt", "error", lastErr)
+				return lastErr // Fail hard if SPNEGO fails on retry
 			} else if connectReq.Header.Get("Proxy-Authorization") != "" {
 				logCtx.Debug("SPNEGO Proxy-Authorization header added", "attempt", attempt)
-				// needsAuth = true // We added an auth header - needsAuth is unused
-			} else if attempt > 1 {
+			} else {
 				logCtx.Warn("SPNEGO did not add Proxy-Authorization header on retry attempt")
+				// Proceed anyway? Maybe server doesn't require SPNEGO after all? Risky. Fail.
+				lastErr = errors.New("failed to generate SPNEGO token for Proxy-Authorization header")
+				return lastErr
 			}
-		} else if attempt > 1 {
+		} else if krbClient == nil && attempt > 1 {
 			// If krbClient is nil and we got a 407, we cannot authenticate.
 			logCtx.Error("Received 407 Proxy Authentication Required, but Kerberos client is not available.")
-			// Use the error from the previous iteration (407 response)
-			if lastErr == nil {
+			if lastErr == nil { // Should have error from previous 407 response
 				lastErr = errors.New("proxy authentication required, but Kerberos is not configured/initialized")
 			}
 			return lastErr
 		}
 
 		// Write the CONNECT request to the proxy connection
+		// Set deadline for the write operation
+		if err := proxyConn.SetWriteDeadline(time.Now().Add(proxyConnectDialTimeout)); err != nil {
+			logCtx.Warn("Failed to set write deadline for CONNECT request", "error", err)
+		}
 		writeErr := connectReq.Write(proxyConn)
+		proxyConn.SetWriteDeadline(time.Time{}) // Clear deadline
+
 		if writeErr != nil {
+			// Check if context was cancelled during write
+			if errors.Is(writeErr, context.Canceled) || errors.Is(writeErr, context.DeadlineExceeded) {
+				return fmt.Errorf("CONNECT write cancelled or timed out (attempt %d): %w", attempt, writeErr)
+			}
 			if isConnectionClosedErr(writeErr) {
-				return fmt.Errorf("proxy connection closed before writing CONNECT (attempt %d): %w", attempt, writeErr)
+				return fmt.Errorf("proxy connection closed before/during writing CONNECT (attempt %d): %w", attempt, writeErr)
 			}
 			return fmt.Errorf("failed to send CONNECT request (attempt %d): %w", attempt, writeErr)
 		}
 		logCtx.Debug("CONNECT request sent", "attempt", attempt)
 
 		// Read the response
-		// Use a buffered reader for ReadResponse
 		proxyReader := bufio.NewReader(proxyConn)
 		// Set a deadline specific to reading the response header
 		readDeadline := time.Now().Add(proxyCONNECTTimeout / 2) // Use half the total timeout for response reading
-		proxyConn.SetReadDeadline(readDeadline)
+		if err := proxyConn.SetReadDeadline(readDeadline); err != nil {
+			logCtx.Warn("Failed to set read deadline for CONNECT response", "error", err)
+		}
 		resp, lastErr = http.ReadResponse(proxyReader, connectReq)
 		proxyConn.SetReadDeadline(time.Time{}) // Clear deadline
 
 		if lastErr != nil {
+			// Check context first
+			if errors.Is(lastErr, context.Canceled) || errors.Is(lastErr, context.DeadlineExceeded) {
+				return fmt.Errorf("CONNECT read cancelled or timed out (attempt %d): %w", attempt, lastErr)
+			}
 			if isTimeoutError(lastErr) {
 				logCtx.Error("Timeout reading CONNECT response", "attempt", attempt, "error", lastErr)
 			} else if isConnectionClosedErr(lastErr) {
@@ -886,28 +951,25 @@ func establishConnectTunnel(ctx context.Context, proxyConn net.Conn, targetAddr 
 
 		// Process the response
 		logCtx.Debug("Received CONNECT response", "attempt", attempt, "status", resp.StatusCode)
+
+		// Drain and close body regardless of status code
+		if resp.Body != nil {
+			io.Copy(io.Discard, resp.Body) // Read and discard any potential body content
+			resp.Body.Close()
+		}
+
 		if resp.StatusCode == http.StatusOK {
-			// Success! Drain any remaining body and return nil.
-			if resp.Body != nil {
-				io.Copy(io.Discard, resp.Body) // Read and discard any potential body content
-				resp.Body.Close()
-			}
 			logCtx.Debug("CONNECT tunnel established successfully")
 			return nil // Success
 		}
 
 		// Handle Authentication Required
 		if resp.StatusCode == http.StatusProxyAuthRequired {
-			// Read and discard body
-			if resp.Body != nil {
-				io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
-			}
 			// Check if we should retry with authentication
 			if attempt == 1 && krbClient != nil {
 				logCtx.Info("Received 407 Proxy Authentication Required, will retry with Kerberos auth.")
-				lastErr = errors.New(resp.Status) // Store the 407 status text as the error
-				continue                          // Go to the next attempt
+				lastErr = fmt.Errorf("proxy authentication required (%s)", resp.Status) // Store the 407 status text as the error
+				continue                                                                // Go to the next attempt
 			} else {
 				logCtx.Error("Received 407 Proxy Authentication Required, but cannot retry or Kerberos not available.")
 				lastErr = fmt.Errorf("proxy authentication failed: %s (Kerberos available: %t, attempt: %d)", resp.Status, krbClient != nil, attempt)
@@ -916,12 +978,8 @@ func establishConnectTunnel(ctx context.Context, proxyConn net.Conn, targetAddr 
 		}
 
 		// Handle other non-OK, non-407 responses
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 512)) // Read some body for context
-		if resp.Body != nil {
-			resp.Body.Close()
-		}
-		errMsg := fmt.Sprintf("proxy CONNECT request failed: %s (%s)", resp.Status, strings.TrimSpace(string(bodyBytes)))
-		logCtx.Error("Proxy returned error for CONNECT", "status", resp.Status, "body_preview", string(bodyBytes))
+		errMsg := fmt.Sprintf("proxy CONNECT request failed: %s", resp.Status)
+		logCtx.Error("Proxy returned error for CONNECT", "status", resp.Status)
 		lastErr = errors.New(errMsg)
 		return lastErr // Return error for non-200, non-407 status
 	}
@@ -934,86 +992,84 @@ func establishConnectTunnel(ctx context.Context, proxyConn net.Conn, targetAddr 
 }
 
 // relayDataBidirectionally copies data between the accepted connection and the proxy connection.
-// It now accepts a context for cancellation.
+// Added context cancellation checks and refined timeout/error handling.
 func relayDataBidirectionally(ctx context.Context, conn1, conn2 net.Conn) error {
 	var wg sync.WaitGroup
-	errChan := make(chan error, 2) // Channel to capture errors from goroutines
+	errChan := make(chan error, 2) // Buffered channel to capture errors
 
 	copyData := func(dst, src net.Conn, tag string) {
 		defer wg.Done()
 		// Use a buffer allocated outside the loop
+		// Consider using sync.Pool for buffer allocation if handling very high connection rates
 		buf := make([]byte, 32*1024) // 32KB buffer
 
+		logCtx := slog.With("relay_tag", tag)
+
 		for {
-			// Check for context cancellation before each read/write cycle
+			// --- Check for context cancellation before read ---
 			select {
 			case <-ctx.Done():
-				errChan <- fmt.Errorf("%s relay cancelled by context: %w", tag, ctx.Err())
-				// Close connections to interrupt the other side? Or rely on CloseWrite?
-				// Closing write signals EOF to the other side.
+				logCtx.Debug("Relay cancelled by context before read")
+				errChan <- ctx.Err() // Report context error
+				// Signal closure to the other side
 				if tcpDst, ok := dst.(*net.TCPConn); ok {
 					tcpDst.CloseWrite()
 				}
 				if tcpSrc, ok := src.(*net.TCPConn); ok {
-					tcpSrc.CloseRead() // Optional: signal we won't read anymore
+					tcpSrc.CloseRead() // Optional
 				}
 				return
 			default:
 				// Proceed with copy attempt
 			}
 
-			// Set deadline for read operation to implement inactivity timeout
-			// and allow periodic context checking.
+			// --- Read with Timeout ---
 			readDeadline := time.Now().Add(relayCopyTimeout)
 			if err := src.SetReadDeadline(readDeadline); err != nil {
-				// This might happen if the connection is already closed.
 				if !isConnectionClosedErr(err) {
-					slog.Warn("Failed to set read deadline for relay", "tag", tag, "error", err)
-					// Attempt to continue without deadline? Or report error? Report error.
+					logCtx.Warn("Failed to set read deadline for relay", "error", err)
+					// Report error, maybe connection is already bad
 					errChan <- fmt.Errorf("%s set read deadline failed: %w", tag, err)
 				} else {
-					// If connection closed while setting deadline, report EOF/closed
-					errChan <- io.EOF
+					errChan <- io.EOF // Report EOF if closed while setting deadline
 				}
 				return
 			}
 
-			// Perform the read
 			nr, readErr := src.Read(buf)
+			_ = src.SetReadDeadline(time.Time{}) // Clear read deadline immediately
 
-			// Clear the read deadline immediately after read returns
-			src.SetReadDeadline(time.Time{})
-
-			// Write the data if read was successful
+			// --- Write Data (if read successful) ---
 			if nr > 0 {
-				// Set write deadline
 				writeDeadline := time.Now().Add(relayCopyTimeout)
 				if err := dst.SetWriteDeadline(writeDeadline); err != nil {
 					if !isConnectionClosedErr(err) {
-						slog.Warn("Failed to set write deadline for relay", "tag", tag, "error", err)
+						logCtx.Warn("Failed to set write deadline for relay", "error", err)
 						errChan <- fmt.Errorf("%s set write deadline failed: %w", tag, err)
 					} else {
-						errChan <- io.EOF
+						errChan <- io.EOF // Report EOF if closed while setting deadline
 					}
 					return
 				}
 
 				nw, writeErr := dst.Write(buf[0:nr])
-
-				// Clear write deadline
-				dst.SetWriteDeadline(time.Time{})
+				_ = dst.SetWriteDeadline(time.Time{}) // Clear write deadline
 
 				if writeErr != nil {
-					// Report write error
-					errChan <- fmt.Errorf("%s write failed: %w", tag, writeErr)
-					// Attempt to close the write side of source to signal peer
+					// Check context cancellation during write
+					if errors.Is(writeErr, context.Canceled) || errors.Is(writeErr, context.DeadlineExceeded) {
+						logCtx.Debug("Relay cancelled by context during write")
+						errChan <- writeErr // Report context error
+					} else {
+						errChan <- fmt.Errorf("%s write failed: %w", tag, writeErr)
+					}
+					// Close read side of source to potentially signal peer
 					if tcpSrc, ok := src.(*net.TCPConn); ok {
-						tcpSrc.CloseRead() // We can't write anymore, stop reading too?
+						tcpSrc.CloseRead()
 					}
 					return
 				}
 				if nr != nw {
-					// Report short write error
 					errChan <- fmt.Errorf("%s short write: %d != %d", tag, nw, nr)
 					if tcpSrc, ok := src.(*net.TCPConn); ok {
 						tcpSrc.CloseRead()
@@ -1022,33 +1078,29 @@ func relayDataBidirectionally(ctx context.Context, conn1, conn2 net.Conn) error 
 				}
 			}
 
-			// Handle read errors
+			// --- Handle Read Errors ---
 			if readErr != nil {
-				// If EOF, it's a clean closure by the source.
-				if readErr == io.EOF {
-					slog.Debug("Relay source closed (EOF)", "tag", tag)
-					// Signal EOF to the destination by closing the write half.
+				if errors.Is(readErr, io.EOF) {
+					logCtx.Debug("Relay source closed (EOF)")
 					if tcpDst, ok := dst.(*net.TCPConn); ok {
-						tcpDst.CloseWrite() // Best effort
+						tcpDst.CloseWrite() // Signal EOF to destination
 					}
 					errChan <- nil // Report success (EOF is not an application error)
 				} else if isTimeoutError(readErr) {
-					// Inactivity timeout occurred
-					slog.Warn("Relay inactivity timeout", "tag", tag, "timeout", relayCopyTimeout)
-					errChan <- fmt.Errorf("%s inactivity timeout after %s", tag, relayCopyTimeout)
-					// Close both sides on timeout? Or just report error? Report error.
-					if tcpDst, ok := dst.(*net.TCPConn); ok {
-						tcpDst.Close() // Close the whole connection on timeout
-					}
-					if tcpSrc, ok := src.(*net.TCPConn); ok {
-						tcpSrc.Close()
-					}
-				} else if isConnectionClosedErr(readErr) || errors.Is(readErr, context.Canceled) {
-					// Connection closed or context cancelled during read
-					slog.Debug("Relay source closed or cancelled during read", "tag", tag, "error", readErr)
-					errChan <- nil // Not an application error
+					logCtx.Warn("Relay inactivity timeout", "timeout", relayCopyTimeout)
+					errChan <- fmt.Errorf("%s inactivity timeout after %s: %w", tag, relayCopyTimeout, readErr)
+					// Close both connections on timeout? Or just report error? Report timeout error.
+					// Closing aggressively might hide other issues. Let caller handle timeout error.
+					// dst.Close() // Force close destination
+					// src.Close() // Force close source
+				} else if isConnectionClosedErr(readErr) {
+					logCtx.Debug("Relay source connection closed during read", "error", readErr)
+					errChan <- nil // Report success (closed is not an application error)
+				} else if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
+					logCtx.Debug("Relay cancelled by context during read")
+					errChan <- readErr // Report context error
 				} else {
-					// Report other read errors
+					// Report other unexpected read errors
 					errChan <- fmt.Errorf("%s read failed: %w", tag, readErr)
 				}
 				return // Exit goroutine on any read error (including EOF and timeout)
@@ -1065,16 +1117,91 @@ func relayDataBidirectionally(ctx context.Context, conn1, conn2 net.Conn) error 
 	close(errChan) // Close the channel signals that all errors (or nil) have been sent
 
 	// Check for the first error reported
+	var firstError error
 	for err := range errChan {
-		if err != nil {
-			// Log the first error encountered
-			slog.Debug("Relay finished with error", "error", err)
-			return err // Return the first error
+		if err != nil && firstError == nil { // Capture the first non-nil error
+			firstError = err
 		}
+	}
+
+	if firstError != nil {
+		// Log the first *significant* error encountered (ignore EOF/context cancellation here for logging)
+		if !errors.Is(firstError, io.EOF) && !errors.Is(firstError, context.Canceled) && !isConnectionClosedErr(firstError) {
+			slog.Warn("Relay finished with error", "error", firstError)
+		} else {
+			slog.Debug("Relay finished", "reason", firstError) // Log EOF/cancelled at debug level
+		}
+		return firstError // Return the first error encountered
 	}
 
 	slog.Debug("Relay finished successfully.")
 	return nil // No errors reported
+}
+
+// refreshConfiguration triggers a configuration refresh from the service.
+func refreshConfiguration() {
+	slog.Info("Attempting configuration refresh...")
+	if !isIPCConnected() {
+		slog.Warn("Cannot refresh config, IPC disconnected.")
+		return
+	}
+	// Fetch new config from service
+	newCfg, err := getConfigFromService()
+	if err != nil {
+		slog.Error("Failed to refresh configuration from service", "error", err)
+		// Check if error indicates disconnect, connection manager will handle it
+		if isConnectionClosedErr(err) || errors.Is(err, net.ErrClosed) {
+			ipcSetConnectionState(false) // Ensure state reflects disconnect
+		}
+		return
+	}
+
+	// Compare and apply if changed
+	currentCfg := getConfig() // Get thread-safe copy
+	// Compare relevant sections (Proxy, Kerberos)
+	configChanged := !reflect.DeepEqual(currentCfg.Proxy, newCfg.Proxy) ||
+		!reflect.DeepEqual(currentCfg.Kerberos, newCfg.Kerberos) // Add other sections if they become dynamic
+
+	if configChanged {
+		slog.Info("Configuration change detected, applying...")
+		setConfig(newCfg) // Update global config
+
+		// Re-initialize Proxy Manager if proxy config changed
+		if !reflect.DeepEqual(currentCfg.Proxy, newCfg.Proxy) {
+			slog.Info("Proxy configuration changed, re-initializing proxy manager.")
+			if globalProxyMgr != nil {
+				globalProxyMgr.Close() // Close old manager
+			}
+			newProxyMgr, proxyErr := proxy.NewProxyManager(&newCfg.Proxy)
+			if proxyErr != nil {
+				slog.Error("Failed to re-initialize proxy manager after config refresh", "error", proxyErr)
+				// If re-init fails, maybe revert config? Or just log? Log error.
+				// We might be left without a proxy manager now.
+				globalProxyMgr = nil // Ensure old one isn't used
+			} else {
+				globalProxyMgr = newProxyMgr // Assign new manager
+				slog.Info("Proxy manager re-initialized.")
+			}
+		}
+
+		// Re-initialize Kerberos if config changed
+		if !reflect.DeepEqual(currentCfg.Kerberos, newCfg.Kerberos) {
+			slog.Info("Kerberos configuration changed, re-initializing Kerberos client.")
+			if globalKerbClient != nil {
+				globalKerbClient.Close()
+			}
+			newKerbClient, krbErr := kerb.NewKerberosClient(&newCfg.Kerberos)
+			if krbErr != nil {
+				slog.Error("Failed to re-initialize Kerberos client after config refresh", "error", krbErr)
+				globalKerbClient = nil // Ensure old one isn't used
+			} else {
+				globalKerbClient = newKerbClient
+				slog.Info("Kerberos client re-initialized.")
+			}
+		}
+	} else {
+		slog.Info("Configuration unchanged after refresh check.")
+	}
 }
 
 // runBackgroundTasks manages periodic tasks like config refresh, Kerberos check, and status pings.
@@ -1090,92 +1217,36 @@ func runBackgroundTasks(ctx context.Context) {
 	statusPingTicker := time.NewTicker(statusPingInterval)
 	defer statusPingTicker.Stop()
 
+	// Run initial checks immediately
+	refreshConfiguration()
+	checkKerberosTicket()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return // Exit if main context is cancelled
 
 		case <-configRefreshTicker.C:
-			slog.Debug("Attempting periodic configuration refresh...")
-			if !isIPCConnected() {
-				slog.Warn("Cannot refresh config, IPC disconnected.")
-				continue
-			}
-			// Fetch new config from service
-			newCfg, err := getConfigFromService()
-			if err != nil {
-				slog.Error("Failed to refresh configuration from service", "error", err)
-				// Check if error indicates disconnect, connection manager will handle it
-				if isConnectionClosedErr(err) || errors.Is(err, net.ErrClosed) {
-					ipcSetConnectionState(false) // Ensure state reflects disconnect
-				}
-				continue
-			}
-
-			// Compare and apply if changed
-			currentCfg := getConfig() // Get thread-safe copy
-			// Compare relevant sections (Proxy, Kerberos)
-			// Note: DeepEqual might be too strict if unexported fields change internally.
-			// Compare relevant fields directly if necessary.
-			configChanged := !reflect.DeepEqual(currentCfg.Proxy, newCfg.Proxy) ||
-				!reflect.DeepEqual(currentCfg.Kerberos, newCfg.Kerberos) // Add other sections if they become dynamic
-
-			if configChanged {
-				slog.Info("Configuration change detected, applying...")
-				setConfig(newCfg) // Update global config
-
-				// Re-initialize Proxy Manager if proxy config changed
-				if !reflect.DeepEqual(currentCfg.Proxy, newCfg.Proxy) {
-					slog.Info("Proxy configuration changed, re-initializing proxy manager.")
-					if globalProxyMgr != nil {
-						globalProxyMgr.Close() // Close old manager
-					}
-					newProxyMgr, proxyErr := proxy.NewProxyManager(&newCfg.Proxy)
-					if proxyErr != nil {
-						slog.Error("Failed to re-initialize proxy manager after config refresh", "error", proxyErr)
-						// What state are we in now? Maybe revert config? For now, log error.
-					} else {
-						globalProxyMgr = newProxyMgr // Assign new manager
-						slog.Info("Proxy manager re-initialized.")
-					}
-				}
-
-				// Re-initialize Kerberos if config changed (though less likely to change dynamically)
-				if !reflect.DeepEqual(currentCfg.Kerberos, newCfg.Kerberos) {
-					slog.Info("Kerberos configuration changed, re-initializing Kerberos client.")
-					if globalKerbClient != nil {
-						globalKerbClient.Close()
-					}
-					newKerbClient, krbErr := kerb.NewKerberosClient(&newCfg.Kerberos)
-					if krbErr != nil {
-						slog.Error("Failed to re-initialize Kerberos client after config refresh", "error", krbErr)
-					} else {
-						globalKerbClient = newKerbClient
-						slog.Info("Kerberos client re-initialized.")
-					}
-				}
-			} else {
-				slog.Debug("Configuration unchanged.")
-			}
+			refreshConfiguration()
 
 		case <-kerbCheckTicker.C:
-			if globalKerbClient != nil {
-				slog.Debug("Performing periodic Kerberos ticket check/refresh...")
-				if err := globalKerbClient.CheckAndRefreshClient(); err != nil {
-					// This is expected if the user ticket expired and kinit wasn't run
-					slog.Warn("Periodic Kerberos check/refresh failed", "error", err)
-				} else {
-					slog.Debug("Kerberos ticket check/refresh successful.")
-				}
-			}
+			checkKerberosTicket()
 
 		case <-statusPingTicker.C:
-			slog.Debug("Sending status ping to service...")
-			if !isIPCConnected() {
-				slog.Warn("Cannot send status ping, IPC disconnected.")
-				continue
-			}
 			sendClientStatusPing()
+		}
+	}
+}
+
+// checkKerberosTicket performs the periodic Kerberos check/refresh.
+func checkKerberosTicket() {
+	if globalKerbClient != nil {
+		slog.Debug("Performing periodic Kerberos ticket check/refresh...")
+		if err := globalKerbClient.CheckAndRefreshClient(); err != nil {
+			// This is expected if the user ticket expired and kinit wasn't run
+			slog.Warn("Periodic Kerberos check/refresh failed", "error", err)
+		} else {
+			slog.Debug("Kerberos ticket check/refresh successful.")
 		}
 	}
 }
@@ -1184,9 +1255,10 @@ func runBackgroundTasks(ctx context.Context) {
 func sendClientStatusPing() {
 	conn := getIPCConnection()
 	if conn == nil {
-		slog.Warn("Cannot send status ping, IPC connection is nil.")
+		slog.Warn("Cannot send status ping, IPC disconnected.")
 		return
 	}
+	slog.Debug("Sending status ping to service...")
 
 	// Gather status data
 	var kStatus ipc.ClientKerberosStatus
@@ -1240,14 +1312,12 @@ func getConfig() config.Config {
 	defer globalConfigMu.RUnlock()
 	if globalConfig == nil {
 		// Return an empty config if called before initialization
-		// This should ideally not happen after initial setup succeeds.
 		slog.Error("Attempted to get config before initialization or after setup failure!")
 		return config.Config{} // Return zero value config
 	}
-	// Return a shallow copy for safety
+	// Return a shallow copy
 	cfgCopy := *globalConfig
-	// Make deep copies of slices/maps if they are modified elsewhere, e.g., proxy list
-	// cfgCopy.Proxy.SomeSlice = append([]SomeType{}, globalConfig.Proxy.SomeSlice...)
+	// No deep copies needed currently as contained structs are simple or handled elsewhere
 	return cfgCopy
 }
 
@@ -1272,8 +1342,11 @@ func isConnectionClosedErr(err error) bool {
 		return true
 	}
 	// Unwrap net.OpError
-	if opErr, ok := err.(*net.OpError); ok {
-		if sysErr, ok := opErr.Err.(*os.SyscallError); ok {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		// Check specific syscall errors wrapped by OpError
+		var sysErr *os.SyscallError
+		if errors.As(opErr.Err, &sysErr) {
 			if errors.Is(sysErr.Err, syscall.EPIPE) || errors.Is(sysErr.Err, syscall.ECONNRESET) || errors.Is(sysErr.Err, syscall.ENOTCONN) {
 				return true
 			}
@@ -1297,6 +1370,10 @@ func isTimeoutError(err error) bool {
 	}
 	// Check for context deadline exceeded wrapped in other errors
 	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// Check specific string for net.Dial timeout error on unix sockets (less reliable)
+	if strings.Contains(err.Error(), "context deadline exceeded") && strings.Contains(err.Error(), "dial unix") {
 		return true
 	}
 	return false
