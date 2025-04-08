@@ -340,7 +340,7 @@ func (e *Engine) FindProxyForURL(ctx context.Context, script, targetURL, targetH
 			if errors.Is(errReason, context.DeadlineExceeded) && hasParentDeadline && parentDeadline.Sub(time.Now()) <= 0 {
 				execErr = fmt.Errorf("pac execution cancelled by parent context: %w", ctx.Err())
 			} else if errors.Is(errReason, context.DeadlineExceeded) {
-				execErr = fmt.Sprintf("pac script execution timed out after %s (context signal)", pacExecTimeout)
+				execErr = fmt.Errorf("pac script execution timed out after %s (context signal)", pacExecTimeout)
 			} else { // cancelled by parent context explicitly
 				execErr = fmt.Errorf("pac execution cancelled by parent context: %w", errReason)
 			}

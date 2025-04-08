@@ -503,11 +503,11 @@ func (pm *ProxyManager) fetchPACScript(location string) (string, error) {
 
 	if specifiedCharset != "" && specifiedCharset != "utf-8" && specifiedCharset != "utf8" {
 		// Use charset.Lookup from x/net/html which uses ianaindex internally
-		encoding, err := charset.Lookup(specifiedCharset)
-		if err != nil {
-			slog.Warn("Unsupported PAC charset specified or detected, falling back to UTF-8", "charset", specifiedCharset, "error", err)
+		encoding, _ := charset.Lookup(specifiedCharset)
+		if encoding == nil {
+			slog.Warn("Unsupported PAC charset specified or detected, falling back to UTF-8", "charset", specifiedCharset)
 			// Use original reader (assuming UTF-8 or binary)
-		} else if encoding != nil {
+		} else {
 			slog.Debug("Decoding PAC script content", "charset", specifiedCharset)
 			finalReader = transform.NewReader(reader, encoding.NewDecoder())
 		}

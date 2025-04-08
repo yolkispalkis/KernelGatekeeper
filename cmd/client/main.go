@@ -755,7 +755,7 @@ func handleAcceptedConnection(ctx context.Context, acceptedConn net.Conn, origin
 			logCtx.Error("Proxy result indicates PROXY but list is empty. Closing connection.")
 			return
 		}
-		logCtx.Info("Proxy determined for target", "proxies", proxy.UrlsToStrings(proxy.UrlsFromPacResult(proxyResult))) // Log parsed URLs
+		logCtx.Info("Proxy determined for target", "proxies", proxy.UrlsToStrings(pac.UrlsFromPacResult(proxyResult))) // Log parsed URLs
 
 		var proxyConn net.Conn
 		var selectedProxyURL *url.URL

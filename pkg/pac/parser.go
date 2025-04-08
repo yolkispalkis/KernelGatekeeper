@@ -520,13 +520,13 @@ func (pm *ProxyManager) fetchPACScript(location string) (string, error) {
 
 	// If the final charset (from config or detection) is not UTF-8, try decoding
 	if finalCharset != "utf-8" && finalCharset != "utf8" {
-		encoding, err := charset.Lookup(finalCharset) // Use charset.Lookup from x/net/html
-		if err != nil {
-			slog.Warn("Unsupported PAC charset specified or detected, falling back to UTF-8", "charset", finalCharset, "error", err)
+		enc, _ := charset.Lookup(finalCharset) // Use charset.Lookup from x/net/html
+		if enc == nil {
+			slog.Warn("Unsupported PAC charset specified or detected, falling back to UTF-8", "charset", finalCharset)
 			// Use original reader (assuming UTF-8 or binary)
-		} else if encoding != nil {
+		} else {
 			slog.Info("Decoding PAC script content", "charset", finalCharset)
-			reader = transform.NewReader(reader, encoding.NewDecoder())
+			reader = transform.NewReader(reader, enc.NewDecoder())
 		}
 	}
 
