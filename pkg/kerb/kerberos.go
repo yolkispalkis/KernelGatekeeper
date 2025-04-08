@@ -17,7 +17,9 @@ import (
 	krb5config "github.com/jcmturner/gokrb5/v8/config"
 	"github.com/jcmturner/gokrb5/v8/credentials"
 	"github.com/jcmturner/gokrb5/v8/spnego"
-	"github.com/jcmturner/gokrb5/v8/types" // Import types for Ticket
+
+	// NOTE: No longer need types.Ticket directly here
+	// "github.com/jcmturner/gokrb5/v8/types"
 
 	appconfig "github.com/yolki/kernelgatekeeper/pkg/config"
 )
@@ -27,7 +29,7 @@ type KerberosClient struct {
 	krb5Config    *krb5config.Config
 	client        *gokrb5client.Client // Use the aliased type here
 	mu            sync.Mutex
-	ticketExpiry  time.Time
+	ticketExpiry  time.Time // Stores an estimated expiry time
 	stopCh        chan struct{}
 	isInitialized bool
 }
@@ -207,30 +209,13 @@ func (k *KerberosClient) initializeFromCCache(effectiveCacheName string) error {
 	k.client = cl
 	k.isInitialized = true
 
-	// Attempt to get the expiry time from the TGT
-	// Construct the TGT SPN
-	tgtSPN := fmt.Sprintf("krbtgt/%s@%s", cl.Credentials.Domain(), cl.Credentials.Domain())
-	// Call GetCachedTicket with the SPN string
-	var tgt types.Ticket
-	var ok bool
-	tgt, ok, err = k.client.GetCachedTicket(tgtSPN) // Corrected call
-
-	if err == nil && ok && tgt.EndTime.After(time.Now()) {
-		k.ticketExpiry = tgt.EndTime
-		slog.Info("Kerberos context initialized from ccache", "principal", strings.Join(k.client.Credentials.CName().NameString, "/"), "realm", k.client.Credentials.Realm(), "tgt_expiry", k.ticketExpiry.Format(time.RFC3339))
-	} else {
-		// If unable to get TGT expiry, set a reasonable default (e.g., 8 hours from now) - actual refresh will happen by external tools
-		k.ticketExpiry = time.Now().Add(8 * time.Hour)
-		logReason := ""
-		if err != nil {
-			logReason = fmt.Sprintf("error: %v", err)
-		} else if !ok {
-			logReason = "ticket not found in cache"
-		} else if !tgt.EndTime.After(time.Now()) {
-			logReason = "cached ticket already expired"
-		}
-		slog.Warn("Could not determine exact TGT expiry from ccache, using default duration", "principal", strings.Join(k.client.Credentials.CName().NameString, "/"), "realm", k.client.Credentials.Realm(), "assumed_expiry", k.ticketExpiry.Format(time.RFC3339), "reason", logReason)
-	}
+	// Estimate expiry time. Cannot reliably get actual TGT expiry from client object.
+	// Using a default of 8 hours. CheckAndRefreshClient relies on reloading the ccache.
+	k.ticketExpiry = time.Now().Add(8 * time.Hour)
+	slog.Info("Kerberos context initialized from ccache",
+		"principal", strings.Join(k.client.Credentials.CName().NameString, "/"),
+		"realm", k.client.Credentials.Realm(),
+		"estimated_expiry", k.ticketExpiry.Format(time.RFC3339))
 
 	return nil
 }
@@ -302,7 +287,7 @@ func (s *spnegoRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	return resp, nil
 }
 
-// CheckAndRefreshClient checks if the Kerberos TGT is valid and close to expiry.
+// CheckAndRefreshClient checks if the Kerberos TGT is valid based on estimated expiry.
 // If needed, it attempts to re-initialize the client by reloading the credential cache.
 func (k *KerberosClient) CheckAndRefreshClient() error {
 	k.mu.Lock()
@@ -311,11 +296,11 @@ func (k *KerberosClient) CheckAndRefreshClient() error {
 	ccName := determineEffectiveCacheName(k.config.CachePath) // Get current effective ccache path
 	k.mu.Unlock()
 
-	// Determine if a refresh is needed: not initialized, expired, or expiring within 5 minutes
+	// Determine if a refresh attempt is needed: not initialized, or estimated expiry is near.
 	needsRefresh := !isInit || expiry.IsZero() || time.Now().Add(5*time.Minute).After(expiry)
 
 	if needsRefresh {
-		slog.Info("Kerberos ticket invalid or expiring soon, attempting refresh by reloading ccache...", "ccache", ccName)
+		slog.Info("Kerberos ticket check: attempting refresh by reloading ccache...", "ccache", ccName, "reason_needs_init", !isInit, "reason_expiry_near", !expiry.IsZero() && time.Now().Add(5*time.Minute).After(expiry))
 
 		// Attempt to reload the ccache and re-initialize the client
 		err := k.initializeFromCCache(ccName)
@@ -328,8 +313,8 @@ func (k *KerberosClient) CheckAndRefreshClient() error {
 		return nil // Refresh successful
 	}
 
-	slog.Debug("Kerberos ticket check: OK (valid and not expiring soon)")
-	return nil // Ticket is okay
+	slog.Debug("Kerberos ticket check: OK (based on estimated expiry)")
+	return nil // Ticket is assumed okay based on estimate
 }
 
 // GetStatus returns the current status of the Kerberos client.
@@ -343,8 +328,8 @@ func (k *KerberosClient) GetStatus() map[string]interface{} {
 		"initialized":           k.isInitialized,
 		"principal":             "N/A",
 		"realm":                 "N/A",
-		"tgt_expiry":            "N/A",
-		"tgt_time_left":         "N/A",
+		"tgt_expiry":            "N/A (estimated)", // Indicate expiry is estimated
+		"tgt_time_left":         "N/A (estimated)",
 		"source":                "ccache", // This client always uses ccache
 		"effective_ccache_path": ccName,
 	}
@@ -354,12 +339,12 @@ func (k *KerberosClient) GetStatus() map[string]interface{} {
 		status["principal"] = strings.Join(k.client.Credentials.CName().NameString, "/")
 		status["realm"] = k.client.Credentials.Realm()
 		if !k.ticketExpiry.IsZero() {
-			status["tgt_expiry"] = k.ticketExpiry.Format(time.RFC3339)
+			status["tgt_expiry"] = k.ticketExpiry.Format(time.RFC3339) + " (estimated)"
 			timeLeft := time.Until(k.ticketExpiry)
 			if timeLeft > 0 {
-				status["tgt_time_left"] = timeLeft.Round(time.Second).String()
+				status["tgt_time_left"] = timeLeft.Round(time.Second).String() + " (estimated)"
 			} else {
-				status["tgt_time_left"] = "Expired"
+				status["tgt_time_left"] = "Expired (estimated)"
 			}
 		}
 	}
