@@ -73,7 +73,7 @@ func (m *IPCManager) Stop() {
 	m.cancel()
 	m.wg.Wait()
 	conn := m.conn.Load()
-	if conn != nil {
+	if conn != nil && *conn != nil {
 		(*conn).Close()
 	}
 }
@@ -367,8 +367,6 @@ func (m *IPCManager) listenIPCNotifications(conn net.Conn) {
 			}
 			slog.Warn(logMsg, "error", err)
 			// Let manageConnection handle reconnect logic. Stop this listener.
-			// Close the potentially bad connection from this side too? Risky.
-			// conn.Close()
 			return // Exit this listener goroutine
 		}
 
@@ -389,17 +387,14 @@ func (m *IPCManager) listenIPCNotifications(conn net.Conn) {
 			}
 			slog.Info("Received 'notify_accept' from service", "src", data.SrcIP, "dport", data.DstPort, "orig_dst", data.DstIP)
 
-			// Call the registered callback with the notification data
+			// Spawn a goroutine to handle the accept and callback
 			go func(d ipc.NotifyAcceptData) {
-				// Accept the connection passed via sockmap
-				// Need access to local listener - use callback
 				listener := m.listenerCallback()
 				if listener == nil {
 					slog.Error("Cannot handle notify_accept: listener not available")
 					return
 				}
 
-				// Set accept deadline
 				if tcpListener, ok := listener.(*net.TCPListener); ok {
 					acceptDeadline := time.Now().Add(5 * time.Second)
 					if err := tcpListener.SetDeadline(acceptDeadline); err != nil {
@@ -428,28 +423,20 @@ func (m *IPCManager) listenIPCNotifications(conn net.Conn) {
 
 		case "config_updated":
 			slog.Info("Received 'config_updated' notification from service. Triggering refresh.")
-			m.stateManager.AddWaitGroup(1)
-			go func() {
-				defer m.stateManager.WaitGroupDone()
-				if bgTasks := m.stateManager.backgroundTasks; bgTasks != nil { // Need access to BackgroundTasks instance
+			// Use the StateManager to access the BackgroundTasks interface
+			bgTasks := m.stateManager.GetBackgroundTasks()
+			if bgTasks != nil {
+				// Run refresh in a goroutine to avoid blocking the IPC listener
+				m.stateManager.AddWaitGroup(1) // Add to waitgroup for graceful shutdown
+				go func() {
+					defer m.stateManager.WaitGroupDone()
 					bgTasks.RefreshConfiguration()
-				} else {
-					slog.Error("Cannot refresh configuration: background task runner not available")
-				}
-			}()
+				}()
+			} else {
+				slog.Error("Cannot refresh configuration: background task runner not available via StateManager")
+			}
 		default:
 			slog.Warn("Received unknown command from service via IPC", "command", cmd.Command)
 		}
 	}
 }
-
-// Placeholder for background tasks dependency, needs proper injection later
-type BackgroundTasks interface {
-	RefreshConfiguration()
-}
-
-func (sm *StateManager) SetBackgroundTasks(bg BackgroundTasks) {
-	sm.backgroundTasks = bg
-}
-
-var backgroundTasks BackgroundTasks // Add this field to StateManager struct

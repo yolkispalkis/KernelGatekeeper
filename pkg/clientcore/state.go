@@ -11,6 +11,12 @@ import (
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/proxy"
 )
 
+// BackgroundTasksRefresher defines the interface needed by StateManager/IPCManager
+// to trigger configuration refreshes.
+type BackgroundTasksRefresher interface {
+	RefreshConfiguration()
+}
+
 type StateManager struct {
 	configPtr        atomic.Pointer[config.Config]
 	kerberosClient   atomic.Pointer[kerb.KerberosClient]
@@ -18,7 +24,8 @@ type StateManager struct {
 	activeConns      atomic.Int64
 	wg               sync.WaitGroup
 	initialSetupDone chan struct{}
-	initialSetupErr  atomic.Pointer[error] // Store error during setup
+	initialSetupErr  atomic.Pointer[error]    // Store error during setup
+	backgroundTasks  BackgroundTasksRefresher // Dependency for config refresh
 }
 
 func NewStateManager(initialConfig *config.Config) *StateManager {
@@ -187,4 +194,14 @@ func (sm *StateManager) Reconfigure(newCfg *config.Config) {
 	// Update the config atomically
 	sm.SetConfig(newCfg)
 	slog.Info("Client configuration updated.")
+}
+
+// SetBackgroundTasks stores a reference to the background task runner.
+func (sm *StateManager) SetBackgroundTasks(bg BackgroundTasksRefresher) {
+	sm.backgroundTasks = bg
+}
+
+// GetBackgroundTasks returns the stored background task runner reference.
+func (sm *StateManager) GetBackgroundTasks() BackgroundTasksRefresher {
+	return sm.backgroundTasks
 }
