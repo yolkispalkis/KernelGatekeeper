@@ -24,11 +24,7 @@ const (
 	cacheCleanupInterval  = 15 * time.Minute
 )
 
-// dnsCacheEntry stores a resolved IP and its expiry time.
-type dnsCacheEntry struct {
-	ip     string // Store first resolved IP as string
-	expiry time.Time
-}
+// dnsCacheEntry is defined in types.go now
 
 // ipCacheEntry stores the determined IP address and its expiry.
 type ipCacheEntry struct {
@@ -344,7 +340,7 @@ func (e *Engine) FindProxyForURL(ctx context.Context, script, targetURL, targetH
 			if errors.Is(errReason, context.DeadlineExceeded) && hasParentDeadline && parentDeadline.Sub(time.Now()) <= 0 {
 				execErr = fmt.Errorf("pac execution cancelled by parent context: %w", ctx.Err())
 			} else if errors.Is(errReason, context.DeadlineExceeded) {
-				execErr = fmt.Errorf("pac script execution timed out after %s (context signal)", pacExecTimeout)
+				execErr = fmt.Sprintf("pac script execution timed out after %s (context signal)", pacExecTimeout)
 			} else { // cancelled by parent context explicitly
 				execErr = fmt.Errorf("pac execution cancelled by parent context: %w", errReason)
 			}

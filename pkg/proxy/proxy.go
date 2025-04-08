@@ -13,12 +13,13 @@ import (
 	"net/url"
 	"os" // Needed for file reading
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
-	"golang.org/x/text/encoding/ianaindex"
+	"golang.org/x/net/html/charset" // Use this for Lookup
 	"golang.org/x/text/transform"
 
 	// "github.com/robertkrimen/otto" // No longer needed directly here
@@ -28,7 +29,10 @@ import (
 )
 
 // ProxyResultType and ProxyResult are moved to pkg/pac/types.go
-// Constants like wpadCacheDuration, pacMaxSizeBytes can remain or move to pac pkg
+const (
+	wpadCacheDuration = 1 * time.Hour // Example: Refresh hourly
+	pacMaxSizeBytes   = 1 * 1024 * 1024
+)
 
 // ProxyManager handles obtaining and managing proxy settings, including WPAD/PAC.
 type ProxyManager struct {
@@ -41,7 +45,8 @@ type ProxyManager struct {
 	wpadCacheExpiry  time.Time    // When the fetched wpadPacScript expires
 	stopChan         chan struct{}
 	stopOnce         sync.Once
-	retryConfig      retrySettings // Keep retry settings
+	wg               sync.WaitGroup // Added WaitGroup
+	retryConfig      retrySettings  // Keep retry settings
 }
 
 // retrySettings struct remains the same
@@ -111,6 +116,7 @@ func NewProxyManager(cfg *appconfig.ProxyConfig) (*ProxyManager, error) {
 
 	// Start WPAD refresher goroutine if type is wpad
 	if strings.ToLower(pm.config.Type) == "wpad" {
+		pm.wg.Add(1) // Add to waitgroup if refresher is started
 		go pm.wpadRefresher()
 	}
 
@@ -346,6 +352,8 @@ func (pm *ProxyManager) GetEffectiveProxyURL() *url.URL {
 
 // wpadRefresher remains largely the same, calls pm.updateProxySettings(false)
 func (pm *ProxyManager) wpadRefresher() {
+	defer pm.wg.Done() // Signal completion when exiting
+
 	// Calculate jittered interval (same logic as before)
 	baseInterval := wpadCacheDuration
 	minInterval := baseInterval - (5 * time.Minute)
@@ -426,6 +434,19 @@ func (pm *ProxyManager) fetchPACScript(location string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("failed to read PAC content from %s: %w", location, err)
 		}
+		// Check size limit wasn't hit (by checking if limitedReader still has data)
+		// This is slightly more complex than just checking length after ReadAll
+		// _, errPeek := limitedReader.(*io.LimitedReader).R.(io.ByteReader).ReadByte()
+		// if errPeek != io.EOF {
+		// 	return "", fmt.Errorf("PAC script %s exceeds maximum size limit (%d bytes)", location, pacMaxSizeBytes)
+		// }
+		if int64(len(contentBytes)) >= pacMaxSizeBytes { // Simplified check after ReadAll
+			_, errPeek := resp.Body.Read(make([]byte, 1)) // Try reading one more byte from original body
+			if errPeek != io.EOF {
+				return "", fmt.Errorf("PAC script %s exceeds maximum size limit (%d bytes)", location, pacMaxSizeBytes)
+			}
+		}
+
 		slog.Debug("Fetched PAC script via HTTP(S)", "url", location, "size", len(contentBytes))
 
 	} else {
@@ -439,6 +460,7 @@ func (pm *ProxyManager) fetchPACScript(location string) (string, error) {
 				filePath = filepath.FromSlash(filePath)      // Convert slashes
 			}
 		}
+		filePath = filepath.Clean(filePath) // Clean path
 
 		// Check if file exists and limit reading size
 		fileInfo, statErr := os.Stat(filePath)
@@ -480,7 +502,8 @@ func (pm *ProxyManager) fetchPACScript(location string) (string, error) {
 	specifiedCharset = strings.ToLower(strings.TrimSpace(specifiedCharset))
 
 	if specifiedCharset != "" && specifiedCharset != "utf-8" && specifiedCharset != "utf8" {
-		encoding, err := ianaindex.IANA.Encoding(specifiedCharset)
+		// Use charset.Lookup from x/net/html which uses ianaindex internally
+		encoding, err := charset.Lookup(specifiedCharset)
 		if err != nil {
 			slog.Warn("Unsupported PAC charset specified or detected, falling back to UTF-8", "charset", specifiedCharset, "error", err)
 			// Use original reader (assuming UTF-8 or binary)
@@ -533,6 +556,8 @@ func (pm *ProxyManager) Close() error {
 				transport.CloseIdleConnections()
 			}
 		}
+		// Wait for goroutines managed by ProxyManager (only wpadRefresher currently)
+		pm.wg.Wait()
 	})
 	slog.Info("Proxy Manager closed.")
 	return nil
@@ -560,14 +585,10 @@ func reflectDeepEqualPacResult(a, b pac.PacResult) bool {
 	if a.Type != b.Type {
 		return false
 	}
-	if len(a.Proxies) != len(b.Proxies) {
+	// Use reflect.DeepEqual for comparing the slices of ProxyInfo structs
+	// This handles potential differences in slice capacity vs. length correctly.
+	if !reflect.DeepEqual(a.Proxies, b.Proxies) {
 		return false
-	}
-	// Compare proxies by Scheme and Host string representation
-	for i := range a.Proxies {
-		if a.Proxies[i].Scheme != b.Proxies[i].Scheme || a.Proxies[i].Host != b.Proxies[i].Host {
-			return false
-		}
 	}
 	return true
 }

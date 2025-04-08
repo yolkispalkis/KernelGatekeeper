@@ -35,5 +35,7 @@ type dnsCacheEntry struct {
 // Helper to convert internal ProxyInfo to net/url.URL (best effort)
 func (p ProxyInfo) URL() (*url.URL, error) {
 	// Ensure host contains port. If not, assign default? For now, assume valid.
-	return url.Parse(p.Scheme + "://" + p.Host)
+	// Construct the full URL string before parsing
+	urlString := p.Scheme + "://" + p.Host
+	return url.Parse(urlString)
 }

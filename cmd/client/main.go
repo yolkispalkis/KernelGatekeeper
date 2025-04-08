@@ -32,6 +32,7 @@ import (
 	"github.com/yolki/kernelgatekeeper/pkg/config"
 	"github.com/yolki/kernelgatekeeper/pkg/ipc"
 	"github.com/yolki/kernelgatekeeper/pkg/kerb"
+	"github.com/yolki/kernelgatekeeper/pkg/pac" // Import the PAC package
 	"github.com/yolki/kernelgatekeeper/pkg/proxy"
 	"golang.org/x/sync/semaphore"
 )
@@ -741,20 +742,20 @@ func handleAcceptedConnection(ctx context.Context, acceptedConn net.Conn, origin
 	}
 
 	switch proxyResult.Type {
-	case proxy.ResultDirect:
+	case pac.ResultDirect:
 		logCtx.Error("PAC script returned DIRECT, but KernelGatekeeper (sockops) cannot bypass proxy once connection is intercepted. Closing connection.", "pac_result", "DIRECT")
 		return // Close the accepted connection
 
-	case proxy.ResultUnknown: // Treat Unknown/Error from PAC the same
+	case pac.ResultUnknown: // Treat Unknown/Error from PAC the same
 		logCtx.Error("Error determining proxy from PAC or configuration. Closing connection.", "pac_result", "UNKNOWN/ERROR")
 		return // Close the accepted connection
 
-	case proxy.ResultProxy:
+	case pac.ResultProxy:
 		if len(proxyResult.Proxies) == 0 {
 			logCtx.Error("Proxy result indicates PROXY but list is empty. Closing connection.")
 			return
 		}
-		logCtx.Info("Proxy determined for target", "proxies", proxy.UrlsToStrings(pac.UrlsFromPacResult(proxyResult))) // Log parsed URLs
+		logCtx.Info("Proxy determined for target", "proxies", proxy.UrlsToStrings(proxy.UrlsFromPacResult(proxyResult))) // Log parsed URLs
 
 		var proxyConn net.Conn
 		var selectedProxyURL *url.URL
