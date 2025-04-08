@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yolki/kernelgatekeeper/pkg/config"
-	"github.com/yolki/kernelgatekeeper/pkg/logging"
-	"github.com/yolki/kernelgatekeeper/pkg/servicecore"
-	"github.com/yolki/kernelgatekeeper/pkg/signals"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/logging"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/servicecore"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/signals"
 )
 
 var (
