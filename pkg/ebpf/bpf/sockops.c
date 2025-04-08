@@ -139,7 +139,7 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
     bpf_printk("SOCKOPS: Socket cookie %u added to proxy_sock_map (ACTIVE_ESTABLISHED_CB)\n", sock_cookie);
     // --- END MODIFICATION ---
 
-    struct connection_tuple_t *event_data = bpf_ringbuf_reserve(¬ification_ringbuf, sizeof(struct connection_tuple_t), 0);
+    struct connection_tuple_t *event_data = bpf_ringbuf_reserve(&notification_ringbuf, sizeof(struct connection_tuple_t), 0);
     if (!event_data) {
         // --- MODIFIED: Updated log message ---
         bpf_printk("SOCKOPS_ERR: Failed to reserve ringbuf space (ACTIVE_ESTABLISHED_CB)\n");
