@@ -34,6 +34,8 @@ import (
 const (
 	GlobalStatsMatchedIndex uint32 = 1
 	DefaultCgroupPath              = "/sys/fs/cgroup"
+	// Define a local constant for log size if the library one causes issues
+	verifierLogSize = 2 * 1024 * 1024 // 2 MiB
 )
 
 // GlobalStats definition remains the same
@@ -90,31 +92,28 @@ type bpfObjects struct {
 	GlobalStats              *ebpf.Map     `ebpf:"global_stats"`
 }
 
-// Close implementation remains the same
+// Close implementation
 func (o *bpfObjects) Close() error {
 	// Combine closers from all embedded objects
 	closers := []io.Closer{
 		&o.bpf_connect4Objects,
 		&o.bpf_sockopsObjects,
 		&o.bpf_skmsgObjects,
-		// Add individual programs/maps if they weren't part of the embedded structs
-		// (though they usually are)
 	}
 	var errs []error
 	for _, closer := range closers {
-		// Check if closer is nil before closing, LoadAndAssign might not populate all
 		if closer == nil {
 			continue
 		}
-		// Check if it's already closed? Some libraries might return os.ErrClosed.
-		// The generated Close() functions usually handle this internally.
-		if c, ok := closer.(interface{ IsClosed() bool }); ok && c.IsClosed() {
-			continue
-		}
+		// Use type assertion to check if already closed, if the object supports it.
+		// Not all ebpf objects might implement this.
+		// if c, ok := closer.(interface{ IsClosed() bool }); ok && c.IsClosed() {
+		//  continue
+		// }
 
 		if err := closer.Close(); err != nil {
-			// Ignore error if it signifies already closed
-			if !errors.Is(err, os.ErrClosed) && !errors.Is(err, ebpf.ErrClosed) { // Added ebpf.ErrClosed
+			// Ignore error if it signifies already closed (os.ErrClosed is common)
+			if !errors.Is(err, os.ErrClosed) { // <<< REMOVED ebpf.ErrClosed check
 				errs = append(errs, err)
 			}
 		}
@@ -149,7 +148,7 @@ type BPFManager struct {
 	mu sync.Mutex
 }
 
-// NewBPFManager remains the same (assuming previous correct version)
+// NewBPFManager
 func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (*BPFManager, error) {
 	slog.Info("Initializing BPF Manager", "mode", "connect4/sockops/skmsg")
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -161,8 +160,8 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 	opts := &ebpf.CollectionOptions{
 		Maps: ebpf.MapOptions{},
 		Programs: ebpf.ProgramOptions{
-			LogLevel: ebpf.LogLevelInstruction,         // Or LogLevelBranch, LogLevelStats
-			LogSize:  ebpf.DefaultVerifierLogSize * 20, // Increased size
+			LogLevel: ebpf.LogLevelInstruction, // Or LogLevelBranch, LogLevelStats
+			LogSize:  verifierLogSize,          // <<< USE LOCAL CONSTANT or a literal value
 		},
 	}
 
@@ -264,6 +263,7 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 	return manager, nil
 }
 
+// --- Rest of the file (handleVerifierError, attachPrograms, Start, readNotifications, etc.) remains unchanged from the previous corrected version ---
 // handleVerifierError remains the same
 func handleVerifierError(objType string, err error) {
 	var verr *ebpf.VerifierError
@@ -502,8 +502,7 @@ func (m *BPFManager) updateAndLogStats() error {
 		"interval_sec", fmt.Sprintf("%.2f", duration),
 	)
 
-	// Update cache
-	// m.statsCache.matchedConns = matchedCurrent // This line is redundant as lastMatched is updated below
+	// Update cache - only need to update lastMatched now
 	m.statsCache.lastMatched = matchedCurrent
 	m.statsCache.lastStatsTime = now
 	return nil
@@ -757,7 +756,12 @@ func GetAvailableInterfaces() ([]string, error) {
 			continue
 		}
 		// Skip virtual interfaces (like veth, docker, bridge, etc.)
-		if strings.HasPrefix(i.Name, "veth") || strings.HasPrefix(i.Name, "docker") || strings.HasPrefix(i.Name, "br-") || strings.HasPrefix(i.Name, "lo") || strings.HasPrefix(i.Name, "virbr") || strings.HasPrefix(i.Name, "vnet") {
+		// Add more patterns if needed for your environment (e.g., flannel, calico, weave)
+		if strings.HasPrefix(i.Name, "veth") || strings.HasPrefix(i.Name, "docker") ||
+			strings.HasPrefix(i.Name, "br-") || strings.HasPrefix(i.Name, "lo") ||
+			strings.HasPrefix(i.Name, "virbr") || strings.HasPrefix(i.Name, "vnet") ||
+			strings.HasPrefix(i.Name, "cni") || strings.HasPrefix(i.Name, "flannel") ||
+			strings.HasPrefix(i.Name, "cali") || strings.HasPrefix(i.Name, "weave") {
 			continue
 		}
 		// Check if it has at least one usable IP address (optional, but good practice)
@@ -766,10 +770,30 @@ func GetAvailableInterfaces() ([]string, error) {
 			slog.Debug("Skipping interface with no addresses or error fetching them", "interface", i.Name, "error", err)
 			continue
 		}
+		// Check if any address is a valid global unicast IP (IPv4 or IPv6)
+		hasValidIP := false
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsInterfaceLocalMulticast() {
+				hasValidIP = true
+				break
+			}
+		}
+		if !hasValidIP {
+			slog.Debug("Skipping interface with no valid global IP address", "interface", i.Name)
+			continue
+		}
+
 		names = append(names, i.Name)
 	}
 	if len(names) == 0 {
-		slog.Warn("No suitable non-loopback, active network interfaces with IP addresses found.")
+		slog.Warn("No suitable non-loopback, active network interfaces with global IP addresses found.")
 		// Return empty list, not an error
 	}
 	return names, nil
