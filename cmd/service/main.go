@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"golang.org/x/sys/unix" // For getPeerCredFromConn
 
 	"github.com/yolki/kernelgatekeeper/pkg/config"
 	"github.com/yolki/kernelgatekeeper/pkg/ebpf"
@@ -44,7 +44,7 @@ const (
 // ClientState holds runtime information about a connected client.
 type ClientState struct {
 	UID        uint32
-	PID        uint32
+	PID        uint32 // PID reported by client during registration
 	LastPing   time.Time
 	LastStatus ipc.PingStatusData // Store the last status received from the client
 }
@@ -60,14 +60,13 @@ type Service struct {
 	ipcClientsMu     sync.RWMutex                // Mutex for ipcClients map
 	stopOnce         sync.Once                   // Ensures shutdown actions run only once
 	wg               sync.WaitGroup              // Tracks active goroutines
-	notificationChan chan ebpf.NotificationTuple // Channel for BPF notifications
+	notificationChan chan ebpf.NotificationTuple // Channel for BPF notifications (uses updated tuple)
 }
 
 func main() {
 	// Panic recovery
 	defer func() {
 		if r := recover(); r != nil {
-			// Ensure panic is logged, especially if slog isn't fully set up
 			fmt.Fprintf(os.Stderr, "SERVICE PANIC: %v\n%s\n", r, string(debug.Stack()))
 			slog.Error("PANIC", "error", r, "stack", string(debug.Stack()))
 			os.Exit(1)
@@ -85,14 +84,12 @@ func main() {
 	}
 
 	// Load initial configuration
-	// Use default path if flag isn't set correctly (though flag has default)
 	cfgPath := "/etc/kernelgatekeeper/config.yaml" // Default path
 	if configPath != nil && *configPath != "" {
 		cfgPath = *configPath
 	}
 	initialCfg, err := config.LoadConfig(cfgPath)
 	if err != nil {
-		// Log to stderr as slog might not be configured yet
 		fmt.Fprintf(os.Stderr, "FATAL: Failed to load configuration %s: %v\n", cfgPath, err)
 		os.Exit(1)
 	}
@@ -110,11 +107,13 @@ func main() {
 	}
 
 	// Determine notification channel size
-	notifChanSize := initialCfg.EBPF.NotificationChannelSize
-	if notifChanSize <= 0 {
-		slog.Warn("ebpf.notification_channel_size invalid, using default", "configured", notifChanSize, "default", defaultNotificationChanSize)
-		notifChanSize = defaultNotificationChanSize
+	notifChanSize := defaultNotificationChanSize // Use constant default
+	if initialCfg.EBPF.NotificationChannelSize > 0 {
+		notifChanSize = initialCfg.EBPF.NotificationChannelSize
+	} else if initialCfg.EBPF.NotificationChannelSize != 0 { // Allow 0 for default, warn on negative
+		slog.Warn("ebpf.notification_channel_size invalid, using default", "configured", initialCfg.EBPF.NotificationChannelSize, "default", defaultNotificationChanSize)
 	}
+	// Create the channel with the correct NotificationTuple type
 	svc.notificationChan = make(chan ebpf.NotificationTuple, notifChanSize)
 
 	// Initialize components (BPF manager)
@@ -192,18 +191,16 @@ func setupLogging(logLevelStr, logPath string) {
 	if logPath != "" {
 		logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0640)
 		if err != nil {
-			// Log fallback to stderr using a temporary logger
 			tempLogger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 			tempLogger.Error("Failed to open configured log file, falling back to stderr", "path", logPath, "error", err)
 		} else {
 			logWriter = logFile
-			// Consider closing the file? For long-running service, maybe not needed until shutdown.
 		}
 	}
 
 	opts := &slog.HandlerOptions{
 		Level:     level,
-		AddSource: level <= slog.LevelDebug, // Add source info only for debug
+		AddSource: level <= slog.LevelDebug,
 	}
 	logger := slog.New(slog.NewTextHandler(logWriter, opts))
 	slog.SetDefault(logger)
@@ -230,9 +227,7 @@ func (s *Service) startBackgroundTasks(ctx context.Context) {
 	// Start BPF Manager tasks (stats updater, ring buffer reader)
 	if s.bpfManager != nil {
 		if err := s.bpfManager.Start(ctx, &s.wg); err != nil {
-			// This is likely fatal if BPF manager can't start its core tasks
 			slog.Error("FATAL: Failed to start BPF manager tasks", "error", err)
-			// Consider triggering shutdown?
 			panic(fmt.Sprintf("failed to start BPF manager tasks: %v", err))
 		}
 	} else {
@@ -247,7 +242,6 @@ func (s *Service) startBackgroundTasks(ctx context.Context) {
 	// Start IPC listener
 	if err := s.startIPCListener(ctx); err != nil {
 		slog.Error("FATAL: Failed to start IPC listener", "error", err)
-		// If IPC fails to start, service cannot function
 		panic(fmt.Sprintf("failed to start IPC listener: %v", err))
 	}
 
@@ -273,14 +267,17 @@ func (s *Service) logPeriodicStats(ctx context.Context) {
 			notifChanLen := len(s.notificationChan)
 			notifChanCap := cap(s.notificationChan)
 			clientCount := s.getClientCount()
+			chanUtil := 0.0
+			if notifChanCap > 0 {
+				chanUtil = float64(notifChanLen) * 100 / float64(notifChanCap)
+			}
 
 			slog.Info("Service Stats",
 				"connected_clients", clientCount,
 				"bpf_notif_chan_len", notifChanLen,
 				"bpf_notif_chan_cap", notifChanCap,
-				"bpf_notif_chan_util", fmt.Sprintf("%.2f%%", float64(notifChanLen)*100/float64(notifChanCap)),
+				"bpf_notif_chan_util", fmt.Sprintf("%.2f%%", chanUtil),
 			)
-			// Log warning if channel is getting full
 			if notifChanLen > (notifChanCap * 3 / 4) { // Over 75% full
 				slog.Warn("BPF notification channel usage is high", "length", notifChanLen, "capacity", notifChanCap)
 			}
@@ -289,6 +286,7 @@ func (s *Service) logPeriodicStats(ctx context.Context) {
 }
 
 // processBPFNotifications reads from the notification channel and forwards to the appropriate client.
+// UPDATED to use PID from notification tuple.
 func (s *Service) processBPFNotifications(ctx context.Context) {
 	defer s.wg.Done()
 	slog.Info("Starting BPF notification processor...")
@@ -298,63 +296,73 @@ func (s *Service) processBPFNotifications(ctx context.Context) {
 		case <-ctx.Done():
 			slog.Info("BPF notification processor stopping (context cancelled).")
 			return
-		case notification, ok := <-s.notificationChan:
+		case notification, ok := <-s.notificationChan: // Receives the updated ebpf.NotificationTuple
 			if !ok {
 				slog.Info("BPF notification channel closed.")
-				// This might happen during shutdown, or if the BPF reader failed catastrophically.
-				return
+				return // Exit if channel is closed
 			}
 
-			logCtx := slog.With("src_ip", notification.SrcIP, "dst_ip", notification.DstIP, "dst_port", notification.DstPort)
+			// Use original destination IP/Port from the notification tuple for logging context
+			logCtx := slog.With(
+				"src_ip", notification.SrcIP.String(), // Use String() for logging IPs
+				"orig_dst_ip", notification.OrigDstIP.String(),
+				"orig_dst_port", notification.OrigDstPort,
+				"src_port", notification.SrcPort, // Include source port for context
+			)
 			logCtx.Debug("Received BPF notification tuple")
 
-			// Find PID associated with the connection tuple from the BPF map
-			pid, err := s.bpfManager.GetConnectionPID(notification)
-			if err != nil {
-				// This can happen if the process exits quickly after connecting
-				logCtx.Warn("Could not get PID for connection tuple (process likely exited?)", "error", err)
-				continue
-			}
-			logCtx = logCtx.With("pid", pid)
+			// --- Get PID directly from the notification tuple ---
+			pid_tgid := notification.PidTgid
+			pid := uint32(pid_tgid & 0xFFFFFFFF) // Extract PID from lower 32 bits
+			tgid := uint32(pid_tgid >> 32)       // Extract TGID from upper 32 bits (optional)
 
-			// Find UID from the PID
+			if pid == 0 {
+				logCtx.Warn("Received notification with zero PID, skipping.", "pid_tgid", pid_tgid)
+				continue // Cannot proceed without a valid PID
+			}
+			logCtx = logCtx.With("pid", pid, "tgid", tgid) // Add pid/tgid to log context
+
+			// Find UID from the PID using the existing helper function
 			uid, err := ebpf.GetUidFromPid(pid)
 			if err != nil {
-				// Process might have exited between getting PID and getting UID
+				// This can happen if the process exits quickly after the connect4 hook runs
 				logCtx.Warn("Could not get UID for PID (process likely exited?)", "error", err)
-				continue
+				continue // Skip if UID cannot be determined
 			}
 			logCtx = logCtx.With("uid", uid)
 
-			// Find the registered client connection for this UID
+			// Find the registered client connection associated with this UID
 			s.ipcClientsMu.RLock()
-			clientConn := s.findClientConnByUID_nolock(uid) // Use nolock version
+			clientConn := s.findClientConnByUID_nolock(uid)
 			s.ipcClientsMu.RUnlock()
 
 			if clientConn == nil {
 				logCtx.Debug("No registered client found for UID")
-				// Maybe log Warn if this happens frequently?
-				continue
+				// Consider logging a warning if this happens frequently, as it might indicate
+				// connections from processes not managed by kernelgatekeeper-client.
+				continue // No client to send the notification to
 			}
 
 			logCtx.Info("Found registered client for connection, sending notification.")
 
-			// Prepare and send the notification command over IPC
+			// Prepare the IPC notification payload using data from the BPF notification tuple
+			// Crucially, use the *original* destination IP and Port.
 			ipcNotifData := ipc.NotifyAcceptData{
-				// Convert IPs to strings for JSON
-				SrcIP:    notification.SrcIP.String(),
-				DstIP:    notification.DstIP.String(),
-				SrcPort:  notification.SrcPort,
-				DstPort:  notification.DstPort,
+				SrcIP:    notification.SrcIP.String(),     // Actual source IP
+				DstIP:    notification.OrigDstIP.String(), // Original destination IP
+				SrcPort:  notification.SrcPort,            // Actual source port
+				DstPort:  notification.OrigDstPort,        // Original destination port
 				Protocol: notification.Protocol,
 			}
+
+			// Create the IPC command structure
 			ipcCmd, err := ipc.NewCommand("notify_accept", ipcNotifData)
 			if err != nil {
 				logCtx.Error("Failed to create IPC notification command", "error", err)
-				continue // Should not happen with valid data
+				continue // Should not happen with valid data, but handle defensively
 			}
 
-			// Send asynchronously to avoid blocking the notification loop
+			// Send the command to the appropriate client asynchronously
 			s.sendToClient(clientConn, ipcCmd)
 		}
 	}
@@ -371,29 +379,24 @@ func (s *Service) findClientConnByUID_nolock(uid uint32) net.Conn {
 }
 
 // sendToClient sends an IPC command to a specific client connection asynchronously.
-// It handles potential write errors and removes the client if sending fails.
 func (s *Service) sendToClient(conn net.Conn, cmd *ipc.Command) {
 	go func(c net.Conn, command *ipc.Command) {
-		// Get client UID for logging before potentially removing
 		clientUID := s.getClientUID(c)
 		logCtx := slog.With("cmd", command.Command, "client_uid", clientUID)
 
 		encoder := json.NewEncoder(c)
-		// Set a reasonable write deadline
 		c.SetWriteDeadline(time.Now().Add(ipcWriteTimeout))
 		err := encoder.Encode(command)
-		c.SetWriteDeadline(time.Time{}) // Clear deadline immediately
+		c.SetWriteDeadline(time.Time{}) // Clear deadline
 
 		if err != nil {
-			// Log error and remove the client connection
-			// Don't log error if it's just context cancellation during shutdown
 			if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) || isConnectionClosedErr(err) {
-				logCtx.Info("IPC send cancelled or connection closed during send (likely shutdown)", "error", err)
+				logCtx.Info("IPC send cancelled or connection closed during send", "error", err)
 			} else {
 				logCtx.Warn("Failed to send command to client, removing client.", "error", err)
-				// Remove the connection from the map
-				s.removeClientConn(c)
 			}
+			// Remove the client connection on any send error
+			s.removeClientConn(c)
 		} else {
 			logCtx.Debug("Sent command to client successfully.")
 		}
@@ -407,32 +410,29 @@ func (s *Service) getClientUID(conn net.Conn) uint32 {
 	if state, ok := s.ipcClients[conn]; ok {
 		return state.UID
 	}
-	return 0 // Return 0 or some indicator for not found
+	return 0 // Indicate not found
 }
 
-// startIPCListener sets up and runs the Unix domain socket listener for client connections.
+// startIPCListener sets up and runs the Unix domain socket listener.
 func (s *Service) startIPCListener(ctx context.Context) error {
 	socketPath := s.getConfig().SocketPath
 	dir := filepath.Dir(socketPath)
 
-	// Create directory if it doesn't exist
-	if err := os.MkdirAll(dir, 0750); err != nil { // Permissions suitable for root/group access
+	// Create directory if needed
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("failed to create IPC directory %s: %w", dir, err)
 	}
 
-	// Remove stale socket file if it exists
-	// Use Stat first to check type, avoid removing directories etc.
+	// Remove stale socket file
 	if fi, err := os.Stat(socketPath); err == nil {
 		if fi.Mode()&os.ModeSocket == 0 {
 			return fmt.Errorf("existing file at socket path %s is not a socket", socketPath)
 		}
-		// Attempt removal
 		if err := os.Remove(socketPath); err != nil {
 			return fmt.Errorf("failed to remove existing IPC socket %s: %w", socketPath, err)
 		}
 		slog.Info("Removed stale IPC socket file", "path", socketPath)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		// Error stating the file other than not existing
 		return fmt.Errorf("failed to stat IPC socket path %s: %w", socketPath, err)
 	}
 
@@ -441,20 +441,15 @@ func (s *Service) startIPCListener(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on IPC socket %s: %w", socketPath, err)
 	}
-	s.ipcListener = l // Store the listener
+	s.ipcListener = l
 
-	// Set permissions on the socket file
-	// 0660 allows user and group (root and kg_users?) - Requires group setup.
-	// Using 0666 for now as per original code, but flagged for security review.
-	// TODO: SECURITY: Change permissions to 0660 and manage group ownership.
+	// Set permissions (TODO: Review security - 0660 might be better with group mgmt)
 	if err := os.Chmod(socketPath, 0666); err != nil {
-		l.Close()             // Close listener if chmod fails
-		os.Remove(socketPath) // Clean up socket file
+		l.Close()
+		os.Remove(socketPath)
 		return fmt.Errorf("failed to chmod IPC socket %s to 0666: %w", socketPath, err)
 	}
-	// TODO: SECURITY: Chown socketPath to root:kg_users group.
-
-	slog.Info("IPC listener started", "path", socketPath, "permissions", "0666") // Update log if permissions change
+	slog.Info("IPC listener started", "path", socketPath, "permissions", "0666")
 
 	// Goroutine to close listener on context cancellation
 	s.wg.Add(1)
@@ -462,7 +457,9 @@ func (s *Service) startIPCListener(ctx context.Context) error {
 		defer s.wg.Done()
 		<-ctx.Done()
 		slog.Info("Closing IPC listener due to context cancellation...")
-		s.ipcListener.Close() // Closing the listener unblocks Accept
+		if s.ipcListener != nil {
+			s.ipcListener.Close()
+		}
 	}()
 
 	// Goroutine to accept incoming connections
@@ -472,38 +469,48 @@ func (s *Service) startIPCListener(ctx context.Context) error {
 		for {
 			conn, err := s.ipcListener.Accept()
 			if err != nil {
-				// Check if the error is due to the listener being closed
 				if errors.Is(err, net.ErrClosed) {
 					slog.Info("IPC listener closed, stopping accept loop.")
 					return // Exit loop cleanly
 				}
-				// Log other accept errors and continue (maybe with a small delay)
 				slog.Error("IPC accept failed", "error", err)
-				// Add delay to prevent potential tight loop on persistent errors
 				select {
 				case <-time.After(100 * time.Millisecond):
 					continue
-				case <-ctx.Done(): // Check context while delaying
+				case <-ctx.Done():
 					return
 				}
 			}
-			// Handle accepted connection in a new goroutine
-			s.wg.Add(1) // Increment wait group for the handler goroutine
+			// Handle connection in a new goroutine
+			s.wg.Add(1)
 			go func(c net.Conn) {
-				defer s.wg.Done()             // Decrement wait group when handler finishes
-				s.handleIPCConnection(ctx, c) // Pass context to handler
+				defer s.wg.Done()
+				s.handleIPCConnection(ctx, c)
 			}(conn)
 		}
 	}()
 	return nil
 }
 
-// addClientConn adds a new client connection to the map.
-func (s *Service) addClientConn(conn net.Conn, uid uint32, pid uint32) {
+// addClientConn adds a new client connection to the map, using credentials from the socket.
+func (s *Service) addClientConn(conn net.Conn, reportedPID int) error {
+	peerCred, err := getPeerCredFromConn(conn)
+	if err != nil {
+		return fmt.Errorf("failed to get peer credentials for registering client: %w", err)
+	}
+	uid := peerCred.Uid
+	credentialPID := peerCred.Pid // PID from socket credentials (int32)
+
+	// Optional: Compare reported PID with credential PID
+	if int32(reportedPID) != credentialPID {
+		slog.Warn("Client reported PID differs from socket credential PID",
+			"reported_pid", reportedPID, "credential_pid", credentialPID)
+		// Use credentialPID for internal state as it's more trustworthy
+	}
+
 	s.ipcClientsMu.Lock()
 	defer s.ipcClientsMu.Unlock()
 
-	// Remove existing entry for this conn if any (shouldn't happen)
 	if _, exists := s.ipcClients[conn]; exists {
 		slog.Warn("Client connection already exists in map during add? Removing old.", "remote_addr", conn.RemoteAddr())
 		delete(s.ipcClients, conn)
@@ -511,11 +518,12 @@ func (s *Service) addClientConn(conn net.Conn, uid uint32, pid uint32) {
 
 	s.ipcClients[conn] = &ClientState{
 		UID:      uid,
-		PID:      pid,
-		LastPing: time.Now(), // Initialize LastPing on registration
+		PID:      uint32(credentialPID), // Store the trustworthy PID
+		LastPing: time.Now(),
 	}
 	clientCount := len(s.ipcClients)
-	slog.Info("IPC client registered and added", "remote_addr", conn.RemoteAddr(), "uid", uid, "pid", pid, "total_clients", clientCount)
+	slog.Info("IPC client registered and added", "remote_addr", conn.RemoteAddr(), "uid", uid, "pid", credentialPID, "total_clients", clientCount)
+	return nil
 }
 
 // removeClientConn removes a client connection from the map and closes it.
@@ -526,14 +534,14 @@ func (s *Service) removeClientConn(conn net.Conn) {
 		delete(s.ipcClients, conn)
 	}
 	clientCount := len(s.ipcClients)
-	s.ipcClientsMu.Unlock() // Unlock before closing connection
+	s.ipcClientsMu.Unlock()
 
 	if ok {
 		slog.Info("IPC client removed", "remote_addr", conn.RemoteAddr(), "uid", state.UID, "pid", state.PID, "total_clients", clientCount)
 	} else {
 		slog.Debug("Attempted to remove non-existent or already removed IPC client", "remote_addr", conn.RemoteAddr())
 	}
-	conn.Close() // Close the connection regardless
+	conn.Close() // Close the connection
 }
 
 // getClientCount returns the current number of connected clients.
@@ -545,7 +553,7 @@ func (s *Service) getClientCount() int {
 
 // handleIPCConnection reads commands from a client connection and processes them.
 func (s *Service) handleIPCConnection(ctx context.Context, conn net.Conn) {
-	clientAddr := conn.RemoteAddr().String() // Get address for logging
+	clientAddr := conn.RemoteAddr().String() // Use String() for logging clarity
 	logCtx := slog.With("client_addr", clientAddr)
 	logCtx.Info("Handling new IPC connection")
 
@@ -555,14 +563,13 @@ func (s *Service) handleIPCConnection(ctx context.Context, conn net.Conn) {
 
 	// Ensure connection is removed on exit
 	defer func() {
-		// Check if client was registered before removing
 		s.ipcClientsMu.RLock()
 		_, registered := s.ipcClients[conn]
 		s.ipcClientsMu.RUnlock()
 		if registered {
-			s.removeClientConn(conn) // Use the removal function which also closes
+			s.removeClientConn(conn)
 		} else {
-			conn.Close() // Ensure close if never registered
+			conn.Close()
 		}
 		logCtx.Info("Finished handling IPC connection")
 	}()
@@ -570,27 +577,23 @@ func (s *Service) handleIPCConnection(ctx context.Context, conn net.Conn) {
 	// Loop reading commands
 	for {
 		select {
-		case <-ctx.Done(): // Check for global shutdown
+		case <-ctx.Done():
 			logCtx.Info("Closing IPC handler due to service shutdown.")
 			return
 		default:
-			// Proceed with reading
 		}
 
 		var cmd ipc.Command
-		// Set read deadline to detect inactive/hung clients
-		conn.SetReadDeadline(time.Now().Add(ipcReadIdleTimeout)) // Use the defined constant
+		conn.SetReadDeadline(time.Now().Add(ipcReadIdleTimeout))
 		err := decoder.Decode(&cmd)
 		conn.SetReadDeadline(time.Time{}) // Clear deadline
 
 		if err != nil {
-			// Handle read errors
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || isConnectionClosedErr(err) {
 				logCtx.Info("IPC connection closed by client or network.")
 			} else if isTimeoutError(err) {
 				logCtx.Warn("IPC connection timeout waiting for command. Closing connection.")
 			} else {
-				// Log other decoding errors
 				logCtx.Error("Failed to decode IPC command", "error", err)
 			}
 			return // Exit handler on any error
@@ -607,24 +610,21 @@ func (s *Service) handleIPCConnection(ctx context.Context, conn net.Conn) {
 		var resp *ipc.Response
 		var procErr error
 
-		// Check registration status for commands requiring it
 		isRegistered := clientInfo != nil
-		requiresRegistration := cmd.Command != "register_client" // Only register doesn't require prior registration
+		requiresRegistration := cmd.Command != "register_client"
 
 		if requiresRegistration && !isRegistered {
 			procErr = errors.New("client not registered")
 			logCtxCmd.Warn("Command rejected: client not registered")
 		} else {
-			// Process the specific command
-			resp, procErr = s.processIPCCommand(conn, &cmd, &clientInfo) // Pass pointer to update clientInfo on register
+			// Pass pointer to update clientInfo on register_client success
+			resp, procErr = s.processIPCCommand(conn, &cmd, &clientInfo)
 		}
 
-		// Prepare response (use ErrorResponse if processing failed)
 		if procErr != nil {
 			resp = ipc.NewErrorResponse(procErr.Error())
 			logCtxCmd.Error("Error processing IPC command", "error", procErr)
 		} else if resp == nil {
-			// Should not happen if procErr is nil, but defensive
 			logCtxCmd.Error("Internal error: processIPCCommand returned nil response and nil error")
 			resp = ipc.NewErrorResponse("internal server error processing command")
 		}
@@ -647,106 +647,74 @@ func (s *Service) handleIPCConnection(ctx context.Context, conn net.Conn) {
 func (s *Service) processIPCCommand(conn net.Conn, cmd *ipc.Command, clientInfo **ClientState) (*ipc.Response, error) {
 	switch cmd.Command {
 	case "register_client":
-		// Check if already registered on this connection
 		if *clientInfo != nil {
 			return nil, errors.New("client already registered on this connection")
 		}
-
 		var data ipc.RegisterClientData
 		if err := ipc.DecodeData(cmd.Data, &data); err != nil {
 			return nil, fmt.Errorf("invalid register_client data: %w", err)
 		}
 
-		// Get credentials (UID/PID) from the socket itself for security
-		peerCred, err := getPeerCredFromConn(conn)
-		if err != nil {
-			slog.Error("Failed to get peer credentials for registering client", "error", err)
-			return nil, errors.New("cannot verify client credentials")
+		// Add client using credentials from socket, passing reported PID for logging/check
+		if err := s.addClientConn(conn, data.PID); err != nil {
+			slog.Error("Failed to add client connection during registration", "error", err)
+			return nil, fmt.Errorf("client registration failed: %w", err)
 		}
-		uid := peerCred.Uid
-		pid := peerCred.Pid // Get PID from credentials as well (int32)
-
-		// Check if PID from credentials matches PID from message (optional sanity check)
-		// Cast both to int32 for comparison
-		if int32(data.PID) != pid {
-			slog.Warn("Client reported PID differs from socket credential PID", "reported_pid", data.PID, "credential_pid", pid)
-			// Decide whether to reject or just log. Using credential PID is safer.
-		}
-
-		// Add client to the map - cast pid to uint32 here
-		s.addClientConn(conn, uid, uint32(pid))
 
 		// Update the clientInfo pointer in the caller (handleIPCConnection)
 		s.ipcClientsMu.RLock()
 		*clientInfo = s.ipcClients[conn] // Get the newly added state
 		s.ipcClientsMu.RUnlock()
-
 		if *clientInfo == nil {
-			// This should not happen if addClientConn succeeded
 			return nil, errors.New("internal error: client state not found after registration")
 		}
-
 		return ipc.NewOKResponse("Client registered successfully")
 
 	case "get_config":
-		// Registration check happens in handleIPCConnection
-		cfg := s.getConfig() // Get thread-safe copy
+		cfg := s.getConfig()
 		return ipc.NewOKResponse(ipc.GetConfigData{Config: cfg})
 
 	case "update_ports":
-		// Registration check happens in handleIPCConnection
-		cfg := s.getConfig() // Get current config for validation
+		cfg := s.getConfig()
 		if !cfg.EBPF.AllowDynamicPorts {
 			return nil, errors.New("dynamic port updates disabled by configuration")
 		}
-
 		var data ipc.UpdatePortsData
 		if err := ipc.DecodeData(cmd.Data, &data); err != nil {
 			return nil, fmt.Errorf("invalid update_ports data: %w", err)
 		}
-
 		if s.bpfManager == nil {
 			return nil, errors.New("BPF manager is not ready")
 		}
-
-		// Apply the port update to the BPF map
 		if err := s.bpfManager.UpdateTargetPorts(data.Ports); err != nil {
 			slog.Error("Failed to update target ports via IPC", "error", err, "client_uid", (*clientInfo).UID)
 			return nil, fmt.Errorf("BPF map update failed: %w", err)
 		}
-
-		// Update the in-memory config as well
+		// Update in-memory config as well
 		s.configMu.Lock()
-		s.config.EBPF.TargetPorts = data.Ports // Store the validated & applied ports
+		s.config.EBPF.TargetPorts = data.Ports
 		s.configMu.Unlock()
-
 		slog.Info("Target ports updated via IPC", "ports", data.Ports, "client_uid", (*clientInfo).UID)
 		return ipc.NewOKResponse("Ports updated successfully")
 
 	case "get_status":
-		// Registration check happens in handleIPCConnection
 		return s.getStatusResponse()
 
 	case "get_interfaces":
-		// Registration check happens in handleIPCConnection
 		return s.getInterfacesResponse()
 
 	case "ping_status":
-		// Registration check happens in handleIPCConnection
 		var data ipc.PingStatusData
 		if err := ipc.DecodeData(cmd.Data, &data); err != nil {
 			return nil, fmt.Errorf("invalid ping_status data: %w", err)
 		}
-		// Update client state
 		s.ipcClientsMu.Lock()
 		if state, ok := s.ipcClients[conn]; ok {
 			state.LastPing = time.Now()
-			state.LastStatus = data // Store the received status
+			state.LastStatus = data
 		}
 		s.ipcClientsMu.Unlock()
-
-		// No data needed in OK response for ping
-		return ipc.NewOKResponse(nil)
+		return ipc.NewOKResponse(nil) // No data needed in OK response for ping
 
 	default:
 		return nil, fmt.Errorf("unknown command: %s", cmd.Command)
@@ -755,13 +723,10 @@ func (s *Service) processIPCCommand(conn net.Conn, cmd *ipc.Command, clientInfo 
 
 // getPeerCredFromConn extracts Unix socket peer credentials.
 func getPeerCredFromConn(conn net.Conn) (*unix.Ucred, error) {
-	// Check if it's a UnixConn
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
-		// If not directly a UnixConn, try to get the underlying file descriptor
-		fileConn, ok := conn.(interface {
-			File() (*os.File, error)
-		})
+		// Handle case where it might be wrapped (less common for direct unix sockets)
+		fileConn, ok := conn.(interface{ File() (*os.File, error) })
 		if !ok {
 			return nil, fmt.Errorf("connection type %T does not support peer credentials", conn)
 		}
@@ -769,42 +734,39 @@ func getPeerCredFromConn(conn net.Conn) (*unix.Ucred, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to get file descriptor from connection: %w", err)
 		}
-		defer file.Close() // Close the duplicated fd
-
-		// Get credentials from the file descriptor
-		ucred, err := unix.GetsockoptUcred(int(file.Fd()), unix.SOL_SOCKET, unix.SO_PEERCRED)
-		if err != nil {
-			return nil, fmt.Errorf("getsockopt SO_PEERCRED failed on file descriptor: %w", err)
-		}
-		return ucred, nil
+		defer file.Close()
+		return unix.GetsockoptUcred(int(file.Fd()), unix.SOL_SOCKET, unix.SO_PEERCRED)
 	}
 
-	// It's already a UnixConn, get credentials via File() method which is more reliable.
-	file, fileErr := unixConn.File()
-	if fileErr != nil {
-		return nil, fmt.Errorf("failed to get file descriptor from unixConn: %w", fileErr)
-	}
-	defer file.Close()
-
-	ucred, err := unix.GetsockoptUcred(int(file.Fd()), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	// Directly use file descriptor from UnixConn
+	rawConn, err := unixConn.SyscallConn()
 	if err != nil {
-		return nil, fmt.Errorf("getsockopt SO_PEERCRED failed via file descriptor: %w", err)
+		return nil, fmt.Errorf("failed to get SyscallConn from UnixConn: %w", err)
 	}
-	return ucred, nil
+	var cred *unix.Ucred
+	var credErr error
+	err = rawConn.Control(func(fd uintptr) {
+		cred, credErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	})
+	if err != nil { // Error from rawConn.Control itself
+		return nil, fmt.Errorf("rawConn.Control error getting peer credentials: %w", err)
+	}
+	if credErr != nil { // Error from GetsockoptUcred
+		return nil, fmt.Errorf("getsockopt SO_PEERCRED failed: %w", credErr)
+	}
+	return cred, nil
 }
 
 // getStatusResponse constructs the data for the get_status command.
 func (s *Service) getStatusResponse() (*ipc.Response, error) {
 	cfg := s.getConfig() // Get thread-safe copy
 
-	// Collect client info and status
 	s.ipcClientsMu.RLock()
 	clientDetails := make([]ipc.ClientInfo, 0, len(s.ipcClients))
 	clientKerberosStates := make(map[uint32]ipc.ClientKerberosStatus)
 	for _, state := range s.ipcClients {
 		clientDetails = append(clientDetails, ipc.ClientInfo{PID: state.PID, UID: state.UID})
-		// Only include Kerberos status if the client reported it recently
-		if time.Since(state.LastPing) < clientStatusTTL { // Use the defined constant
+		if time.Since(state.LastPing) < clientStatusTTL {
 			clientKerberosStates[state.UID] = state.LastStatus.KerberosStatus
 		}
 	}
@@ -812,7 +774,7 @@ func (s *Service) getStatusResponse() (*ipc.Response, error) {
 	s.ipcClientsMu.RUnlock()
 
 	statusData := ipc.GetStatusData{
-		Status:               "running", // TODO: Add logic for "degraded" status if needed
+		Status:               "running", // Assume running, could be degraded if BPF fails
 		ActiveInterface:      cfg.EBPF.Interface,
 		ActivePorts:          cfg.EBPF.TargetPorts,
 		LoadMode:             cfg.EBPF.LoadMode,
@@ -821,15 +783,13 @@ func (s *Service) getStatusResponse() (*ipc.Response, error) {
 		ConnectedClients:     clientCount,
 		ClientDetails:        clientDetails,
 		ClientKerberosStates: clientKerberosStates,
-		// MatchedBytes removed as it's not collected currently
 	}
 
-	// Get BPF stats if available
 	if s.bpfManager != nil {
 		_, matched, err := s.bpfManager.GetStats() // Ignoring total stats for now
 		if err != nil {
 			slog.Warn("Failed to get eBPF stats for status response", "error", err)
-			statusData.Status = "degraded" // Indicate issue if stats fail
+			statusData.Status = "degraded"
 		} else {
 			statusData.MatchedConns = matched.Packets
 		}
@@ -845,10 +805,9 @@ func (s *Service) getInterfacesResponse() (*ipc.Response, error) {
 	interfaces, err := ebpf.GetAvailableInterfaces()
 	if err != nil {
 		slog.Error("Failed to get network interfaces for response", "error", err)
-		// Don't fail the whole command, return empty list? Or error? Return error.
 		return nil, fmt.Errorf("failed to list network interfaces: %w", err)
 	}
-	currentInterface := s.getConfig().EBPF.Interface // Informational
+	currentInterface := s.getConfig().EBPF.Interface
 	data := ipc.GetInterfacesData{Interfaces: interfaces, CurrentInterface: currentInterface}
 	return ipc.NewOKResponse(data)
 }
@@ -857,16 +816,13 @@ func (s *Service) getInterfacesResponse() (*ipc.Response, error) {
 func (s *Service) getConfig() config.Config {
 	s.configMu.RLock()
 	defer s.configMu.RUnlock()
-	// Create a shallow copy
 	cfgCopy := *s.config
-	// Create deep copies of slices/maps to prevent modification races
-	// if they are modified directly elsewhere (TargetPorts is handled)
-	if cfgCopy.EBPF.TargetPorts != nil {
+	// Deep copy slices/maps if needed
+	if s.config.EBPF.TargetPorts != nil {
 		cfgCopy.EBPF.TargetPorts = append([]int{}, s.config.EBPF.TargetPorts...)
 	} else {
-		cfgCopy.EBPF.TargetPorts = []int{} // Ensure it's not nil
+		cfgCopy.EBPF.TargetPorts = []int{}
 	}
-	// Deep copy other slices/maps if needed
 	return cfgCopy
 }
 
@@ -879,45 +835,31 @@ func (s *Service) reloadConfig() error {
 	}
 
 	s.configMu.Lock()
-	oldCfg := s.config // Keep old config for comparison/rollback
-	s.config = newCfg  // Atomically update the pointer
+	oldCfg := s.config
+	s.config = newCfg
 	s.configMu.Unlock()
 
-	// Update logging based on new config
-	// Note: This changes the global default logger
-	setupLogging(newCfg.LogLevel, newCfg.LogPath)
+	setupLogging(newCfg.LogLevel, newCfg.LogPath) // Update logging
 	slog.Info("Logging reconfigured based on reloaded settings.")
 
-	// Apply changes that can be applied dynamically
+	// Apply dynamic changes
 	if s.bpfManager != nil {
-		// Update Target Ports if they changed and dynamic updates are allowed
 		if newCfg.EBPF.AllowDynamicPorts && !equalIntSliceUnordered(oldCfg.EBPF.TargetPorts, newCfg.EBPF.TargetPorts) {
 			slog.Info("Applying updated target ports from reloaded configuration...", "ports", newCfg.EBPF.TargetPorts)
 			if err := s.bpfManager.UpdateTargetPorts(newCfg.EBPF.TargetPorts); err != nil {
-				slog.Error("Failed to update target ports on config reload, BPF map may be inconsistent with config!", "error", err)
-				// Should we revert the config change? For now, just log the error.
-				// Reverting config might be complex if other changes were already applied.
-				// s.configMu.Lock()
-				// s.config.EBPF.TargetPorts = oldCfg.EBPF.TargetPorts // Revert just the ports part
-				// s.configMu.Unlock()
+				slog.Error("Failed to update target ports on config reload", "error", err)
+				// Consider reverting config or marking state as degraded
 			} else {
 				slog.Info("Target ports successfully updated in BPF map.")
 			}
 		}
-
-		// Update Notification Channel Size? Requires recreating the channel and potentially BPF manager - skip for now.
 		if oldCfg.EBPF.NotificationChannelSize != newCfg.EBPF.NotificationChannelSize {
-			slog.Warn("Configuration reload detected change in 'ebpf.notification_channel_size', but this requires a service restart to take effect.")
+			slog.Warn("Config reload detected change in 'ebpf.notification_channel_size', requires restart.")
 		}
-
-		// Add other dynamic updates here if needed (e.g., stats interval)
-
+		// Update stats interval? Needs changes in BPFManager.Start/statsUpdater
 	} else {
 		slog.Warn("Cannot apply BPF config changes on reload: BPF manager not initialized.")
 	}
-
-	// TODO: Notify clients about config changes if necessary?
-	// Currently, clients fetch config periodically.
 
 	slog.Info("Configuration reload finished.")
 	return nil
@@ -928,35 +870,31 @@ func (s *Service) Shutdown(ctx context.Context) {
 	s.stopOnce.Do(func() {
 		slog.Info("Initiating graceful shutdown...")
 
-		// 1. Close IPC listener to stop accepting new clients
+		// Close IPC listener
 		if s.ipcListener != nil {
 			slog.Debug("Closing IPC listener...")
 			s.ipcListener.Close()
 		}
 
-		// 2. Close existing client connections
+		// Close client connections
 		s.ipcClientsMu.Lock()
 		connsToClose := make([]net.Conn, 0, len(s.ipcClients))
 		for c := range s.ipcClients {
 			connsToClose = append(connsToClose, c)
 		}
-		// Clear map immediately inside lock
-		s.ipcClients = make(map[net.Conn]*ClientState)
+		s.ipcClients = make(map[net.Conn]*ClientState) // Clear map
 		s.ipcClientsMu.Unlock()
 
 		slog.Debug("Closing active IPC client connections...", "count", len(connsToClose))
-		closeWg := sync.WaitGroup{}
+		var closeWg sync.WaitGroup
 		closeWg.Add(len(connsToClose))
 		for _, c := range connsToClose {
-			go func(connToClose net.Conn) {
-				defer closeWg.Done()
-				connToClose.Close() // Close connections concurrently
-			}(c)
+			go func(connToClose net.Conn) { defer closeWg.Done(); connToClose.Close() }(c)
 		}
-		closeWg.Wait() // Wait for all closes to finish
+		closeWg.Wait()
 		slog.Debug("Finished closing client connections.")
 
-		// 3. Close BPF Manager (detaches programs, closes maps, stops readers)
+		// Close BPF Manager
 		if s.bpfManager != nil {
 			slog.Debug("Closing BPF manager...")
 			if err := s.bpfManager.Close(); err != nil {
@@ -966,65 +904,52 @@ func (s *Service) Shutdown(ctx context.Context) {
 			}
 		}
 
-		// 4. Close notification channel (signal processor to stop)
-		// Ensure channel is closed only once and after BPF manager reader has stopped.
-		// BPFManager.Close() should handle stopping the reader that writes here.
-		// Closing the channel signals the processor `processBPFNotifications` to exit its range loop.
-		// Do this *after* BPF manager close guarantees no more writes.
+		// Close notification channel (after BPF manager closes its writer)
 		if s.notificationChan != nil {
 			slog.Debug("Closing notification channel...")
-			close(s.notificationChan)
-			s.notificationChan = nil // Avoid double close
+			// Check if already closed by BPF manager shutdown internally if applicable
+			// Or just close here assuming BPF manager stopped writing.
+			// Add safety:
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Debug("Notification channel already closed.")
+					}
+				}()
+				close(s.notificationChan)
+			}()
+
+			s.notificationChan = nil
 		}
 
-		slog.Info("Shutdown sequence initiated. Waiting for remaining tasks to complete...")
-		// Main loop waits for s.wg after this function returns
+		slog.Info("Shutdown sequence initiated. Waiting for remaining tasks...")
 	})
-}
-
-// Close is a convenience method for shutdown (e.g., called via defer).
-// Deprecated: Use Shutdown with context instead. Included for compatibility if used.
-func (s *Service) Close() {
-	slog.Warn("Service.Close() called directly, prefer Shutdown() with context.")
-	shutdownTimeout := 5 * time.Second // Default shorter timeout for direct Close()
-	if s.config != nil && s.config.ShutdownTimeout > 0 {
-		shutdownTimeout = s.config.ShutdownTimeout
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-	s.Shutdown(ctx)
 }
 
 // --- Utility Functions ---
 
-// equalIntSliceUnordered checks if two integer slices contain the same elements, regardless of order.
+// equalIntSliceUnordered checks if two integer slices contain the same elements.
 func equalIntSliceUnordered(a, b []int) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	if (a == nil && b != nil) || (a != nil && b == nil) {
-		return false // Handles case where one is nil and other is empty
+	if (a == nil) != (b == nil) {
+		return false
 	}
-	if a == nil && b == nil {
-		return true // Both nil
-	}
+	if len(a) == 0 {
+		return true
+	} // Both empty or nil handled above
 
-	// Use a map to count elements in 'a'
 	counts := make(map[int]int, len(a))
 	for _, x := range a {
 		counts[x]++
 	}
-
-	// Decrement counts for elements in 'b'
 	for _, x := range b {
 		if counts[x] == 0 {
-			return false // Element in b not in a or too many occurrences
+			return false
 		}
 		counts[x]--
 	}
-
-	// If all counts are zero, the slices are equal (ignoring order)
-	// This check is implicitly covered by the previous loop if lengths are equal.
 	return true
 }
 

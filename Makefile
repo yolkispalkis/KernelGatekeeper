@@ -12,11 +12,13 @@ DEB_FILENAME=$(DEB_PACKAGE_NAME)_$(VERSION)_$(ARCH).deb
 # Путь к исходным файлам для DEB
 DEB_SCRIPTS_SRC=deploy/debian_scripts
 
+# BPF related - BPF_C_SRC will pick up the new .c file automatically
 BPF_C_SRC=$(wildcard pkg/ebpf/bpf/*.c)
 BPF_HEADER_DIR=pkg/ebpf/bpf
-BPF_OUTPUT_DIR=pkg/ebpf/bpf
+# Output files go directly into pkg/ebpf/ by bpf2go
 CLANG ?= clang
-CFLAGS ?= -O2 -g -Wall -Werror -target bpf -I./ -I/usr/include/bpf -I/usr/include
+# Removed -I/usr/include as it's usually covered by system includes
+CFLAGS ?= -O2 -g -Wall -Werror -target bpf -I./ -I/usr/include/bpf
 DESTDIR ?= bin
 GO_CMD=go
 GOLANGCILINT = $(shell command -v golangci-lint 2> /dev/null)
@@ -37,8 +39,10 @@ build-client: $(DESTDIR)
 	@echo "Building client application..."
 	$(GO_CMD) build -ldflags="-s -w" -v -o $(DESTDIR)/$(CLIENT_BINARY) ./cmd/client
 
-generate: $(BPF_HEADER_DIR)/bpf_shared.h $(BPF_C_SRC)
-	@echo "Generating Go wrappers and compiling eBPF C code..."
+# NOTE: generate target does not need changes as go:generate handles it
+# It depends on the source files to ensure regeneration if they change.
+generate: $(BPF_HEADER_DIR)/bpf_shared.h $(BPF_C_SRC) pkg/ebpf/program.go
+	@echo "Generating Go wrappers and compiling eBPF C code (via go generate)..."
 	$(GO_CMD) generate ./pkg/ebpf/...
 
 # --- Вспомогательные цели ---
@@ -63,10 +67,12 @@ else
 	$(GOLANGCILINT) run ./...
 endif
 
+# MODIFIED clean target to include bpf_connect4_bpf.go
 clean:
 	@echo "Cleaning up..."
 	rm -rf $(DESTDIR) $(DEB_ROOT) $(DEB_FILENAME)
-	rm -f pkg/ebpf/bpf_skmsg_bpf.go pkg/ebpf/bpf_sockops_bpf.go pkg/ebpf/*.o
+	# Remove generated Go files and BPF object files from pkg/ebpf/
+	rm -f pkg/ebpf/bpf_connect4_bpf.go pkg/ebpf/bpf_skmsg_bpf.go pkg/ebpf/bpf_sockops_bpf.go pkg/ebpf/*.o
 	$(GO_CMD) clean
 
 # --- Установка (ручная, для разработки) ---
@@ -105,7 +111,7 @@ deb: clean build
 	# --- Копирование файлов приложения ---
 	cp $(DESTDIR)/$(SERVICE_BINARY) $(DEB_ROOT)/usr/local/bin/
 	cp $(DESTDIR)/$(CLIENT_BINARY) $(DEB_ROOT)/usr/local/bin/
-	cp config.yaml $(DEB_ROOT)/etc/kernelgatekeeper/config.yaml
+	cp config.yaml $(DEB_ROOT)/etc/kernelgatekeeper/config.yaml.example # Install as example, postinst copies if main is missing
 	cp deploy/kernelgatekeeper.service $(DEB_ROOT)/etc/systemd/system/
 	cp deploy/kernelgatekeeper-client.service $(DEB_ROOT)/usr/lib/systemd/user/
 
@@ -124,10 +130,10 @@ deb: clean build
 	@echo "Priority: optional" >> $(DEB_ROOT)/DEBIAN/control
 	@echo "Architecture: $(ARCH)" >> $(DEB_ROOT)/DEBIAN/control
 	@echo "Depends: libc6, adduser" >> $(DEB_ROOT)/DEBIAN/control
-	@echo "Maintainer: Karim Zabbarov <me@w3h.su>" >> $(DEB_ROOT)/DEBIAN/control
+	@echo "Maintainer: Karim Zabbarov <me@w3h.su>" >> $(DEB_ROOT)/DEBIAN/control # Update maintainer if needed
 	@echo "Description: Transparent Kerberos proxy using eBPF sockops." >> $(DEB_ROOT)/DEBIAN/control
 	@echo " Provides transparent proxying for user applications by leveraging" >> $(DEB_ROOT)/DEBIAN/control
-	@echo " eBPF sockops/sockmap to redirect traffic and performing Kerberos" >> $(DEB_ROOT)/DEBIAN/control
+	@echo " eBPF connect4/sockops/sockmap hooks to redirect traffic and performing Kerberos" >> $(DEB_ROOT)/DEBIAN/control # Updated description slightly
 	@echo " authentication via a user-specific client process." >> $(DEB_ROOT)/DEBIAN/control
 
 	# --- Установка прав на выполнение ---
@@ -152,13 +158,14 @@ help:
 	@echo "Makefile Help:"
 	@echo "  make all          - Format, lint, test, generate BPF, build Go (default)"
 	@echo "  make build        - Build Go applications"
-	@echo "  make generate     - Compile BPF C code and generate Go wrappers"
+	@echo "  make generate     - Compile BPF C code and generate Go wrappers (via go generate)"
 	@echo "  make deps         - Tidy dependencies"
 	@echo "  make test         - Run tests"
 	@echo "  make fmt          - Format Go code"
 	@echo "  make lint         - Run linter"
-	@echo "  make clean        - Remove build artifacts and deb package"
+	@echo "  make clean        - Remove build artifacts, generated BPF files, and deb package"
 	@echo "  make install      - Manual installation (for development)"
 	@echo "  make deb          - Build the Debian (.deb) package"
 	@echo "  make run-service  - Build and run service (sudo required)"
 	@echo "  make run-client   - Build and run client"
+	@echo "  make help         - Show this help message"
