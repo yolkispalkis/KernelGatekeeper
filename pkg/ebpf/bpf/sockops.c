@@ -83,7 +83,7 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
 		 #endif
 	}
 
-	struct notification_tuple_t *event_data = bpf_ringbuf_reserve(¬ification_ringbuf, sizeof(struct notification_tuple_t), 0);
+	struct notification_tuple_t *event_data = bpf_ringbuf_reserve(&notification_ringbuf, sizeof(struct notification_tuple_t), 0);
 	if (!event_data) {
 		bpf_printk("SOCKOPS_ERR: Failed to reserve ringbuf space (cookie %llu, ACTIVE_ESTABLISHED_CB)\n", sock_cookie);
 	} else {
