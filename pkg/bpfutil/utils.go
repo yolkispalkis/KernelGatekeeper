@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -44,10 +45,7 @@ func GetAvailableInterfaces() ([]string, error) {
 			continue
 		}
 		if strings.HasPrefix(i.Name, "veth") || strings.HasPrefix(i.Name, "docker") ||
-			strings.HasPrefix(i.Name, "br-") || strings.HasPrefix(i.Name, "lo") ||
-			strings.HasPrefix(i.Name, "virbr") || strings.HasPrefix(i.Name, "vnet") ||
-			strings.HasPrefix(i.Name, "cni") || strings.HasPrefix(i.Name, "flannel") ||
-			strings.HasPrefix(i.Name, "cali") || strings.HasPrefix(i.Name, "weave") {
+			strings.HasPrefix(i.Name, "br-") || strings.HasPrefix(i.Name, "lo") {
 			continue
 		}
 		addrs, err := i.Addrs()
@@ -55,29 +53,10 @@ func GetAvailableInterfaces() ([]string, error) {
 			slog.Debug("Skipping interface with no addresses or error fetching them", "interface", i.Name, "error", err)
 			continue
 		}
-		hasValidIP := false
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip != nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsInterfaceLocalMulticast() {
-				hasValidIP = true
-				break
-			}
-		}
-		if !hasValidIP {
-			slog.Debug("Skipping interface with no valid global IP address", "interface", i.Name)
-			continue
-		}
-
 		names = append(names, i.Name)
 	}
 	if len(names) == 0 {
-		slog.Warn("No suitable non-loopback, active network interfaces with global IP addresses found.")
+		slog.Warn("No suitable non-loopback, active network interfaces found.")
 	}
 	return names, nil
 }
@@ -105,4 +84,20 @@ func GetUidFromPid(pid uint32) (uint32, error) {
 		}
 	}
 	return 0, fmt.Errorf("uid not found in process status file %s", statusFilePath)
+}
+
+func GetExecutablePathFromPid(pid uint32) (string, error) {
+	if pid == 0 {
+		return "", errors.New("invalid PID 0")
+	}
+	procPath := fmt.Sprintf("/proc/%d/exe", pid)
+	linkPath, err := os.Readlink(procPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+			return "", fmt.Errorf("failed to readlink %s (process likely exited or permission denied): %w", procPath, err)
+		}
+		return "", fmt.Errorf("failed to readlink %s: %w", procPath, err)
+	}
+	cleanedPath := filepath.Clean(linkPath)
+	return cleanedPath, nil
 }

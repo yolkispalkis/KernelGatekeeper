@@ -76,7 +76,6 @@ func (bp *BpfProcessor) Run(ctx context.Context) {
 							isExcluded = true
 							break
 						}
-						// Potential future enhancement: filepath.Match(excluded, execPath)
 					}
 
 					if isExcluded {
@@ -128,7 +127,6 @@ func (bp *BpfProcessor) Run(ctx context.Context) {
 	}
 }
 
-// Helper function to compare string slices (order matters)
 func stringSlicesEqual(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
