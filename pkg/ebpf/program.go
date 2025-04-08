@@ -46,55 +46,44 @@ type GlobalStats struct {
 
 // NotificationTuple **MUST** match the fields expected by service/main.go AND the C struct notification_tuple_t
 type NotificationTuple struct {
-	PidTgid     uint64 // <<< ADDED
+	PidTgid     uint64 // Populated from BPF
 	SrcIP       net.IP // Source IP address (IPv4)
-	OrigDstIP   net.IP // Original Destination IP address (IPv4) // <<< ADDED
+	OrigDstIP   net.IP // Original Destination IP address (IPv4)
 	SrcPort     uint16 // Source port (Host Byte Order)
-	OrigDstPort uint16 // Original Destination port (Host Byte Order) // <<< ADDED
+	OrigDstPort uint16 // Original Destination port (Host Byte Order)
 	Protocol    uint8  // IP protocol (e.g., syscall.IPPROTO_TCP)
-	// PaddingBytes []byte // Optional - C struct has padding, but usually not needed in Go unless alignment is critical
 }
 
 // BpfConnectionDetailsT corresponds to struct connection_details_t. Use connect4's generated type.
-type BpfConnectionDetailsT = bpf_connect4ConnectionDetailsT // Corrected Alias
+type BpfConnectionDetailsT = bpf_connect4ConnectionDetailsT // Alias generated type
 
 // BpfNotificationTupleT corresponds to struct notification_tuple_t.
-// Define it manually as bpf2go didn't seem to generate it explicitly.
-// **CRITICAL:** Field names and types MUST match the C struct exactly.
+// Define it manually to match the C struct layout precisely.
 type BpfNotificationTupleT struct {
 	PidTgid     uint64
-	SrcIp       uint32 // Network Byte Order IP
-	OrigDstIp   uint32 // Network Byte Order IP
-	SrcPort     uint16 // Network Byte Order Port
-	OrigDstPort uint16 // Network Byte Order Port
-	Protocol    uint8
-	Padding     [5]uint8 // Match C struct padding
-	// _           [X]byte // Add explicit Go padding if needed for binary.Read alignment
+	SrcIp       uint32   // Network Byte Order IP (Matches C: __be32)
+	OrigDstIp   uint32   // Network Byte Order IP (Matches C: __be32)
+	SrcPort     uint16   // Network Byte Order Port (Matches C: __be16)
+	OrigDstPort uint16   // Network Byte Order Port (Matches C: __be16)
+	Protocol    uint8    // Matches C: __u8
+	Padding     [5]uint8 // Matches C: __u8 padding[5]
+	// Go compiler should handle alignment implicitly here, no extra Go padding needed normally
 }
 
 // Use the generated type for global stats map values
-type BpfGlobalStatsT = bpf_connect4GlobalStatsT // Corrected Alias
+type BpfGlobalStatsT = bpf_connect4GlobalStatsT // Alias generated type
 
-// bpfObjects holds references to all loaded eBPF programs and maps.
+// bpfObjects holds references to all loaded eBPF programs and maps
+// by embedding the generated object structs.
 type bpfObjects struct {
-	bpf_connect4Objects
-	bpf_sockopsObjects
-	bpf_skmsgObjects
-
-	// Direct access fields (Redundant if included in embedded objects, but explicit for clarity)
-	KernelgatekeeperConnect4 *ebpf.Program `ebpf:"kernelgatekeeper_connect4"`
-	KernelgatekeeperSockops  *ebpf.Program `ebpf:"kernelgatekeeper_sockops"`
-	KernelgatekeeperSkmsg    *ebpf.Program `ebpf:"kernelgatekeeper_skmsg"`
-	ConnectionDetailsMap     *ebpf.Map     `ebpf:"connection_details_map"` // <<< Corrected Name (assuming it's here)
-	TargetPorts              *ebpf.Map     `ebpf:"target_ports"`
-	ProxySockMap             *ebpf.Map     `ebpf:"proxy_sock_map"`
-	NotificationRingbuf      *ebpf.Map     `ebpf:"notification_ringbuf"`
-	GlobalStats              *ebpf.Map     `ebpf:"global_stats"`
+	bpf_connect4Objects // Embeds connect4 programs and maps
+	bpf_sockopsObjects  // Embeds sockops programs and maps (maps replaced on load)
+	bpf_skmsgObjects    // Embeds skmsg programs and maps (maps replaced on load)
+	// No need for duplicate direct access fields if embedded structs are used correctly
 }
 
-// Close implementation
+// Close closes all embedded object collections.
 func (o *bpfObjects) Close() error {
-	// Combine closers from all embedded objects
 	closers := []io.Closer{
 		&o.bpf_connect4Objects,
 		&o.bpf_sockopsObjects,
@@ -105,21 +94,14 @@ func (o *bpfObjects) Close() error {
 		if closer == nil {
 			continue
 		}
-		// Use type assertion to check if already closed, if the object supports it.
-		// Not all ebpf objects might implement this.
-		// if c, ok := closer.(interface{ IsClosed() bool }); ok && c.IsClosed() {
-		//  continue
-		// }
-
+		// The generated Close methods should handle nil checks internally.
 		if err := closer.Close(); err != nil {
-			// Ignore error if it signifies already closed (os.ErrClosed is common)
-			if !errors.Is(err, os.ErrClosed) { // <<< REMOVED ebpf.ErrClosed check
+			if !errors.Is(err, os.ErrClosed) { // Check standard Go error
 				errs = append(errs, err)
 			}
 		}
 	}
 	if len(errs) > 0 {
-		// Aggregate errors more robustly
 		finalErr := errors.New("errors closing BPF objects")
 		for _, err := range errs {
 			finalErr = fmt.Errorf("%w; %w", finalErr, err) // Chain errors
@@ -132,7 +114,7 @@ func (o *bpfObjects) Close() error {
 // BPFManager definition remains the same
 type BPFManager struct {
 	cfg                 *config.EBPFConfig
-	objs                bpfObjects
+	objs                bpfObjects // Holds all loaded BPF objects
 	connect4Link        link.Link
 	cgroupLink          link.Link
 	skMsgLink           link.Link
@@ -142,29 +124,32 @@ type BPFManager struct {
 	stopChan            chan struct{}
 	statsCache          struct {
 		sync.RWMutex
-		matchedConns, lastMatched GlobalStats
-		lastStatsTime             time.Time
+		// Removed matchedConns as it was redundant with lastMatched
+		lastMatched   GlobalStats
+		lastStatsTime time.Time
 	}
 	mu sync.Mutex
 }
 
-// NewBPFManager
+// NewBPFManager loads and attaches BPF programs and maps.
 func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (*BPFManager, error) {
 	slog.Info("Initializing BPF Manager", "mode", "connect4/sockops/skmsg")
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return nil, fmt.Errorf("failed to remove memlock rlimit: %w", err)
 	}
 
+	// Use a single objs struct to hold all loaded components
 	var objs bpfObjects
-	// Increase verifier log size for better debugging
+
 	opts := &ebpf.CollectionOptions{
 		Maps: ebpf.MapOptions{},
 		Programs: ebpf.ProgramOptions{
-			LogLevel: ebpf.LogLevelInstruction, // Or LogLevelBranch, LogLevelStats
-			LogSize:  verifierLogSize,          // <<< USE LOCAL CONSTANT or a literal value
+			LogLevel: ebpf.LogLevelInstruction,
+			LogSize:  verifierLogSize,
 		},
 	}
 
+	// Load Specs
 	specConnect4, err := loadBpf_connect4()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load connect4 BPF spec: %w", err)
@@ -178,84 +163,90 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 		return nil, fmt.Errorf("failed to load skmsg BPF spec: %w", err)
 	}
 
-	// Load connect4 first
+	// --- Load connect4 Objects ---
+	// Load directly into the embedded bpf_connect4Objects within the main objs struct.
 	if err := specConnect4.LoadAndAssign(&objs.bpf_connect4Objects, opts); err != nil {
 		handleVerifierError("connect4", err)
 		return nil, fmt.Errorf("failed to load eBPF connect4 objects: %w", err)
 	}
 	slog.Debug("eBPF connect4 objects loaded successfully.")
-	// Explicitly assign direct access fields from the first loaded object where they are defined
-	objs.KernelgatekeeperConnect4 = objs.bpf_connect4Objects.KernelgatekeeperConnect4
-	objs.ConnectionDetailsMap = objs.bpf_connect4Objects.ConnectionDetailsMap // <<< Assign the actual map object
-	objs.TargetPorts = objs.bpf_connect4Objects.TargetPorts
-	objs.ProxySockMap = objs.bpf_connect4Objects.ProxySockMap
-	objs.NotificationRingbuf = objs.bpf_connect4Objects.NotificationRingbuf
-	objs.GlobalStats = objs.bpf_connect4Objects.GlobalStats
+	// Now access maps and programs via objs.bpf_connect4Objects.*
 
-	// Load sockops, replacing maps with the ones already loaded from connect4
+	// --- Load sockops Objects ---
+	// Prepare replacements using maps loaded by connect4
 	opts.MapReplacements = map[string]*ebpf.Map{
-		// Ensure ALL maps shared between C files are listed here using the names from C
-		"connection_details_map": objs.ConnectionDetailsMap,
-		"target_ports":           objs.TargetPorts,
-		"proxy_sock_map":         objs.ProxySockMap,
-		"notification_ringbuf":   objs.NotificationRingbuf,
-		"global_stats":           objs.GlobalStats,
+		"connection_details_map": objs.bpf_connect4Objects.ConnectionDetailsMap,
+		"target_ports":           objs.bpf_connect4Objects.TargetPorts,
+		"proxy_sock_map":         objs.bpf_connect4Objects.ProxySockMap,
+		"notification_ringbuf":   objs.bpf_connect4Objects.NotificationRingbuf,
+		"global_stats":           objs.bpf_connect4Objects.GlobalStats,
 	}
+	// Load into the embedded bpf_sockopsObjects
 	if err := specSockops.LoadAndAssign(&objs.bpf_sockopsObjects, opts); err != nil {
 		handleVerifierError("sockops", err)
-		objs.bpf_connect4Objects.Close() // Clean up previously loaded objects
+		objs.bpf_connect4Objects.Close() // Clean up connect4 objects
 		return nil, fmt.Errorf("failed to load eBPF sockops objects: %w", err)
 	}
 	slog.Debug("eBPF sockops objects loaded successfully.")
-	objs.KernelgatekeeperSockops = objs.bpf_sockopsObjects.KernelgatekeeperSockops // Assign sockops program
+	// Access sockops program via objs.bpf_sockopsObjects.*
 
-	// Load skmsg, replacing the shared sockmap
+	// --- Load skmsg Objects ---
+	// Prepare replacement for the sockmap
 	opts.MapReplacements = map[string]*ebpf.Map{
-		"proxy_sock_map": objs.ProxySockMap, // Only replace the map used by skmsg
+		"proxy_sock_map": objs.bpf_connect4Objects.ProxySockMap, // Use the map loaded by connect4
 	}
+	// Load into the embedded bpf_skmsgObjects
 	if err := specSkmsg.LoadAndAssign(&objs.bpf_skmsgObjects, opts); err != nil {
 		handleVerifierError("skmsg", err)
-		objs.bpf_connect4Objects.Close() // Clean up all previous on failure
+		objs.bpf_connect4Objects.Close() // Clean up previous objects
 		objs.bpf_sockopsObjects.Close()
 		return nil, fmt.Errorf("failed to load eBPF skmsg objects: %w", err)
 	}
 	slog.Debug("eBPF skmsg objects loaded successfully.")
-	objs.KernelgatekeeperSkmsg = objs.bpf_skmsgObjects.KernelgatekeeperSkmsg // Assign skmsg program
+	// Access skmsg program via objs.bpf_skmsgObjects.*
 
+	// --- Create Manager ---
 	manager := &BPFManager{
 		cfg:                 cfg,
-		objs:                objs,
+		objs:                objs, // Assign the fully loaded objs struct
 		notificationChannel: notifChan,
 		stopChan:            make(chan struct{}),
 	}
 	manager.statsCache.lastStatsTime = time.Now()
 
-	// Verify essential objects are not nil after loading all specs
-	if objs.KernelgatekeeperConnect4 == nil || objs.KernelgatekeeperSockops == nil || objs.KernelgatekeeperSkmsg == nil ||
-		objs.ConnectionDetailsMap == nil || objs.TargetPorts == nil || objs.ProxySockMap == nil ||
-		objs.NotificationRingbuf == nil || objs.GlobalStats == nil {
+	// --- Verify Essential Objects ---
+	// Access programs and maps through the embedded structs
+	if objs.bpf_connect4Objects.KernelgatekeeperConnect4 == nil ||
+		objs.bpf_sockopsObjects.KernelgatekeeperSockops == nil || // Check sockops program
+		objs.bpf_skmsgObjects.KernelgatekeeperSkmsg == nil || // Check skmsg program
+		objs.bpf_connect4Objects.ConnectionDetailsMap == nil ||
+		objs.bpf_connect4Objects.TargetPorts == nil ||
+		objs.bpf_connect4Objects.ProxySockMap == nil ||
+		objs.bpf_connect4Objects.NotificationRingbuf == nil ||
+		objs.bpf_connect4Objects.GlobalStats == nil {
 		manager.objs.Close() // Use the consolidated close method
-		return nil, errors.New("one or more required BPF programs or maps failed to load or assign after merging objects")
+		return nil, errors.New("one or more required BPF programs or maps failed to load or assign correctly")
 	}
 
-	// Attach programs
+	// --- Attach Programs ---
 	if err := manager.attachPrograms(DefaultCgroupPath); err != nil {
-		manager.Close() // Use the consolidated close method
+		manager.Close()
 		return nil, err
 	}
 
-	// Create ring buffer reader AFTER programs are attached and maps are loaded
+	// --- Initialize Ring Buffer Reader ---
 	var ringbufErr error
-	manager.notificationReader, ringbufErr = ringbuf.NewReader(objs.NotificationRingbuf)
+	// Access NotificationRingbuf via the embedded struct it was loaded into
+	manager.notificationReader, ringbufErr = ringbuf.NewReader(objs.bpf_connect4Objects.NotificationRingbuf)
 	if ringbufErr != nil {
-		manager.Close() // Use the consolidated close method
+		manager.Close()
 		return nil, fmt.Errorf("failed to create ring buffer reader: %w", ringbufErr)
 	}
 	slog.Info("BPF ring buffer reader initialized")
 
-	// Set initial target ports
+	// --- Set Initial Target Ports ---
 	if err := manager.UpdateTargetPorts(cfg.TargetPorts); err != nil {
-		manager.Close() // Use the consolidated close method
+		manager.Close()
 		return nil, fmt.Errorf("failed to set initial target ports in BPF map: %w", err)
 	}
 
@@ -263,7 +254,6 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 	return manager, nil
 }
 
-// --- Rest of the file (handleVerifierError, attachPrograms, Start, readNotifications, etc.) remains unchanged from the previous corrected version ---
 // handleVerifierError remains the same
 func handleVerifierError(objType string, err error) {
 	var verr *ebpf.VerifierError
@@ -274,12 +264,14 @@ func handleVerifierError(objType string, err error) {
 	}
 }
 
-// attachPrograms remains the same
+// attachPrograms uses programs and maps from the manager's objs struct.
 func (m *BPFManager) attachPrograms(cgroupPath string) error {
-	connect4Prog := m.objs.KernelgatekeeperConnect4
-	sockopsProg := m.objs.KernelgatekeeperSockops
-	skmsgProg := m.objs.KernelgatekeeperSkmsg
-	sockMap := m.objs.ProxySockMap
+	// Access programs and maps via the embedded structs within m.objs
+	connect4Prog := m.objs.bpf_connect4Objects.KernelgatekeeperConnect4
+	sockopsProg := m.objs.bpf_sockopsObjects.KernelgatekeeperSockops // From sockopsObjects
+	skmsgProg := m.objs.bpf_skmsgObjects.KernelgatekeeperSkmsg       // From skmsgObjects
+	sockMap := m.objs.bpf_connect4Objects.ProxySockMap               // Map loaded by connect4
+
 	if connect4Prog == nil || sockopsProg == nil || skmsgProg == nil || sockMap == nil {
 		return errors.New("internal error: one or more required BPF programs or the sockmap are nil during attach phase")
 	}
@@ -293,21 +285,27 @@ func (m *BPFManager) attachPrograms(cgroupPath string) error {
 	if !fi.IsDir() {
 		return fmt.Errorf("cgroup v2 path '%s' is not a directory", cgroupPath)
 	}
+
 	var linkErr error
+	// Attach connect4
 	m.connect4Link, linkErr = link.AttachCgroup(link.CgroupOptions{Path: cgroupPath, Program: connect4Prog, Attach: ebpf.AttachCGroupInet4Connect})
 	if linkErr != nil {
 		return fmt.Errorf("failed to attach connect4 program to cgroup '%s': %w", cgroupPath, linkErr)
 	}
 	slog.Info("eBPF connect4 program attached to cgroup", "path", cgroupPath)
+
+	// Attach sockops
 	m.cgroupLink, linkErr = link.AttachCgroup(link.CgroupOptions{Path: cgroupPath, Program: sockopsProg, Attach: ebpf.AttachCGroupSockOps})
 	if linkErr != nil {
-		m.connect4Link.Close()
+		m.connect4Link.Close() // Rollback previous attachment
 		return fmt.Errorf("failed to attach sock_ops program to cgroup '%s': %w", cgroupPath, linkErr)
 	}
 	slog.Info("eBPF sock_ops program attached to cgroup", "path", cgroupPath)
+
+	// Attach skmsg to sockmap
 	m.skMsgLink, linkErr = link.AttachRawLink(link.RawLinkOptions{Program: skmsgProg, Attach: ebpf.AttachSkMsgVerdict, Target: sockMap.FD(), Flags: 0})
 	if linkErr != nil {
-		m.cgroupLink.Close()
+		m.cgroupLink.Close() // Rollback previous attachments
 		m.connect4Link.Close()
 		return fmt.Errorf("failed to attach sk_msg program to proxy_sock_map (FD %d): %w", sockMap.FD(), linkErr)
 	}
@@ -342,9 +340,9 @@ func (m *BPFManager) Start(ctx context.Context, wg *sync.WaitGroup) error {
 
 // readNotifications reads connection notification events from the BPF ring buffer.
 func (m *BPFManager) readNotifications(ctx context.Context) {
-	// **MODIFIED:** Use the manually defined Go type `BpfNotificationTupleT`
+	// Use the manually defined Go type `BpfNotificationTupleT`
 	var bpfTuple BpfNotificationTupleT
-	// Use unsafe.Sizeof for C-like struct size determination if binary.Size fails or is inaccurate
+	// Use unsafe.Sizeof for C-like struct size determination
 	tupleSize := int(unsafe.Sizeof(bpfTuple))
 	if tupleSize <= 0 {
 		// Fallback or error if unsafe.Sizeof also fails
@@ -354,7 +352,6 @@ func (m *BPFManager) readNotifications(ctx context.Context) {
 			return
 		}
 		tupleSize = bsize
-
 	}
 	slog.Debug("BPF ring buffer reader expecting record size", "size", tupleSize)
 
@@ -400,7 +397,7 @@ func (m *BPFManager) readNotifications(ctx context.Context) {
 
 		// Use bytes.NewReader for efficient reading
 		reader := bytes.NewReader(record.RawSample)
-		// **MODIFIED:** Read into the correctly defined type `BpfNotificationTupleT`
+		// Read into the correctly defined type `BpfNotificationTupleT`
 		if err := binary.Read(reader, nativeEndian, &bpfTuple); err != nil {
 			slog.Error("Failed to decode BPF ring buffer event data into BpfNotificationTupleT", "error", err)
 			continue
@@ -511,12 +508,13 @@ func (m *BPFManager) updateAndLogStats() error {
 // readGlobalStats reads per-CPU stats from the BPF map and aggregates them.
 func (m *BPFManager) readGlobalStats(index uint32) (GlobalStats, error) {
 	var aggregate GlobalStats
-	globalStatsMap := m.objs.GlobalStats // Use direct access field
+	// Access GlobalStats map via the embedded struct it was loaded into
+	globalStatsMap := m.objs.bpf_connect4Objects.GlobalStats
 	if globalStatsMap == nil {
 		return aggregate, errors.New("BPF global_stats map is nil (was it loaded?)")
 	}
 
-	// **MODIFIED:** Use the correct generated type alias `BpfGlobalStatsT`
+	// Use the aliased generated type `BpfGlobalStatsT`
 	var perCPUValues []BpfGlobalStatsT
 	err := globalStatsMap.Lookup(index, &perCPUValues)
 	if err != nil {
@@ -537,21 +535,20 @@ func (m *BPFManager) readGlobalStats(index uint32) (GlobalStats, error) {
 }
 
 // GetStats returns the cached statistics.
-// Renamed the first return value to avoid confusion with total packets processed by the NIC.
 func (m *BPFManager) GetStats() (totalIgnored GlobalStats, matched GlobalStats, err error) {
 	m.statsCache.RLock()
 	defer m.statsCache.RUnlock()
-	// totalIgnored = m.statsCache.totalConns // If you had a separate counter for total processed
 	totalIgnored = GlobalStats{}       // No separate total counter currently
 	matched = m.statsCache.lastMatched // Return the last read value
 	return totalIgnored, matched, nil
 }
 
-// UpdateTargetPorts remains the same
+// UpdateTargetPorts uses the map from the manager's objs struct.
 func (m *BPFManager) UpdateTargetPorts(ports []int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	targetPortsMap := m.objs.TargetPorts
+	// Access TargetPorts map via the embedded struct it was loaded into
+	targetPortsMap := m.objs.bpf_connect4Objects.TargetPorts
 	if targetPortsMap == nil {
 		return errors.New("BPF target_ports map not initialized (was it loaded?)")
 	}
@@ -584,12 +581,9 @@ func (m *BPFManager) UpdateTargetPorts(ports []int) error {
 	// Delete ports no longer desired
 	for portKey := range currentPortsMap {
 		if !desiredPortsSet[portKey] {
-			// Use DeleteStrict for potentially better error handling if needed
 			if err := targetPortsMap.Delete(portKey); err != nil {
-				// Don't error out if key already gone, could happen with concurrent updates or map clears
 				if !errors.Is(err, ebpf.ErrKeyNotExist) {
 					slog.Error("Failed to delete target port from BPF map", "port", portKey, "error", err)
-					// Maybe return error here if deletes are critical?
 				}
 			} else {
 				slog.Debug("Deleted target port from BPF map", "port", portKey)
@@ -602,10 +596,8 @@ func (m *BPFManager) UpdateTargetPorts(ports []int) error {
 	// Add newly desired ports
 	for portKey := range desiredPortsSet {
 		if !currentPortsMap[portKey] {
-			// Use Put/Update instead of Insert if overwriting is acceptable/desired
 			if err := targetPortsMap.Put(portKey, mapValueOne); err != nil {
 				slog.Error("Failed to add target port to BPF map", "port", portKey, "error", err)
-				// Maybe return error here if adds are critical?
 			} else {
 				slog.Debug("Added target port to BPF map", "port", portKey)
 				addedCount++
