@@ -16,7 +16,6 @@ const (
 	DefaultProxyConnectionTimeout = 10
 	DefaultProxyRequestTimeout    = 30
 	DefaultProxyMaxRetries        = 3
-	DefaultKerberosEnableCache    = true
 	DefaultEBPFInterface          = "eth0"
 	DefaultEBPFLoadMode           = "sockops"
 	DefaultEBPFAllowDynamicPorts  = true
@@ -49,14 +48,11 @@ type ProxyConfig struct {
 	PacExecutionTimeout int    `mapstructure:"pacExecutionTimeout"`
 }
 
+// KerberosConfig for client mode primarily uses CachePath. Realm/KDCHost are optional.
 type KerberosConfig struct {
-	Realm          string `mapstructure:"realm"`
-	KDCHost        string `mapstructure:"kdcHost"`
-	Principal      string `mapstructure:"principal"`
-	KeytabPath     string `mapstructure:"keytabPath"`
-	EnableCache    bool   `mapstructure:"enableCache"`
-	TicketLifetime int    `mapstructure:"ticketLifetime"`
-	CachePath      string `mapstructure:"cachePath"`
+	Realm     string `mapstructure:"realm"`
+	KDCHost   string `mapstructure:"kdcHost"`
+	CachePath string `mapstructure:"cachePath"` // Path pattern for ccache (optional)
 }
 
 type EBPFConfig struct {
@@ -84,7 +80,7 @@ func LoadConfig(configPath string) (*Config, error) {
 	setDefaults(v)
 
 	v.SetEnvPrefix("KG")
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_")) // May not work well with camelCase keys
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
 
 	err = v.ReadInConfig()
@@ -103,7 +99,6 @@ func LoadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to decode configuration: %w", err)
 	}
 
-	// Viper doesn't automatically handle time.Duration from ints in seconds via mapstructure
 	config.ShutdownTimeout = time.Duration(v.GetInt("shutdownTimeout")) * time.Second
 
 	if err := validateConfig(&config); err != nil {
@@ -138,8 +133,9 @@ func validateConfig(cfg *Config) error {
 		return errors.New("proxy.pacExecutionTimeout must be positive")
 	}
 
-	if cfg.Kerberos.Realm == "" {
-		slog.Warn("Kerberos realm is not explicitly set in config, relying on system defaults or auto-detection.")
+	if strings.Contains(cfg.Kerberos.CachePath, "%{null}") {
+		slog.Warn("kerberos.cachePath contains '%{null}', which is unsupported. Ignoring cachePath setting.")
+		cfg.Kerberos.CachePath = ""
 	}
 
 	if len(cfg.EBPF.TargetPorts) == 0 {
@@ -193,10 +189,6 @@ func setDefaults(v *viper.Viper) {
 
 	v.SetDefault("kerberos.realm", "")
 	v.SetDefault("kerberos.kdcHost", "")
-	v.SetDefault("kerberos.principal", "")
-	v.SetDefault("kerberos.keytabPath", "")
-	v.SetDefault("kerberos.enableCache", DefaultKerberosEnableCache)
-	v.SetDefault("kerberos.ticketLifetime", 24)
 	v.SetDefault("kerberos.cachePath", "")
 
 	v.SetDefault("ebpf.interface", DefaultEBPFInterface)
