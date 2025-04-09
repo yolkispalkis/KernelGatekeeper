@@ -3,7 +3,6 @@ package clientcore
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -15,16 +14,16 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/common"
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/ipc"
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/pac"
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/proxy"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/ipc"   // Keep kerb import
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/proxy" // Keep proxy import
 )
 
 const (
 	maxConcurrentWorkers    = 200
-	proxyConnectDialTimeout = 10 * time.Second
-	proxyCONNECTTimeout     = 30 * time.Second
-	relayCopyTimeout        = 5 * time.Minute
+	proxyConnectDialTimeout = 10 * time.Second // Timeout dialing the proxy server itself
+	proxyCONNECTTimeout     = 30 * time.Second // Timeout for the whole CONNECT handshake including auth
+	relayCopyTimeout        = 5 * time.Minute  // Timeout for io.Copy during relay
+	targetDialTimeout       = 15 * time.Second // Timeout for dialing the original target directly
 )
 
 type ConnectionHandler struct {
@@ -41,253 +40,221 @@ func NewConnectionHandler(stateMgr *StateManager) *ConnectionHandler {
 
 // HandleBPFAccept is called by the IPCManager when a notify_accept is received and the connection is accepted locally.
 func (h *ConnectionHandler) HandleBPFAccept(ctx context.Context, acceptedConn net.Conn, originalDest ipc.NotifyAcceptData) {
-	// Acquire semaphore before starting goroutine
-	if err := h.semaphore.Acquire(ctx, 1); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			slog.Info("Worker semaphore acquisition cancelled or timed out during shutdown")
-		} else {
-			slog.Error("Failed to acquire worker semaphore", "error", err)
-		}
+	if !h.semaphore.TryAcquire(1) {
+		slog.Warn("Too many concurrent connections, rejecting new BPF connection")
 		acceptedConn.Close() // Close the connection if we can't handle it
 		return
 	}
 
+	h.stateManager.AddWaitGroup(1) // Increment state manager's WaitGroup
 	h.stateManager.IncActiveConnections()
-	h.stateManager.AddWaitGroup(1)
 
-	go func(conn net.Conn, dest ipc.NotifyAcceptData) {
-		defer h.stateManager.WaitGroupDone()
+	go func() {
 		defer h.semaphore.Release(1)
 		defer h.stateManager.DecActiveConnections()
-		h.handleAcceptedConnection(ctx, conn, dest)
-	}(acceptedConn, originalDest)
+		defer h.stateManager.WaitGroupDone() // Decrement state manager's WaitGroup
+
+		// Use the context passed from IPCManager which might be linked to root context
+		// Add connection specific details to logger
+		logCtx := slog.With(
+			"remote_addr", acceptedConn.RemoteAddr().String(), // This will be the local BPF listener addr
+			"local_addr", acceptedConn.LocalAddr().String(), // This will be dynamic
+			"original_dst_ip", originalDest.DstIP,
+			"original_dst_port", originalDest.DstPort,
+			"original_src_ip", originalDest.SrcIP,
+			"original_src_port", originalDest.SrcPort,
+		)
+		logCtx.Info("Handling new BPF connection")
+
+		h.handleAcceptedConnection(ctx, acceptedConn, originalDest, logCtx)
+
+		logCtx.Info("BPF connection handling finished")
+	}()
 }
 
-func (h *ConnectionHandler) handleAcceptedConnection(ctx context.Context, acceptedConn net.Conn, originalDest ipc.NotifyAcceptData) {
-	defer acceptedConn.Close()
+// handleAcceptedConnection determines the proxy, establishes the connection (direct or tunnel), and relays data.
+func (h *ConnectionHandler) handleAcceptedConnection(ctx context.Context, acceptedConn net.Conn, originalDest ipc.NotifyAcceptData, logCtx *slog.Logger) {
+	defer acceptedConn.Close() // Ensure accepted connection is always closed eventually
 
-	targetAddr := net.JoinHostPort(originalDest.DstIP, strconv.Itoa(int(originalDest.DstPort)))
-	scheme := "http"
-	if originalDest.DstPort == 443 || originalDest.DstPort == 8443 {
-		scheme = "https"
+	targetHost := originalDest.DstIP
+	targetPort := originalDest.DstPort
+	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(int(targetPort)))
+
+	// Construct target URL (scheme doesn't matter much for CONNECT, but helps PAC)
+	// Assume https for common web ports, http otherwise? Or just use host?
+	// Let's use a placeholder scheme like "tcp" for PAC evaluation
+	targetURL := &url.URL{
+		Scheme: "tcp", // Scheme for PAC evaluation logic
+		Host:   targetAddr,
 	}
-	targetURLStr := fmt.Sprintf("%s://%s", scheme, targetAddr)
-	targetURL, err := url.Parse(targetURLStr)
-	if err != nil {
-		slog.Error("Failed to parse target address into URL", "target_addr", targetAddr, "error", err)
-		return
+	// Override scheme if common ports are used, PAC might expect http/https
+	if targetPort == 80 {
+		targetURL.Scheme = "http"
+	} else if targetPort == 443 {
+		targetURL.Scheme = "https"
 	}
 
-	logCtx := slog.With("target_addr", targetAddr, "target_url", targetURLStr)
-	logCtx.Info("Handling proxied connection")
-
+	// 1. Determine Proxy using ProxyManager
 	proxyMgr := h.stateManager.GetProxyManager()
 	if proxyMgr == nil {
-		logCtx.Error("Proxy manager is not initialized")
+		logCtx.Error("ProxyManager is nil, cannot determine route")
 		return
 	}
 
-	proxyResult, err := proxyMgr.GetEffectiveProxyForURL(targetURL)
+	pacResult, err := proxyMgr.GetEffectiveProxyForURL(targetURL)
 	if err != nil {
-		logCtx.Error("Failed to determine effective proxy for target", "error", err)
+		logCtx.Error("Failed to determine proxy route via PAC/config", "target_url", targetURL.String(), "error", err)
 		return
 	}
 
-	switch proxyResult.Type {
-	case pac.ResultDirect:
-		logCtx.Error("PAC script returned DIRECT, but KernelGatekeeper (sockops) cannot bypass proxy. Closing connection.", "pac_result", "DIRECT")
-		return
+	var upstreamConn net.Conn
+	var connectErr error
 
-	case pac.ResultUnknown:
-		logCtx.Error("Error determining proxy from PAC or configuration. Closing connection.", "pac_result", "UNKNOWN/ERROR")
-		return
-
-	case pac.ResultProxy:
-		if len(proxyResult.Proxies) == 0 {
-			logCtx.Error("Proxy result indicates PROXY but list is empty. Closing connection.")
-			return
+	// 2. Establish Upstream Connection (Direct or via Proxy)
+	switch pacResult.Type {
+	case proxy.ResultDirect:
+		logCtx.Info("PAC result: DIRECT connection", "target", targetAddr)
+		dialer := net.Dialer{Timeout: targetDialTimeout}
+		upstreamConn, connectErr = dialer.DialContext(ctx, "tcp", targetAddr)
+		if connectErr != nil {
+			logCtx.Error("Failed to establish direct connection", "target", targetAddr, "error", connectErr)
+			return // Cannot proceed
 		}
-		logCtx.Info("Proxy determined for target", "proxies", proxy.UrlsToStrings(pac.UrlsFromPacResult(proxyResult)))
+		logCtx.Info("Direct connection established", "target", targetAddr)
 
-		var proxyConn net.Conn
-		var selectedProxyURL *url.URL
-		connectErr := errors.New("no proxies available or all failed")
-
-		kerbClient := h.stateManager.GetKerberosClient() // Get Kerberos client
-
-		for _, currentProxyInfo := range proxyResult.Proxies {
-			currentProxyURL, urlErr := currentProxyInfo.URL()
-			if urlErr != nil {
-				logCtx.Warn("Skipping invalid proxy info from PAC result", "proxy_info", currentProxyInfo, "error", urlErr)
-				connectErr = fmt.Errorf("invalid proxy %v: %w", currentProxyInfo, urlErr)
-				continue
-			}
-
-			logCtx.Info("Attempting connection via proxy", "proxy_url", currentProxyURL.String())
-			selectedProxyURL = currentProxyURL
-
-			proxyDialer := net.Dialer{Timeout: proxyConnectDialTimeout}
-			proxyConn, connectErr = proxyDialer.DialContext(ctx, "tcp", currentProxyURL.Host)
-			if connectErr != nil {
-				logCtx.Warn("Failed to connect to proxy server, trying next (if any)", "proxy_url", currentProxyURL.String(), "error", connectErr)
-				continue
-			}
-			logCtx.Debug("Connected to proxy server", "proxy_url", currentProxyURL.String())
-
-			connectErr = establishConnectTunnel(ctx, proxyConn, targetAddr, kerbClient) // Pass kerbClient
-			if connectErr != nil {
-				logCtx.Warn("Failed to establish CONNECT tunnel, trying next proxy (if any)", "proxy_url", currentProxyURL.String(), "error", connectErr)
-				proxyConn.Close()
-				proxyConn = nil
-				continue
-			}
-
-			logCtx.Info("CONNECT tunnel established via proxy", "proxy_url", currentProxyURL.String())
-			defer proxyConn.Close()
-			break
+	case proxy.ResultProxy:
+		if len(pacResult.Proxies) == 0 {
+			logCtx.Error("PAC result indicated PROXY but provided no proxy servers")
+			return // Cannot proceed
 		}
-
-		if proxyConn == nil || connectErr != nil {
-			logCtx.Error("Failed to establish connection through any configured/PAC-provided proxy.", "last_error", connectErr)
+		// Currently, only use the first proxy in the list
+		selectedProxyInfo := pacResult.Proxies[0]
+		selectedProxyURL := selectedProxyInfo.URL() // Convert ProxyInfo to url.URL
+		if selectedProxyURL == nil {
+			logCtx.Error("Failed to parse selected proxy info into URL", "proxy_info", selectedProxyInfo)
 			return
 		}
 
-		logCtx.Debug("Starting data relay", "selected_proxy", selectedProxyURL.String())
-		relayErr := h.relayDataBidirectionally(ctx, acceptedConn, proxyConn)
-		if relayErr != nil && !common.IsConnectionClosedErr(relayErr) && !errors.Is(relayErr, context.Canceled) && !common.IsTimeoutError(relayErr) {
-			logCtx.Warn("Data relay ended with unexpected error", "error", relayErr)
-		} else if relayErr != nil {
-			logCtx.Debug("Data relay ended", "reason", relayErr)
-		} else {
-			logCtx.Debug("Data relay completed.")
+		logCtx.Info("PAC result: PROXY connection", "target", targetAddr, "proxy", selectedProxyURL.String())
+
+		// Get Kerberos client from state manager (might be nil if init failed)
+		kerbClient := h.stateManager.GetKerberosClient()
+
+		// Establish tunnel via establishConnectTunnel
+		// Timeout for the entire CONNECT process
+		connectCtx, connectCancel := context.WithTimeout(ctx, proxyCONNECTTimeout)
+		defer connectCancel()
+
+		// establishConnectTunnel now needs the specific proxy URL
+		upstreamConn, connectErr = establishConnectTunnel(connectCtx, selectedProxyURL, targetAddr, kerbClient, logCtx)
+		if connectErr != nil {
+			logCtx.Error("Failed to establish CONNECT tunnel via proxy", "proxy", selectedProxyURL.String(), "target", targetAddr, "error", connectErr)
+			return // Cannot proceed
 		}
+		logCtx.Info("CONNECT tunnel established via proxy", "proxy", selectedProxyURL.String(), "target", targetAddr)
+
+	case proxy.ResultUnknown:
+		logCtx.Error("Could not determine proxy route (PAC returned Unknown or error)")
+		return // Cannot proceed
 
 	default:
-		logCtx.Error("Unknown proxy result type encountered after PAC evaluation", "type", proxyResult.Type)
+		logCtx.Error("Unhandled PAC result type", "type", pacResult.Type)
+		return // Cannot proceed
+	}
+
+	// Ensure upstream connection is closed if established
+	defer upstreamConn.Close()
+
+	// 3. Relay Data Bidirectionally
+	logCtx.Debug("Starting bidirectional relay")
+	relayErr := h.relayDataBidirectionally(ctx, acceptedConn, upstreamConn)
+	if relayErr != nil {
+		// Log relay error, especially if it's not just context cancellation or standard EOF
+		if !errors.Is(relayErr, context.Canceled) && !errors.Is(relayErr, io.EOF) && !common.IsConnectionClosedErr(relayErr) {
+			logCtx.Warn("Error during data relay", "error", relayErr)
+		} else {
+			logCtx.Debug("Data relay finished", "reason", relayErr)
+		}
+	} else {
+		logCtx.Debug("Data relay completed successfully")
 	}
 }
 
+// relayDataBidirectionally copies data between two connections with timeouts.
 func (h *ConnectionHandler) relayDataBidirectionally(ctx context.Context, conn1, conn2 net.Conn) error {
 	var wg sync.WaitGroup
-	errChan := make(chan error, 2)
+	errChan := make(chan error, 2) // Buffer to prevent goroutine leak on send
 
-	copyData := func(dst, src net.Conn, tag string) {
+	copyData := func(dst net.Conn, src net.Conn) {
 		defer wg.Done()
-		buf := make([]byte, 32*1024)
-		logCtx := slog.With("relay_tag", tag)
-
-		for {
-			select {
-			case <-ctx.Done():
-				logCtx.Debug("Relay cancelled by context before read")
-				errChan <- ctx.Err()
-				if tcpDst, ok := dst.(*net.TCPConn); ok {
-					tcpDst.CloseWrite()
-				}
-				if tcpSrc, ok := src.(*net.TCPConn); ok {
-					tcpSrc.CloseRead()
-				}
-				return
-			default:
-			}
-
-			readDeadline := time.Now().Add(relayCopyTimeout)
-			if err := src.SetReadDeadline(readDeadline); err != nil {
-				if !common.IsConnectionClosedErr(err) {
-					logCtx.Warn("Failed to set read deadline for relay", "error", err)
-					errChan <- fmt.Errorf("%s set read deadline failed: %w", tag, err)
-				} else {
-					errChan <- io.EOF
-				}
-				return
-			}
-
-			nr, readErr := src.Read(buf)
-			_ = src.SetReadDeadline(time.Time{})
-
-			if nr > 0 {
-				writeDeadline := time.Now().Add(relayCopyTimeout)
-				if err := dst.SetWriteDeadline(writeDeadline); err != nil {
-					if !common.IsConnectionClosedErr(err) {
-						logCtx.Warn("Failed to set write deadline for relay", "error", err)
-						errChan <- fmt.Errorf("%s set write deadline failed: %w", tag, err)
-					} else {
-						errChan <- io.EOF
-					}
-					return
-				}
-
-				nw, writeErr := dst.Write(buf[0:nr])
-				_ = dst.SetWriteDeadline(time.Time{})
-
-				if writeErr != nil {
-					if errors.Is(writeErr, context.Canceled) || errors.Is(writeErr, context.DeadlineExceeded) {
-						logCtx.Debug("Relay cancelled by context during write")
-						errChan <- writeErr
-					} else {
-						errChan <- fmt.Errorf("%s write failed: %w", tag, writeErr)
-					}
-					if tcpSrc, ok := src.(*net.TCPConn); ok {
-						tcpSrc.CloseRead()
-					}
-					return
-				}
-				if nr != nw {
-					errChan <- fmt.Errorf("%s short write: %d != %d", tag, nw, nr)
-					if tcpSrc, ok := src.(*net.TCPConn); ok {
-						tcpSrc.CloseRead()
-					}
-					return
-				}
-			}
-
-			if readErr != nil {
-				if errors.Is(readErr, io.EOF) {
-					logCtx.Debug("Relay source closed (EOF)")
-					if tcpDst, ok := dst.(*net.TCPConn); ok {
-						tcpDst.CloseWrite()
-					}
-					errChan <- nil
-				} else if common.IsTimeoutError(readErr) {
-					logCtx.Warn("Relay inactivity timeout", "timeout", relayCopyTimeout)
-					errChan <- fmt.Errorf("%s inactivity timeout after %s: %w", tag, relayCopyTimeout, readErr)
-				} else if common.IsConnectionClosedErr(readErr) {
-					logCtx.Debug("Relay source connection closed during read", "error", readErr)
-					errChan <- nil
-				} else if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
-					logCtx.Debug("Relay cancelled by context during read")
-					errChan <- readErr
-				} else {
-					errChan <- fmt.Errorf("%s read failed: %w", tag, readErr)
-				}
-				return
+		// Apply deadline for the copy operation
+		// Set deadline based on context or fixed timeout? Let's use fixed for simplicity.
+		// If context is cancelled, reads/writes should fail anyway.
+		copyTimeout := relayCopyTimeout
+		if dl, ok := ctx.Deadline(); ok {
+			copyTimeout = time.Until(dl)
+			if copyTimeout < 0 {
+				copyTimeout = 0 // Expired already
 			}
 		}
+		if copyTimeout <= 0 {
+			errChan <- ctx.Err() // Context already cancelled or expired
+			return
+		}
+
+		// Set read deadline on the source connection for the copy duration
+		if err := src.SetReadDeadline(time.Now().Add(copyTimeout)); err != nil {
+			slog.Warn("Failed to set read deadline for relay", "error", err)
+			// Proceed without deadline? Or fail? Let's proceed.
+		}
+		defer src.SetReadDeadline(time.Time{}) // Clear deadline on exit
+
+		// Perform the copy
+		_, err := io.Copy(dst, src)
+
+		// Check context error after copy finishes or errors out
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			errChan <- ctxErr // Prioritize context cancellation error
+			return
+		}
+		// Send the io.Copy error (could be nil or EOF)
+		errChan <- err
 	}
 
 	wg.Add(2)
-	go copyData(conn1, conn2, "proxy->client(bpf)")
-	go copyData(conn2, conn1, "client(bpf)->proxy")
+	go copyData(conn1, conn2)
+	go copyData(conn2, conn1)
 
-	wg.Wait()
-	close(errChan)
-
+	// Wait for one side to finish or error
 	var firstError error
-	for err := range errChan {
-		if err != nil && firstError == nil {
-			firstError = err
-		}
+	select {
+	case err := <-errChan:
+		firstError = err
+	case <-ctx.Done():
+		firstError = ctx.Err()
 	}
 
-	if firstError != nil {
-		if !errors.Is(firstError, io.EOF) && !errors.Is(firstError, context.Canceled) && !common.IsConnectionClosedErr(firstError) {
-			slog.Warn("Relay finished with error", "error", firstError)
-		} else {
-			slog.Debug("Relay finished", "reason", firstError)
+	// Signal the other goroutine to stop by closing connections
+	conn1.Close()
+	conn2.Close()
+
+	// Wait for the second goroutine to finish
+	wg.Wait()
+
+	// Collect potential second error (usually EOF or closed connection error)
+	select {
+	case err := <-errChan:
+		// Log second error if it's different and not expected close/EOF error
+		if firstError == nil || !errors.Is(err, io.EOF) && !common.IsConnectionClosedErr(err) && !errors.Is(err, context.Canceled) {
+			slog.Debug("Second relay goroutine finished", "error", err)
+			if firstError == nil {
+				firstError = err // Capture second error if first was nil
+			}
 		}
-		return firstError
+	default:
+		// Channel empty, second goroutine finished cleanly after Close()
 	}
 
-	slog.Debug("Relay finished successfully.")
-	return nil
+	// Return the first significant error encountered
+	return firstError
 }
