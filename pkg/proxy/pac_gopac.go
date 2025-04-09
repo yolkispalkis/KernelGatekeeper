@@ -104,8 +104,8 @@ func (p *PacParser) createPacParserInstance(pacFileContent []byte) (*gopac.Parse
 
 	pacString := string(pacFileContent)
 
-	parser, err := gopac.New(pacString)
-
+	// Use NewParser instead of New
+	parser, err := gopac.NewParser(pacString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse PAC script: %w", err)
 	}
@@ -403,15 +403,13 @@ func decodeBytesWithCharset(rawBytes []byte, contentTypeHeader string, charsetOv
 
 	if charsetOverride == "" && (contentTypeHeader == "" || !strings.Contains(strings.ToLower(contentTypeHeader), "charset=")) {
 
-		detectedEncodingName, certain, err := charset.DetermineEncoding(rawBytes, "")
+		// Correctly capture encoding, name, and certainty. charset.DetermineEncoding does not return an error.
+		_, detectedName, certain := charset.DetermineEncoding(rawBytes, "")
 
-		if err == nil && certain {
-
-			encodingName = detectedEncodingName
+		if certain { // Check the boolean directly
+			encodingName = detectedName // Assign the detected name (string)
 			slog.Debug("Detected charset from BOM with certainty", "charset", encodingName)
 
-		} else if err != nil {
-			slog.Warn("Error detecting encoding from BOM, assuming UTF-8", "error", err)
 		} else {
 			slog.Debug("No charset override, Content-Type, or certain BOM found. Assuming UTF-8.")
 		}

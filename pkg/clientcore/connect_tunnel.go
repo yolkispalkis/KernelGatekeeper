@@ -83,12 +83,13 @@ func establishConnectTunnel(ctx context.Context, proxyURL *url.URL, targetAddr s
 
 			spn := ""
 
+			// spnego.SetSPNEGOHeader requires the base client.Client
 			spnegoClient := spnego.NewClient(krbClient.Gokrb5Client(), nil, spn)
-
-			err = spnegoClient.SetSPNEGOHeader(connectReq, "")
-			if err != nil {
+			baseKrbClient := krbClient.Gokrb5Client() // Get the underlying gokrb5 client.Client
+			if baseKrbClient == nil {
+				lastErr = errors.New("failed to get underlying Kerberos client for SPNEGO")
+			} else if err = spnego.SetSPNEGOHeader(baseKrbClient, connectReq, spn); err != nil {
 				lastErr = fmt.Errorf("failed to set SPNEGO header: %w", err)
-				logCtx.Error(lastErr.Error())
 				break
 			}
 			logCtx.Debug("Added Proxy-Authorization: Negotiate header")
