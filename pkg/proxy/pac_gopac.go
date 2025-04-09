@@ -104,8 +104,9 @@ func (p *PacParser) createPacParserInstance(pacFileContent []byte) (*gopac.Parse
 
 	pacString := string(pacFileContent)
 
-	// Use NewParser instead of New
-	parser, err := gopac.NewParser(pacString)
+	// Use New instead of NewParser
+	parser := new(gopac.Parser)
+	err := parser.ParseBytes([]byte(pacString))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse PAC script: %w", err)
 	}

@@ -43,9 +43,9 @@ func (p ProxyInfo) URL() *url.URL {
 	return u
 }
 
-// reflectDeepEqualPacResult compares two PacResult structs for deep equality.
+// ReflectDeepEqualPacResult compares two PacResult structs for deep equality.
 // Useful for detecting changes in effective proxy settings.
-func reflectDeepEqualPacResult(a, b PacResult) bool {
+func ReflectDeepEqualPacResult(a, b PacResult) bool {
 	if a.Type != b.Type {
 		return false
 	}

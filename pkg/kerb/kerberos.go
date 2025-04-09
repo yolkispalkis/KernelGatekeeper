@@ -127,13 +127,12 @@ func (k *KerberosClient) initializeFromCCache() error {
 	// Success - valid credentials loaded
 	k.client = cl
 	k.isInitialized = true
-	// Use actual TGT expiry time
-	// Access the TGT via client.Credentials.TGT (TGT is exported in gokrb5/v8)
+	// Use actual credential end time
+	// Use the EndTime method provided by the Credentials struct
 	var ok bool
-	// Check path: k.client -> Credentials (*credentials.Credentials) -> TGT (*ticket.Ticket) -> EndTime (time.Time)
-	if k.client != nil && k.client.Credentials != nil && k.client.Credentials.TGT != nil && !k.client.Credentials.TGT.EndTime.IsZero() {
-		k.ticketExpiry = k.client.Credentials.TGT.EndTime
-		slog.Debug("Using actual TGT expiry time from ccache", "expiry", k.ticketExpiry.Format(time.RFC3339))
+	if k.client != nil && k.client.Credentials != nil && !k.client.Credentials.Expired() {
+		k.ticketExpiry = k.client.Credentials.ValidUntil()
+		slog.Debug("Using actual credential end time from ccache", "expiry", k.ticketExpiry.Format(time.RFC3339))
 		ok = true // Indicate we successfully got the expiry
 	} else {
 		ok = false // Indicate we couldn't get the specific TGT expiry
