@@ -1,4 +1,3 @@
-<file path="pkg/config/config.go">
 package config
 
 import (
@@ -46,7 +45,7 @@ type ProxyConfig struct {
 	URL                 string `mapstructure:"url"`                 // URL for static proxy (http://proxy:port)
 	WpadURL             string `mapstructure:"wpadUrl"`             // URL for PAC/WPAD discovery (http://wpad/wpad.dat or file:///...)
 	ConnectionTimeout   int    `mapstructure:"connectionTimeout"`   // Timeout for connecting to the proxy (seconds)
-	RequestTimeout      int    `mapstructure:"requestTimeout"`    // Timeout for the CONNECT request (seconds)
+	RequestTimeout      int    `mapstructure:"requestTimeout"`      // Timeout for the CONNECT request (seconds)
 	MaxRetries          int    `mapstructure:"maxRetries"`          // Max retries for CONNECT request (currently unused in tunnel logic)
 	PacCharset          string `mapstructure:"pacCharset"`          // Optional: Charset of the PAC file (e.g., "windows-1251")
 	PacExecutionTimeout int    `mapstructure:"pacExecutionTimeout"` // Timeout for FindProxyForURL execution (seconds) - Handled by gopac? Check docs.
@@ -61,7 +60,7 @@ type KerberosConfig struct {
 }
 
 type EBPFConfig struct {
-	Interface               string   `mapstructure:"interface"` // Primarily informational in sockops mode
+	Interface               string   `mapstructure:"interface"`   // Primarily informational in sockops mode
 	ProgramPath             string   `mapstructure:"programPath"` // Usually embedded, path optional
 	TargetPorts             []int    `mapstructure:"targetPorts"`
 	LoadMode                string   `mapstructure:"loadMode"` // Should be "sockops"
@@ -234,5 +233,3 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("shutdownTimeout", DefaultShutdownTimeout) // Store as int initially
 	v.SetDefault("socketPath", DefaultSocketPath)
 }
-
-</file>
