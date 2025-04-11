@@ -1,11 +1,10 @@
-// FILE: pkg/clientcore/listener.go
 package clientcore
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
-	"strconv"
 
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 )
@@ -83,13 +82,9 @@ func (l *LocalListener) IP() net.IP {
 }
 
 func ParseListenerIP(ipStr string) (uint32, error) {
-	ip := net.ParseIP(ipStr)
+	ip := net.ParseIP(ipStr).To4()
 	if ip == nil {
-		return 0, fmt.Errorf("invalid IP address string: %s", ipStr)
-	}
-	ipv4 := ip.To4()
-	if ipv4 == nil {
 		return 0, fmt.Errorf("IP address is not IPv4: %s", ipStr)
 	}
-	return strconv.ParseUint(fmt.Sprintf("%d", ipv4[0]<<24|ipv4[1]<<16|ipv4[2]<<8|ipv4[3]), 10, 32)
+	return binary.BigEndian.Uint32(ip), nil
 }

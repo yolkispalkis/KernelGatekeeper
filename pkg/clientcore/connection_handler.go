@@ -1,8 +1,8 @@
-// FILE: pkg/clientcore/connection_handler.go
 package clientcore
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -125,13 +125,14 @@ func (h *ConnectionHandler) getOriginalDestination(conn net.Conn) (net.IP, uint1
 	}
 
 	ip := net.IPv4(originalDst.Addr[0], originalDst.Addr[1], originalDst.Addr[2], originalDst.Addr[3])
-	port := (uint16(originalDst.Port[0]) << 8) | uint16(originalDst.Port[1])
+	portBytes := make([]byte, 2)
+	common.NativeEndian.PutUint16(portBytes, originalDst.Port)
+	port := binary.BigEndian.Uint16(portBytes)
 
 	return ip, port, nil
 }
 
 func (h *ConnectionHandler) handleAcceptedConnection(ctx context.Context, acceptedConn net.Conn, targetHost string, targetPort uint16, logCtx *slog.Logger) {
-
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(int(targetPort)))
 
 	targetURL := &url.URL{
@@ -212,7 +213,6 @@ func (h *ConnectionHandler) handleAcceptedConnection(ctx context.Context, accept
 	logCtx.Debug("Starting bidirectional relay")
 	relayErr := h.relayDataBidirectionally(ctx, acceptedConn, upstreamConn)
 	if relayErr != nil {
-
 		if !errors.Is(relayErr, context.Canceled) && !errors.Is(relayErr, io.EOF) && !common.IsConnectionClosedErr(relayErr) {
 			logCtx.Warn("Error during data relay", "error", relayErr)
 		} else {
@@ -244,7 +244,6 @@ func (h *ConnectionHandler) relayDataBidirectionally(ctx context.Context, conn1,
 
 		if err := src.SetReadDeadline(time.Now().Add(copyTimeout)); err != nil {
 			slog.Warn("Failed to set read deadline for relay", "error", err)
-
 		}
 		defer src.SetReadDeadline(time.Time{})
 
@@ -277,7 +276,6 @@ func (h *ConnectionHandler) relayDataBidirectionally(ctx context.Context, conn1,
 
 	select {
 	case err := <-errChan:
-
 		if firstError == nil || !errors.Is(err, io.EOF) && !common.IsConnectionClosedErr(err) && !errors.Is(err, context.Canceled) {
 			slog.Debug("Second relay goroutine finished", "error", err)
 			if firstError == nil {
@@ -285,7 +283,6 @@ func (h *ConnectionHandler) relayDataBidirectionally(ctx context.Context, conn1,
 			}
 		}
 	default:
-
 	}
 
 	return firstError

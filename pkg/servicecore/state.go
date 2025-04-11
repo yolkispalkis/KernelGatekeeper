@@ -1,4 +1,3 @@
-// FILE: pkg/servicecore/state.go
 package servicecore
 
 import (
@@ -13,7 +12,7 @@ import (
 	"time"
 
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/bpfutil"
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/clientcore"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/clientcore" // Correct placement
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/ebpf"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/logging"
@@ -57,7 +56,6 @@ func NewStateManager(configPath string, initialCfg *config.Config) (*StateManage
 	var bpfErr error
 	sm.bpfManager, bpfErr = ebpf.NewBPFManager(&initialCfg.EBPF, listenerIP, listenerPort)
 	if bpfErr != nil {
-
 		return nil, fmt.Errorf("failed to initialize BPF manager: %w", bpfErr)
 	}
 	slog.Info("BPF Manager initialized successfully.")
@@ -71,9 +69,7 @@ func (sm *StateManager) StartBackgroundTasks(ctx context.Context) error {
 	slog.Info("Starting service background tasks...")
 
 	if sm.bpfManager != nil {
-
 		if err := sm.bpfManager.Start(ctx, &sm.wg); err != nil {
-
 			errFatal := fmt.Errorf("FATAL: Failed to start BPF manager core tasks: %w", err)
 			sm.fatalErrChan <- errFatal
 			return errFatal
@@ -104,12 +100,9 @@ func (sm *StateManager) GetConfig() *config.Config {
 		slog.Error("GetConfig called when configuration pointer was nil!")
 		return &config.Config{}
 	}
-
 	newCfg := *cfg
-
 	newCfg.EBPF.TargetPorts = append([]int(nil), cfg.EBPF.TargetPorts...)
 	newCfg.EBPF.Excluded = append([]string(nil), cfg.EBPF.Excluded...)
-
 	return &newCfg
 }
 
@@ -163,21 +156,18 @@ func (sm *StateManager) ReloadConfig() error {
 		if sm.bpfManager != nil {
 			if err := sm.bpfManager.UpdateTargetPorts(newCfgPtr.EBPF.TargetPorts); err != nil {
 				slog.Error("Failed to update target ports in BPF map on config reload", "error", err)
-
 				newCfgPtr.EBPF.TargetPorts = oldCfg.EBPF.TargetPorts
 			} else {
 				slog.Info("Target ports successfully updated in BPF map.")
 			}
 		} else {
 			slog.Warn("Cannot update target ports: BPF manager not initialized.")
-
 			newCfgPtr.EBPF.TargetPorts = oldCfg.EBPF.TargetPorts
 		}
 	}
 
 	if oldCfg.EBPF.StatsInterval != newCfgPtr.EBPF.StatsInterval {
 		slog.Warn("Config reload detected change in 'ebpf.stats_interval', requires service restart to take effect for BPF internal stats.")
-
 	}
 	if oldCfg.SocketPath != newCfgPtr.SocketPath {
 		slog.Warn("Config reload detected change in 'socket_path', requires service restart to take effect.")
@@ -236,7 +226,6 @@ func (sm *StateManager) Shutdown(ctx context.Context) {
 		}
 
 		slog.Info("Shutdown sequence complete. Waiting for remaining tasks via main WaitGroup...")
-
 	})
 }
 

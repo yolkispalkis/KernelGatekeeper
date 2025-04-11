@@ -1,9 +1,4 @@
-// FILE: pkg/ebpf/manager.go
 package ebpf
-
-//go:generate go run -tags linux github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpf -cflags "-O2 -g -Wall -Werror -DDEBUG -I./bpf -I/usr/include/bpf -I/usr/include -I/usr/include/x86_64-linux-gnu" bpf_connect4 ./bpf/connect4.c -- -I./bpf
-//go:generate go run -tags linux github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpf -cflags "-O2 -g -Wall -Werror -DDEBUG -I./bpf -I/usr/include/bpf -I/usr/include -I/usr/include/x86_64-linux-gnu" bpf_sockops ./bpf/sockops.c -- -I./bpf
-//go:generate go run -tags linux github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpf -cflags "-O2 -g -Wall -Werror -DDEBUG -I./bpf -I/usr/include/bpf -I/usr/include -I/usr/include/x86_64-linux-gnu" bpf_getsockopt ./bpf/getsockopt.c -- -I./bpf
 
 import (
 	"context"
@@ -18,7 +13,6 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-
 	"github.com/cilium/ebpf/rlimit"
 
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
@@ -88,15 +82,17 @@ func (o *bpfObjects) Close() error {
 }
 
 type BPFManager struct {
-	cfg            *config.EBPFConfig
-	objs           bpfObjects
-	connect4Link   link.Link
-	sockopsLink    link.Link
-	getsockoptLink link.Link
-	stopOnce       sync.Once
-	stopChan       chan struct{}
-	statsCache     StatsCache
-	mu             sync.Mutex
+	cfg                 *config.EBPFConfig
+	objs                bpfObjects
+	connect4Link        link.Link
+	sockopsLink         link.Link
+	getsockoptLink      link.Link
+	stopOnce            sync.Once
+	stopChan            chan struct{}
+	statsCache          StatsCache
+	mu                  sync.Mutex
+	notificationReader  *ringbuf.Reader             // Added field
+	notificationChannel chan ebpf.NotificationTuple // Added field
 }
 
 func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint16) (*BPFManager, error) {
@@ -115,9 +111,9 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 		},
 	}
 
-	opts.MapSpecReplacements = map[string]ebpf.MapSpec{
-		"kg_orig_dest":      {MaxEntries: uint32(cfg.OrigDestMapSize)},
-		"kg_port_to_cookie": {MaxEntries: uint32(cfg.PortMapSize)},
+	opts.MapReplacements = map[string]*ebpf.MapSpec{
+		"kg_orig_dest":      {Name: "kg_orig_dest", MaxEntries: uint32(cfg.OrigDestMapSize)},
+		"kg_port_to_cookie": {Name: "kg_port_to_cookie", MaxEntries: uint32(cfg.PortMapSize)},
 	}
 
 	specConnect4, err := loadBpf_connect4()
@@ -178,9 +174,10 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 	objs.KernelgatekeeperGetsockopt = objs.bpf_getsockoptObjects.KernelgatekeeperGetsockopt
 
 	manager := &BPFManager{
-		cfg:      cfg,
-		objs:     objs,
-		stopChan: make(chan struct{}),
+		cfg:                 cfg,
+		objs:                objs,
+		stopChan:            make(chan struct{}),
+		notificationChannel: make(chan NotificationTuple, cfg.NotificationChannelSize), // Initialize channel
 	}
 	manager.statsCache.lastStatsTime = time.Now()
 
@@ -189,6 +186,19 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 		objs.KgConfig == nil || objs.KgStats == nil {
 		manager.objs.Close()
 		return nil, errors.New("one or more required BPF programs or maps failed to load or assign after merging objects")
+	}
+
+	// Initialize ring buffer reader if the map exists
+	if objs.KgNotifRb != nil {
+		rd, err := ringbuf.NewReader(objs.KgNotifRb)
+		if err != nil {
+			manager.Close()
+			return nil, fmt.Errorf("failed to create ring buffer reader: %w", err)
+		}
+		manager.notificationReader = rd
+		slog.Info("BPF ring buffer reader initialized.")
+	} else {
+		slog.Warn("BPF map 'kg_notif_rb' not found, notification reader will not be started.")
 	}
 
 	if err := manager.UpdateConfigMap(listenerIP, listenerPort); err != nil {
@@ -275,6 +285,20 @@ func (m *BPFManager) Start(ctx context.Context, wg *sync.WaitGroup) error {
 		m.statsUpdater(ctx)
 		slog.Info("BPF statistics updater task stopped.")
 	}()
+
+	// Start the ring buffer reader only if it was initialized
+	if m.notificationReader != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slog.Info("BPF ring buffer notification reader task started.")
+			m.readNotifications(ctx)
+			slog.Info("BPF ring buffer notification reader task stopped.")
+		}()
+	} else {
+		slog.Warn("BPF notification reader task not started (reader not initialized).")
+	}
+
 	return nil
 }
 
@@ -288,6 +312,18 @@ func (m *BPFManager) Close() error {
 		case <-m.stopChan:
 		default:
 			close(m.stopChan)
+		}
+
+		// Close the ring buffer reader first
+		if m.notificationReader != nil {
+			slog.Debug("Closing BPF ring buffer reader...")
+			if err := m.notificationReader.Close(); err != nil {
+				slog.Error("Error closing BPF ring buffer reader", "error", err)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("ring buffer reader close: %w", err)
+				}
+			}
+			m.notificationReader = nil
 		}
 
 		if m.getsockoptLink != nil {
@@ -330,7 +366,19 @@ func (m *BPFManager) Close() error {
 				firstErr = fmt.Errorf("%w; bpf objects close: %w", firstErr, err)
 			}
 		}
+
+		// Close the notification channel
+		if m.notificationChannel != nil {
+			close(m.notificationChannel)
+			m.notificationChannel = nil
+		}
+
 		slog.Info("BPF Manager closed.")
 	})
 	return firstErr
+}
+
+// GetNotificationChannel returns the channel for receiving BPF notifications.
+func (m *BPFManager) GetNotificationChannel() <-chan NotificationTuple {
+	return m.notificationChannel
 }
