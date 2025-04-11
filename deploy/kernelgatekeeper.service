@@ -15,6 +15,7 @@ CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 NoNewPrivileges=true
 ProtectHome=true
+ProtectProc=no
 PrivateTmp=true
 PrivateDevices=true
 ReadWritePaths=/run /var/log/kernelgatekeeper.log /etc/kernelgatekeeper/config.yaml
