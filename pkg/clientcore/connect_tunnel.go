@@ -1,3 +1,4 @@
+// FILE: pkg/clientcore/connect_tunnel.go
 package clientcore
 
 import (
@@ -83,21 +84,17 @@ func establishConnectTunnel(ctx context.Context, proxyURL *url.URL, targetAddr s
 
 			spn := ""
 
-			// spnego.SetSPNEGOHeader requires the base client.Client
-			// The spnegoClient variable is no longer needed as we use the package function.
-			// spnegoClient := spnego.NewClient(krbClient.Gokrb5Client(), nil, spn) // Removed unused variable
-			baseKrbClient := krbClient.Gokrb5Client() // Get the underlying gokrb5 client.Client
+			baseKrbClient := krbClient.Gokrb5Client()
 			if baseKrbClient == nil {
 				lastErr = errors.New("failed to get underlying Kerberos client for SPNEGO")
-				// No need to break here, the next check handles the error
+
 			} else if err = spnego.SetSPNEGOHeader(baseKrbClient, connectReq, spn); err != nil {
 				lastErr = fmt.Errorf("failed to set SPNEGO header: %w", err)
-				// No need to break here, the next check handles the error
+
 			}
 
-			// Check if an error occurred during SPNEGO header setting
 			if lastErr != nil {
-				logCtx.Error(lastErr.Error()) // Log the error before breaking
+				logCtx.Error(lastErr.Error())
 				break
 			}
 

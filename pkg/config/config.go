@@ -1,10 +1,11 @@
+// FILE: pkg/config/config.go
 package config
 
 import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url" // Import net/url
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -14,94 +15,90 @@ import (
 
 const (
 	DefaultProxyType              = "http"
-	DefaultProxyConnectionTimeout = 10 // seconds
-	DefaultProxyRequestTimeout    = 30 // seconds
+	DefaultProxyConnectionTimeout = 10
+	DefaultProxyRequestTimeout    = 30
 	DefaultProxyMaxRetries        = 3
-	DefaultPacFileTTL             = 60 // seconds
-	DefaultPacExecTimeout         = 5  // seconds
-	DefaultEBPFInterface          = "eth0"
-	DefaultEBPFLoadMode           = "sockops"
-	DefaultEBPFAllowDynamicPorts  = true
+	DefaultPacFileTTL             = 60
+	DefaultPacExecTimeout         = 5
+	DefaultEBPFLoadMode           = "getsockopt"
 	DefaultEBPFStatsInterval      = 15
-	DefaultEBPFNotifChanSize      = 4096
 	DefaultLogLevel               = "info"
 	DefaultLogPath                = "/var/log/kernelgatekeeper.log"
 	DefaultShutdownTimeout        = 30
 	DefaultSocketPath             = "/var/run/kernelgatekeeper.sock"
+	DefaultClientListenerPort     = 3129
+	DefaultEBPFMapSize            = 8192
 )
 
 type Config struct {
-	Proxy           ProxyConfig    `mapstructure:"proxy"`
-	Kerberos        KerberosConfig `mapstructure:"kerberos"`
-	EBPF            EBPFConfig     `mapstructure:"ebpf"`
-	LogLevel        string         `mapstructure:"logLevel"`
-	LogPath         string         `mapstructure:"logPath"`
-	ShutdownTimeout time.Duration  `mapstructure:"shutdownTimeout"` // Use time.Duration directly
-	SocketPath      string         `mapstructure:"socketPath"`
+	Proxy              ProxyConfig    `mapstructure:"proxy"`
+	Kerberos           KerberosConfig `mapstructure:"kerberos"`
+	EBPF               EBPFConfig     `mapstructure:"ebpf"`
+	LogLevel           string         `mapstructure:"logLevel"`
+	LogPath            string         `mapstructure:"logPath"`
+	ShutdownTimeout    time.Duration  `mapstructure:"shutdownTimeout"`
+	SocketPath         string         `mapstructure:"socketPath"`
+	ClientListenerPort uint16         `mapstructure:"clientListenerPort"`
 }
 
 type ProxyConfig struct {
-	Type                string `mapstructure:"type"`                // "http", "https", "wpad", "none"
-	URL                 string `mapstructure:"url"`                 // URL for static proxy (http://proxy:port)
-	WpadURL             string `mapstructure:"wpadUrl"`             // URL for PAC/WPAD discovery (http://wpad/wpad.dat or file:///...)
-	ConnectionTimeout   int    `mapstructure:"connectionTimeout"`   // Timeout for connecting to the proxy (seconds)
-	RequestTimeout      int    `mapstructure:"requestTimeout"`      // Timeout for the CONNECT request (seconds)
-	MaxRetries          int    `mapstructure:"maxRetries"`          // Max retries for CONNECT request (currently unused in tunnel logic)
-	PacCharset          string `mapstructure:"pacCharset"`          // Optional: Charset of the PAC file (e.g., "windows-1251")
-	PacExecutionTimeout int    `mapstructure:"pacExecutionTimeout"` // Timeout for FindProxyForURL execution (seconds) - Handled by gopac? Check docs.
-	PacFileTTL          int    `mapstructure:"pacFileTtl"`          // <<< Добавлено: TTL for caching the PAC file (seconds)
+	Type                string `mapstructure:"type"`
+	URL                 string `mapstructure:"url"`
+	WpadURL             string `mapstructure:"wpadUrl"`
+	ConnectionTimeout   int    `mapstructure:"connectionTimeout"`
+	RequestTimeout      int    `mapstructure:"requestTimeout"`
+	MaxRetries          int    `mapstructure:"maxRetries"`
+	PacCharset          string `mapstructure:"pacCharset"`
+	PacExecutionTimeout int    `mapstructure:"pacExecutionTimeout"`
+	PacFileTTL          int    `mapstructure:"pacFileTtl"`
 }
 
-// KerberosConfig for client mode primarily uses CachePath. Realm/KDCHost are optional.
 type KerberosConfig struct {
 	Realm     string `mapstructure:"realm"`
 	KDCHost   string `mapstructure:"kdcHost"`
-	CachePath string `mapstructure:"cachePath"` // Path pattern for ccache (optional)
+	CachePath string `mapstructure:"cachePath"`
 }
 
 type EBPFConfig struct {
-	Interface               string   `mapstructure:"interface"`   // Primarily informational in sockops mode
-	ProgramPath             string   `mapstructure:"programPath"` // Usually embedded, path optional
-	TargetPorts             []int    `mapstructure:"targetPorts"`
-	LoadMode                string   `mapstructure:"loadMode"` // Should be "sockops"
-	AllowDynamicPorts       bool     `mapstructure:"allowDynamicPorts"`
-	StatsInterval           int      `mapstructure:"statsInterval"`           // BPF map stats update interval (seconds)
-	NotificationChannelSize int      `mapstructure:"notificationChannelSize"` // Size of ring buffer -> userspace channel
-	Excluded                []string `mapstructure:"excluded"`                // Full paths to executables to exclude
+	ProgramPath     string   `mapstructure:"programPath"`
+	TargetPorts     []int    `mapstructure:"targetPorts"`
+	LoadMode        string   `mapstructure:"loadMode"`
+	StatsInterval   int      `mapstructure:"statsInterval"`
+	Excluded        []string `mapstructure:"excluded"`
+	OrigDestMapSize int      `mapstructure:"origDestMapSize"`
+	PortMapSize     int      `mapstructure:"portMapSize"`
 }
 
 func LoadConfig(configPath string) (*Config, error) {
 	v := viper.New()
 	if configPath != "" {
 		v.SetConfigFile(configPath)
-		v.SetConfigType(filepath.Ext(configPath)[1:]) // e.g., "yaml"
+		v.SetConfigType(filepath.Ext(configPath)[1:])
 	} else {
-		// Default locations if no path provided
+
 		v.AddConfigPath("/etc/kernelgatekeeper/")
-		v.AddConfigPath("$HOME/.config/kernelgatekeeper") // User-specific config
+		v.AddConfigPath("$HOME/.config/kernelgatekeeper")
 		v.AddConfigPath(".")
-		v.SetConfigName("config") // name of config file (without extension)
+		v.SetConfigName("config")
 		v.SetConfigType("yaml")
 	}
 
-	// Set default values
 	setDefaults(v)
 
-	// Read environment variables (optional)
-	v.SetEnvPrefix("KG") // e.g., KG_LOGLEVEL=debug
+	v.SetEnvPrefix("KG")
 	v.AutomaticEnv()
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	if err := v.ReadInConfig(); err != nil {
 		var configFileNotFoundError viper.ConfigFileNotFoundError
 		if errors.As(err, &configFileNotFoundError) && configPath == "" {
-			// Config file not found in default locations, proceed with defaults only
+
 			slog.Warn("Configuration file not found in default locations, using defaults and environment variables.")
 		} else if errors.As(err, &configFileNotFoundError) && configPath != "" {
-			// Specific config file path provided but not found
+
 			return nil, fmt.Errorf("configuration file not found at specified path %s: %w", configPath, err)
 		} else {
-			// Some other error reading the config file
+
 			return nil, fmt.Errorf("error reading configuration file %s: %w", v.ConfigFileUsed(), err)
 		}
 	} else {
@@ -109,15 +106,13 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 
 	var config Config
-	// Unmarshal the config
+
 	if err := v.Unmarshal(&config); err != nil {
 		return nil, fmt.Errorf("error unmarshalling configuration: %w", err)
 	}
 
-	// Convert shutdown timeout from seconds (int) to time.Duration
 	config.ShutdownTimeout = time.Duration(v.GetInt("shutdownTimeout")) * time.Second
 
-	// Validate the loaded configuration
 	if err := validateConfig(&config); err != nil {
 		return nil, fmt.Errorf("configuration validation failed: %w", err)
 	}
@@ -126,7 +121,7 @@ func LoadConfig(configPath string) (*Config, error) {
 }
 
 func validateConfig(cfg *Config) error {
-	// Proxy validation
+
 	validProxyTypes := map[string]bool{"http": true, "https": true, "wpad": true, "none": true}
 	if !validProxyTypes[strings.ToLower(cfg.Proxy.Type)] {
 		return fmt.Errorf("invalid proxy.type: '%s', must be one of: http, https, wpad, none", cfg.Proxy.Type)
@@ -144,7 +139,7 @@ func validateConfig(cfg *Config) error {
 		if cfg.Proxy.WpadURL == "" {
 			return errors.New("proxy.wpadUrl is required when proxy.type is 'wpad'")
 		}
-		// Allow file:// or http(s)://
+
 		u, err := url.Parse(cfg.Proxy.WpadURL)
 		if err != nil {
 			return fmt.Errorf("invalid proxy.wpadUrl: %w", err)
@@ -161,13 +156,9 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.Proxy.PacFileTTL <= 0 && cfg.Proxy.Type == "wpad" {
 		slog.Warn("proxy.pacFileTtl is not positive, using default", "default", DefaultPacFileTTL)
-		cfg.Proxy.PacFileTTL = DefaultPacFileTTL // Apply default if invalid
+		cfg.Proxy.PacFileTTL = DefaultPacFileTTL
 	}
-	// PacExecutionTimeout validation? gopac might handle its own timeout.
 
-	// Kerberos validation (minimal for client)
-
-	// EBPF validation
 	if len(cfg.EBPF.TargetPorts) == 0 {
 		slog.Warn("ebpf.targetPorts is empty, no connections will be proxied by default")
 	}
@@ -176,34 +167,38 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf("invalid port %d in ebpf.targetPorts, must be between 1 and 65535", port)
 		}
 	}
-	if strings.ToLower(cfg.EBPF.LoadMode) != "sockops" {
-		return fmt.Errorf("invalid ebpf.loadMode: '%s', currently only 'sockops' is supported", cfg.EBPF.LoadMode)
+	if strings.ToLower(cfg.EBPF.LoadMode) != "getsockopt" {
+		return fmt.Errorf("invalid ebpf.loadMode: '%s', currently only 'getsockopt' is supported", cfg.EBPF.LoadMode)
 	}
 	if cfg.EBPF.StatsInterval <= 0 {
 		slog.Warn("ebpf.statsInterval is not positive, using default", "default", DefaultEBPFStatsInterval)
 		cfg.EBPF.StatsInterval = DefaultEBPFStatsInterval
 	}
-	if cfg.EBPF.NotificationChannelSize <= 0 {
-		slog.Warn("ebpf.notificationChannelSize is not positive, using default", "default", DefaultEBPFNotifChanSize)
-		cfg.EBPF.NotificationChannelSize = DefaultEBPFNotifChanSize
+	if cfg.EBPF.OrigDestMapSize <= 0 {
+		slog.Warn("ebpf.origDestMapSize is not positive, using default", "default", DefaultEBPFMapSize)
+		cfg.EBPF.OrigDestMapSize = DefaultEBPFMapSize
 	}
-	// Validate excluded paths are absolute?
+	if cfg.EBPF.PortMapSize <= 0 {
+		slog.Warn("ebpf.portMapSize is not positive, using default", "default", DefaultEBPFMapSize)
+		cfg.EBPF.PortMapSize = DefaultEBPFMapSize
+	}
 
-	// Logging validation
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLogLevels[strings.ToLower(cfg.LogLevel)] {
 		slog.Warn("Invalid logLevel in config, using default", "configured", cfg.LogLevel, "default", DefaultLogLevel)
 		cfg.LogLevel = DefaultLogLevel
 	}
-	// LogPath validation? Check if writable? Defer to logging setup.
 
-	// Other validation
 	if cfg.ShutdownTimeout <= 0 {
 		slog.Warn("shutdownTimeout must be positive, using default", "default", DefaultShutdownTimeout)
 		cfg.ShutdownTimeout = time.Duration(DefaultShutdownTimeout) * time.Second
 	}
 	if cfg.SocketPath == "" {
 		return errors.New("socketPath cannot be empty")
+	}
+	if cfg.ClientListenerPort == 0 {
+		slog.Warn("clientListenerPort is not configured or zero, using default", "default", DefaultClientListenerPort)
+		cfg.ClientListenerPort = DefaultClientListenerPort
 	}
 
 	return nil
@@ -216,20 +211,20 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("proxy.maxRetries", DefaultProxyMaxRetries)
 	v.SetDefault("proxy.pacCharset", "")
 	v.SetDefault("proxy.pacExecutionTimeout", DefaultPacExecTimeout)
-	v.SetDefault("proxy.pacFileTtl", DefaultPacFileTTL) // <<< Добавлено
+	v.SetDefault("proxy.pacFileTtl", DefaultPacFileTTL)
 
-	v.SetDefault("kerberos.enableCache", true) // Default client to use ccache
+	v.SetDefault("kerberos.enableCache", true)
 
-	v.SetDefault("ebpf.interface", DefaultEBPFInterface)
 	v.SetDefault("ebpf.loadMode", DefaultEBPFLoadMode)
-	v.SetDefault("ebpf.allowDynamicPorts", DefaultEBPFAllowDynamicPorts)
 	v.SetDefault("ebpf.statsInterval", DefaultEBPFStatsInterval)
-	v.SetDefault("ebpf.notificationChannelSize", DefaultEBPFNotifChanSize)
-	v.SetDefault("ebpf.targetPorts", []int{80, 443}) // Default ports
-	v.SetDefault("ebpf.excluded", []string{})        // Default empty exclude list
+	v.SetDefault("ebpf.targetPorts", []int{80, 443})
+	v.SetDefault("ebpf.excluded", []string{})
+	v.SetDefault("ebpf.origDestMapSize", DefaultEBPFMapSize)
+	v.SetDefault("ebpf.portMapSize", DefaultEBPFMapSize)
 
 	v.SetDefault("logLevel", DefaultLogLevel)
 	v.SetDefault("logPath", DefaultLogPath)
-	v.SetDefault("shutdownTimeout", DefaultShutdownTimeout) // Store as int initially
+	v.SetDefault("shutdownTimeout", DefaultShutdownTimeout)
 	v.SetDefault("socketPath", DefaultSocketPath)
+	v.SetDefault("clientListenerPort", DefaultClientListenerPort)
 }

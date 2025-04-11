@@ -1,10 +1,13 @@
+// FILE: cmd/client/main.go
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -53,52 +56,46 @@ func main() {
 		return
 	}
 
-	// --- Load Initial Configuration Locally ---
 	cfg, err := config.LoadConfig(flags.configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: Failed to load configuration %s: %v\n", flags.configPath, err)
 		os.Exit(1)
 	}
 
-	// --- Logging Setup ---
-	logLvl := cfg.LogLevel // Use config value first
+	logLvl := cfg.LogLevel
 	if flags.logLevel != "" {
-		logLvl = flags.logLevel // Override with flag if set
+		logLvl = flags.logLevel
 	}
-	logging.Setup(logLvl, "", os.Stderr) // Client logs to stderr
-	slog.Info("Starting KernelGatekeeper Client (SockOps Model)", "version", version, "pid", os.Getpid())
+	logging.Setup(logLvl, "", os.Stderr)
+	slog.Info("Starting KernelGatekeeper Client (Getsockopt Model)", "version", version, "pid", os.Getpid())
 	slog.Info("Using configuration file", "path", flags.configPath)
 
-	// --- Signal Handling ---
 	signals.SetupHandler(ctx, rootCancel, &globalShutdownOnce)
 
-	// --- Initialize Core Components based on Local Config ---
-	stateManager := clientcore.NewStateManager(cfg) // Pass loaded config
+	stateManager := clientcore.NewStateManager(cfg)
 
-	kClient, kerr := kerb.NewKerberosClient(&cfg.Kerberos) // Initialize Kerberos locally
+	kClient, kerr := kerb.NewKerberosClient(&cfg.Kerberos)
 	if kerr != nil {
 		slog.Error("Failed to initialize Kerberos client", "error", kerr)
-		// Continue without Kerberos? Or exit? Decide based on requirements.
-		// For now, log error and continue, proxy might fail later if auth needed.
+
 	} else {
-		stateManager.SetKerberosClient(kClient) // Store in state manager
+		stateManager.SetKerberosClient(kClient)
 		slog.Info("Kerberos client initialized.")
 	}
 
-	pMgr, perr := proxy.NewProxyManager(&cfg.Proxy) // Initialize Proxy Manager locally
+	pMgr, perr := proxy.NewProxyManager(&cfg.Proxy)
 	if perr != nil {
 		slog.Error("Failed to initialize Proxy Manager", "error", perr)
 		signals.TriggerShutdown(&globalShutdownOnce, rootCancel)
 		if kClient != nil {
 			kClient.Close()
 		}
-		os.Exit(1) // Proxy manager failure is critical
+		os.Exit(1)
 	}
-	stateManager.SetProxyManager(pMgr) // Store in state manager
+	stateManager.SetProxyManager(pMgr)
 	slog.Info("Proxy Manager initialized.")
 
-	// --- Start Local Listener Early ---
-	localListener := clientcore.NewLocalListener()
+	localListener := clientcore.NewLocalListener(cfg.ClientListenerPort)
 	if err := localListener.Start(); err != nil {
 		slog.Error("Failed to start local listener", "address", localListener.Addr(), "error", err)
 		signals.TriggerShutdown(&globalShutdownOnce, rootCancel)
@@ -107,62 +104,89 @@ func main() {
 	}
 	defer localListener.Close()
 
-	// --- Initialize IPC Manager ---
-	// Use socket path from flags or default (config value is ignored here)
 	ipcSocketPath := flags.socketPath
 	if ipcSocketPath == "" {
 		ipcSocketPath = config.DefaultSocketPath
 	}
 	ipcManager := clientcore.NewIPCManager(ctx, stateManager, ipcSocketPath, flags.connectTimeout)
 
-	// --- Setup Connection Handler & Set Callbacks BEFORE Run() ---
 	connectionHandler := clientcore.NewConnectionHandler(stateManager)
-	ipcManager.SetAcceptCallback(connectionHandler.HandleBPFAccept)
-	ipcManager.SetListenerCallback(localListener.GetListener)
-	slog.Debug("IPC callbacks registered.")
 
-	// --- Start IPC Manager (Connects and listens for notifications) ---
 	ipcManager.Run()
 
-	// --- Wait for Initial IPC Connection (Necessary for receiving notifications) ---
 	if err := ipcManager.WaitForInitialConnection(flags.connectTimeout + 5*time.Second); err != nil {
 		slog.Error("Failed to establish initial connection to service", "error", err)
-		// No need to trigger shutdown here, signals handler will catch ctx cancellation eventually
+
 		ipcManager.Stop()
 		localListener.Close()
 		stateManager.Cleanup()
 		os.Exit(1)
 	}
-	slog.Info("Successfully connected to service IPC for notifications.")
+	slog.Info("Successfully connected to service IPC.")
 
-	// --- Start Background Tasks (Kerberos Check, Ping) ---
-	// No config refresh needed via IPC anymore.
 	backgroundTasks := clientcore.NewBackgroundTasks(ctx, stateManager, ipcManager)
 	backgroundTasks.Run()
 
 	slog.Info("Client initialization complete. Ready to accept proxied connections.")
 
-	// --- Wait for Shutdown Signal ---
-	<-ctx.Done()
-	slog.Info("Shutdown initiated. Waiting for background tasks and connections to complete...")
+	acceptLoopWg := sync.WaitGroup{}
+	acceptLoopWg.Add(1)
+	go func() {
+		defer acceptLoopWg.Done()
+		runAcceptLoop(ctx, localListener.GetListener(), connectionHandler, stateManager)
+	}()
 
-	// --- Graceful Shutdown ---
-	localListener.Close()  // Stop accepting new BPF connections
-	ipcManager.Stop()      // Stop IPC manager loops & close connection
-	stateManager.Cleanup() // Waits for connection handlers & background tasks via WaitGroup
+	<-ctx.Done()
+	slog.Info("Shutdown initiated. Waiting for connections, IPC, and background tasks...")
+
+	localListener.Close()
+	acceptLoopWg.Wait()
+	slog.Debug("Accept loop finished.")
+
+	ipcManager.Stop()
+	stateManager.Cleanup()
 
 	slog.Info("Client exited gracefully.")
 }
 
+func runAcceptLoop(ctx context.Context, listener net.Listener, handler *clientcore.ConnectionHandler, stateMgr *clientcore.StateManager) {
+	slog.Info("Starting accept loop for redirected connections...")
+	defer slog.Info("Accept loop stopped.")
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+
+			select {
+			case <-ctx.Done():
+				slog.Info("Accept loop exiting due to context cancellation.")
+				return
+			default:
+			}
+
+			if errors.Is(err, net.ErrClosed) {
+				slog.Info("Listener closed, stopping accept loop.")
+				return
+			}
+			slog.Error("Failed to accept connection", "error", err)
+
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		go handler.HandleIncomingConnection(ctx, conn)
+	}
+}
+
 func parseFlags() clientFlags {
 	var flags clientFlags
-	// Try common config locations
+
 	defaultConfigPath := "/etc/kernelgatekeeper/config.yaml"
 	homeDir, err := os.UserHomeDir()
 	if err == nil {
 		userConfigPath := filepath.Join(homeDir, ".config", "kernelgatekeeper", "config.yaml")
 		if _, statErr := os.Stat(userConfigPath); statErr == nil {
-			defaultConfigPath = userConfigPath // Prefer user config if it exists
+			defaultConfigPath = userConfigPath
 		}
 	}
 
@@ -175,7 +199,6 @@ func parseFlags() clientFlags {
 	return flags
 }
 
-// Inject version info into connect_tunnel.go (replace placeholder)
 func init() {
 	clientcore.ClientVersion = version
 }

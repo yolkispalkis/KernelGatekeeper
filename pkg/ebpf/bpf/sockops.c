@@ -1,3 +1,4 @@
+// FILE: pkg/ebpf/bpf/sockops.c
 //go:build ignore
 
 #include <linux/bpf.h>
@@ -24,124 +25,56 @@
 SEC("sockops")
 int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
 
-	__u16 op = skops->op;
+    __u16 op = skops->op;
 
-	#ifdef DEBUG
-	// Log general sockops entry details in debug mode
-	// remote_port is already network byte order, convert with ntohs for display.
-	// local_port is host byte order, cast directly for display.
-	bpf_printk("SOCKOPS_DEBUG: family=%u op=%u lport=%u rport=%u lip4=%x rip4=%x reply=%u pid=%llu\n",
-			   skops->family, op, (__u16)skops->local_port, bpf_ntohs(skops->remote_port),
-			   skops->local_ip4, skops->remote_ip4, skops->reply, bpf_get_current_pid_tgid());
-	#endif
+    #ifdef DEBUG
+    bpf_printk("SOCKOPS_DEBUG: family=%u op=%u lport=%u rport=%u lip4=%x rip4=%x reply=%u pid=%llu\n",
+               skops->family, op, (__u16)skops->local_port, bpf_ntohs(skops->remote_port),
+               skops->local_ip4, skops->remote_ip4, skops->reply, bpf_get_current_pid_tgid());
+    #endif
 
-	// We are only interested in established IPv4 TCP connections for redirection
-	if (op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB) {
-		return BPF_OK;
-	}
+    if (op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB) {
+        return BPF_OK;
+    }
 
-	if (skops->family != AF_INET) {
-		 #ifdef DEBUG
-		 bpf_printk("SOCKOPS: Ignoring non-AF_INET established connection.\n");
-		 #endif
-		return BPF_OK;
-	}
+    if (skops->family != AF_INET) {
+         #ifdef DEBUG
+         bpf_printk("SOCKOPS: Ignoring non-AF_INET established connection.\n");
+         #endif
+        return BPF_OK;
+    }
 
-	// Retrieve the socket cookie
-	__u64 sock_cookie = bpf_get_socket_cookie(skops);
-	if (sock_cookie == 0) {
-		 #ifdef DEBUG
-		 // Note: Getting cookie might fail early in connection setup, but should work for ACTIVE_ESTABLISHED_CB
-		 bpf_printk("SOCKOPS_ERR: Failed to get socket cookie (ACTIVE_ESTABLISHED_CB).\n");
-		 #endif
-		 return BPF_OK;
-	}
+    __u64 sock_cookie = bpf_get_socket_cookie(skops);
+    if (sock_cookie == 0) {
+         #ifdef DEBUG
+         bpf_printk("SOCKOPS_ERR: Failed to get socket cookie (ACTIVE_ESTABLISHED_CB).\n");
+         #endif
+         return BPF_OK;
+    }
 
-	// Look up the connection details saved by the connect4 hook
-	struct connection_details_t *details = bpf_map_lookup_elem(&connection_details_map, &sock_cookie);
-	if (!details) {
-		#ifdef DEBUG
-		// This might happen if the connect4 hook didn't run or map entry was evicted
-		bpf_printk("SOCKOPS_WARN: Connection details not found in map for cookie %llu (ACTIVE_ESTABLISHED_CB). Not redirecting.\n", sock_cookie);
-		#endif
-		return BPF_OK; // Cannot proceed without original destination details
-	}
+    struct original_dest_t *details = bpf_map_lookup_elem(&kg_orig_dest, &sock_cookie);
+    if (!details) {
 
-	// Check if the original destination port is one we want to proxy
-	__u16 orig_dst_port_h = bpf_ntohs(details->orig_dst_port); // Convert to host byte order for map lookup
-	__u8 *target_flag = bpf_map_lookup_elem(&target_ports, &orig_dst_port_h);
+        #ifdef DEBUG
+        bpf_printk("SOCKOPS_DEBUG: No original dest found for cookie %llu, likely not redirected by connect4.\n", sock_cookie);
+        #endif
+        return BPF_OK;
+    }
 
-	if (!target_flag || *target_flag != 1) {
-		#ifdef DEBUG
-		bpf_printk("SOCKOPS_DEBUG: Original port %u not targeted (cookie %llu, ACTIVE_ESTABLISHED_CB).\n", orig_dst_port_h, sock_cookie);
-		#endif
-		// Don't remove from connection_details_map here, let LRU handle it or it might be needed by other hooks.
-		return BPF_OK; // Port not targeted for proxying
-	}
+    __u16 src_port_h = (__u16)skops->local_port;
 
-	#ifdef DEBUG
-	// Connection is targeted for redirection
-	bpf_printk("SOCKOPS: Connection MATCHED original port %u (cookie %llu, ACTIVE_ESTABLISHED_CB): pid=%llu\n",
-			   orig_dst_port_h, sock_cookie, details->pid_tgid);
-	#endif
+    int ret = bpf_map_update_elem(&kg_port_to_cookie, &src_port_h, &sock_cookie, BPF_ANY);
+    if (ret != 0) {
+        bpf_printk("SOCKOPS_ERR: Failed to update kg_port_to_cookie (port %u, cookie %llu): %d\n", src_port_h, sock_cookie, ret);
 
-	// --- Attempt to add the socket to the sockmap for redirection ---
-	int ret = bpf_sock_map_update(skops, &proxy_sock_map, &sock_cookie, BPF_ANY);
-	if (ret != 0) {
-		// Log the error if the update fails
-		bpf_printk("SOCKOPS_ERR: Failed to update proxy_sock_map (sockmap) (cookie %llu, ACTIVE_ESTABLISHED_CB): %d\n", sock_cookie, ret);
-		// !!! IMPORTANT FIX: Do not send notification if sockmap update failed !!!
-		// Removing from connection_details_map might be considered, but risks races. Let LRU handle it.
-		return BPF_OK; // Exit program, cannot proceed with redirection
-	}
+        bpf_map_delete_elem(&kg_orig_dest, &sock_cookie);
+    } else {
+        #ifdef DEBUG
+        bpf_printk("SOCKOPS: Stored port->cookie mapping (%u -> %llu)\n", src_port_h, sock_cookie);
+        #endif
+    }
 
-	// --- Sockmap update succeeded, now send notification to userspace ---
-	#ifdef DEBUG
-	bpf_printk("SOCKOPS: Socket cookie %llu added to proxy_sock_map for redirection (ACTIVE_ESTABLISHED_CB)\n", sock_cookie);
-	#endif
-
-	// Reserve space in the ring buffer for the notification event
-	struct notification_tuple_t *event_data = bpf_ringbuf_reserve(&notification_ringbuf, sizeof(struct notification_tuple_t), 0);
-	if (!event_data) {
-		// Failed to reserve space, log error but connection is already in sockmap
-		bpf_printk("SOCKOPS_ERR: Failed to reserve ringbuf space (cookie %llu, ACTIVE_ESTABLISHED_CB)\n", sock_cookie);
-		// We don't remove from sockmap here, as it might still work, but userspace won't know.
-		// This might lead to a stuck connection if the client relies solely on notification.
-	} else {
-		// Populate the notification data
-		event_data->pid_tgid      = details->pid_tgid;
-		event_data->src_ip        = skops->local_ip4;          // Use actual local IP from sock_ops
-		// event_data->src_port must be in network byte order.
-		// skops->local_port is in host byte order, so convert it using bpf_htons.
-		event_data->src_port      = bpf_htons((__u16)skops->local_port);
-		event_data->orig_dst_ip   = details->orig_dst_ip;      // Original destination IP from connect4 map
-		event_data->orig_dst_port = details->orig_dst_port;    // Original destination port from connect4 map (already network byte order)
-		event_data->protocol      = details->protocol;         // Protocol (TCP)
-
-		// Ensure padding is zeroed (good practice)
-		__builtin_memset(event_data->padding, 0, sizeof(event_data->padding));
-
-		// Submit the event to the ring buffer
-		bpf_ringbuf_submit(event_data, 0);
-		#ifdef DEBUG
-		 bpf_printk("SOCKOPS: Sent notification to ringbuf (cookie %llu, ACTIVE_ESTABLISHED_CB)\n", sock_cookie);
-		#endif
-	}
-
-	// Optionally update statistics for matched connections
-	__u32 stats_key_matched = 1; // Assuming key 1 is for matched/redirected connections
-	struct global_stats_t *stats = bpf_map_lookup_elem(&global_stats, &stats_key_matched);
-	if (stats) {
-		// Atomically increment the packet count (representing a connection here)
-		__sync_fetch_and_add(&stats->packets, 1);
-		// We don't have byte counts at this stage
-	}
-
-	// Remove the entry from the connection details map now that we've processed it?
-	// bpf_map_delete_elem(&connection_details_map, &sock_cookie); // Consider implications (races, map pressure vs LRU)
-	// For now, rely on LRU eviction.
-
-	return BPF_OK; // Indicate success
+    return BPF_OK;
 }
 
 char _license[] SEC("license") = "GPL";

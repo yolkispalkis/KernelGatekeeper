@@ -1,3 +1,4 @@
+// FILE: pkg/clientcore/background_tasks.go
 package clientcore
 
 import (
@@ -11,15 +12,13 @@ import (
 
 const (
 	kerberosCheckInterval = 5 * time.Minute
-	// Removed configRefreshInterval
-	// statusPingInterval is defined in ipc_manager.go
 )
 
 type BackgroundTasks struct {
-	stateManager *StateManager // Needs access to KerberosClient and connection count
-	ipcManager   *IPCManager   // Needs access to send pings
+	stateManager *StateManager
+	ipcManager   *IPCManager
 	ctx          context.Context
-	wg           *sync.WaitGroup // Use stateManager's WaitGroup
+	wg           *sync.WaitGroup
 }
 
 func NewBackgroundTasks(ctx context.Context, stateMgr *StateManager, ipcMgr *IPCManager) *BackgroundTasks {
@@ -27,7 +26,7 @@ func NewBackgroundTasks(ctx context.Context, stateMgr *StateManager, ipcMgr *IPC
 		stateManager: stateMgr,
 		ipcManager:   ipcMgr,
 		ctx:          ctx,
-		wg:           &stateMgr.wg, // Reference the WaitGroup from StateManager
+		wg:           &stateMgr.wg,
 	}
 }
 
@@ -41,21 +40,18 @@ func (bt *BackgroundTasks) Run() {
 }
 
 func (bt *BackgroundTasks) runLoop() {
-	// Removed configRefreshTicker
+
 	kerbCheckTicker := time.NewTicker(kerberosCheckInterval)
 	defer kerbCheckTicker.Stop()
 	statusPingTicker := time.NewTicker(statusPingInterval)
 	defer statusPingTicker.Stop()
 
-	// Run initial Kerberos check immediately after setup (which now happens in main)
 	bt.checkKerberosTicket()
 
 	for {
 		select {
 		case <-bt.ctx.Done():
 			return
-
-		// Removed config refresh case
 
 		case <-kerbCheckTicker.C:
 			bt.checkKerberosTicket()
@@ -65,8 +61,6 @@ func (bt *BackgroundTasks) runLoop() {
 		}
 	}
 }
-
-// Removed RefreshConfiguration
 
 func (bt *BackgroundTasks) checkKerberosTicket() {
 	kc := bt.stateManager.GetKerberosClient()
@@ -84,7 +78,7 @@ func (bt *BackgroundTasks) checkKerberosTicket() {
 
 func (bt *BackgroundTasks) sendClientStatusPing() {
 	if !bt.ipcManager.IsConnected() {
-		slog.Debug("Cannot send status ping, IPC disconnected.") // Debug level as it's expected often
+		slog.Debug("Cannot send status ping, IPC disconnected.")
 		return
 	}
 	slog.Debug("Sending status ping to service...")
@@ -109,8 +103,8 @@ func (bt *BackgroundTasks) sendClientStatusPing() {
 	}
 
 	if err := bt.ipcManager.SendIPCCommand(cmd); err != nil {
-		// Error is logged within SendIPCCommand if connection drops etc.
-		slog.Warn("Failed to send status ping to service", "error", err) // Warn level for send failure
+
+		slog.Warn("Failed to send status ping to service", "error", err)
 	} else {
 		slog.Debug("Status ping sent successfully.")
 	}

@@ -1,13 +1,16 @@
+// FILE: pkg/clientcore/listener.go
 package clientcore
 
 import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
+
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 )
 
 const (
-	localListenPort = 3129
 	localListenAddr = "127.0.0.1"
 )
 
@@ -16,9 +19,13 @@ type LocalListener struct {
 	address  string
 }
 
-func NewLocalListener() *LocalListener {
+func NewLocalListener(port uint16) *LocalListener {
+	if port == 0 {
+		port = config.DefaultClientListenerPort
+		slog.Warn("Client listener port not configured or zero, using default", "default", port)
+	}
 	return &LocalListener{
-		address: fmt.Sprintf("%s:%d", localListenAddr, localListenPort),
+		address: fmt.Sprintf("%s:%d", localListenAddr, port),
 	}
 }
 
@@ -28,7 +35,7 @@ func (l *LocalListener) Start() error {
 		return fmt.Errorf("failed to start local listener on %s: %w", l.address, err)
 	}
 	l.listener = listener
-	slog.Info("Started local listener for BPF connections", "address", l.address)
+	slog.Info("Started local listener for redirected connections", "address", l.address)
 	return nil
 }
 
@@ -40,7 +47,7 @@ func (l *LocalListener) Close() error {
 	if l.listener != nil {
 		slog.Info("Closing local listener", "address", l.address)
 		err := l.listener.Close()
-		l.listener = nil // Avoid double close
+		l.listener = nil
 		return err
 	}
 	return nil
@@ -51,4 +58,38 @@ func (l *LocalListener) Addr() net.Addr {
 		return l.listener.Addr()
 	}
 	return nil
+}
+
+func (l *LocalListener) Port() uint16 {
+	if l.listener == nil {
+		return 0
+	}
+	tcpAddr, ok := l.listener.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0
+	}
+	return uint16(tcpAddr.Port)
+}
+
+func (l *LocalListener) IP() net.IP {
+	if l.listener == nil {
+		return nil
+	}
+	tcpAddr, ok := l.listener.Addr().(*net.TCPAddr)
+	if !ok {
+		return nil
+	}
+	return tcpAddr.IP
+}
+
+func ParseListenerIP(ipStr string) (uint32, error) {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return 0, fmt.Errorf("invalid IP address string: %s", ipStr)
+	}
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return 0, fmt.Errorf("IP address is not IPv4: %s", ipStr)
+	}
+	return strconv.ParseUint(fmt.Sprintf("%d", ipv4[0]<<24|ipv4[1]<<16|ipv4[2]<<8|ipv4[3]), 10, 32)
 }

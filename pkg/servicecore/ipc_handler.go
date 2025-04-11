@@ -1,3 +1,4 @@
+// FILE: pkg/servicecore/ipc_handler.go
 package servicecore
 
 import (
@@ -10,18 +11,17 @@ import (
 	"net"
 	"time"
 
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/bpfutil" // Keep for getInterfacesResponse
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/common"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/ipc"
 )
 
 const (
 	ipcWriteTimeout    = 2 * time.Second
-	ipcReadIdleTimeout = 90 * time.Second // Increased timeout as client only sends pings periodically
+	ipcReadIdleTimeout = 90 * time.Second
 )
 
 type IpcHandler struct {
-	stateManager *StateManager // Access state (clients, bpf manager for status)
+	stateManager *StateManager
 }
 
 func NewIpcHandler(stateMgr *StateManager) *IpcHandler {
@@ -39,15 +39,15 @@ func (h *IpcHandler) HandleConnection(ctx context.Context, conn net.Conn) {
 	logCtx.Info("Handling new IPC connection")
 
 	clientManager := h.stateManager.GetClientManager()
-	var clientInfo *ClientState // Track state for this specific connection
+	var clientInfo *ClientState
 
 	defer func() {
 		if clientInfo != nil {
 			logCtx.Info("Removing client state due to IPC connection closure", "uid", clientInfo.UID, "pid", clientInfo.PID)
-			clientManager.RemoveClientConn(conn) // This also closes the connection
+			clientManager.RemoveClientConn(conn)
 		} else {
 			logCtx.Info("Closing unregistered IPC connection")
-			conn.Close() // Ensure close even if not registered
+			conn.Close()
 		}
 		logCtx.Debug("Finished handling IPC connection")
 	}()
@@ -64,10 +64,10 @@ func (h *IpcHandler) HandleConnection(ctx context.Context, conn net.Conn) {
 		}
 
 		var cmd ipc.Command
-		// Set read deadline for detecting idle/dead clients
+
 		conn.SetReadDeadline(time.Now().Add(ipcReadIdleTimeout))
 		err := decoder.Decode(&cmd)
-		conn.SetReadDeadline(time.Time{}) // Clear deadline immediately after read attempt
+		conn.SetReadDeadline(time.Time{})
 
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || common.IsConnectionClosedErr(err) {
@@ -77,10 +77,9 @@ func (h *IpcHandler) HandleConnection(ctx context.Context, conn net.Conn) {
 			} else {
 				logCtx.Error("Failed to decode IPC command", "error", err)
 			}
-			return // Exit handler for this connection
+			return
 		}
 
-		// Fetch current state on each command, as it might have been added/removed
 		clientInfo = clientManager.GetClientState(conn)
 
 		logCtxCmd := logCtx.With("command", cmd.Command)
@@ -93,59 +92,52 @@ func (h *IpcHandler) HandleConnection(ctx context.Context, conn net.Conn) {
 		var resp *ipc.Response
 		var procErr error
 
-		// Check registration status *after* receiving the command
 		isRegistered := clientInfo != nil
-		requiresRegistration := cmd.Command != "register_client" // Only register_client is allowed before registration
+		requiresRegistration := cmd.Command != "register_client"
 
 		if requiresRegistration && !isRegistered {
 			procErr = errors.New("client not registered")
 			logCtxCmd.Warn("Command rejected: client not registered")
 			resp = ipc.NewErrorResponse(procErr.Error())
 		} else {
-			// Pass the pointer to allow processIPCCommand to update it upon registration
+
 			resp, procErr = h.processIPCCommand(conn, &cmd, &clientInfo)
 			if procErr != nil {
-				resp = ipc.NewErrorResponse(procErr.Error()) // Use helper for consistent error response
+				resp = ipc.NewErrorResponse(procErr.Error())
 				logCtxCmd.Error("Error processing IPC command", "error", procErr)
 			} else if resp == nil {
-				// This case should ideally not happen if processIPCCommand always returns a response or error
+
 				logCtxCmd.Error("Internal error: processIPCCommand returned nil response and nil error")
 				resp = ipc.NewErrorResponse("internal server error processing command")
 			}
 		}
 
-		// Send response if one was generated
 		if resp != nil {
 			conn.SetWriteDeadline(time.Now().Add(ipcWriteTimeout))
 			encodeErr := encoder.Encode(resp)
-			conn.SetWriteDeadline(time.Time{}) // Clear deadline
+			conn.SetWriteDeadline(time.Time{})
 
 			if encodeErr != nil {
 				logCtxCmd.Error("Failed to send IPC response", "error", encodeErr)
-				// Don't return immediately, let the loop try reading the next command,
-				// but the connection is likely broken. RemoveClientConn will be called in defer.
-				return // Exit handler on write failure
+
+				return
 			}
 			logCtxCmd.Debug("Sent IPC response", "status", resp.Status)
 		} else {
-			// Should only happen for commands that don't inherently require a response (none currently)
+
 			logCtxCmd.Debug("No response generated for command")
 		}
 	}
 }
 
-// processIPCCommand handles the logic for each command.
-// It takes a pointer to the clientInfo pointer (*ClientState) so it can update
-// the caller's clientInfo variable when registration occurs.
 func (h *IpcHandler) processIPCCommand(conn net.Conn, cmd *ipc.Command, clientInfoPtr **ClientState) (*ipc.Response, error) {
-	currentClientInfo := *clientInfoPtr // Dereference to get the current *ClientState
+	currentClientInfo := *clientInfoPtr
 	clientManager := h.stateManager.GetClientManager()
 
 	switch cmd.Command {
 	case "register_client":
 		if currentClientInfo != nil {
-			// Log the attempt but return success? Or error?
-			// Let's return an error to prevent unexpected state changes.
+
 			slog.Warn("IPC client attempted to register again on the same connection", "uid", currentClientInfo.UID, "pid", currentClientInfo.PID)
 			return nil, errors.New("client already registered on this connection")
 		}
@@ -155,31 +147,18 @@ func (h *IpcHandler) processIPCCommand(conn net.Conn, cmd *ipc.Command, clientIn
 			return nil, fmt.Errorf("invalid register_client data: %w", err)
 		}
 
-		// AddClientConn handles getting peer credentials
 		newState, err := clientManager.AddClientConn(conn, data.PID)
 		if err != nil {
 			slog.Error("Failed to add client connection during registration", "reported_pid", data.PID, "error", err)
-			return nil, fmt.Errorf("client registration failed: %w", err) // Propagate error
+			return nil, fmt.Errorf("client registration failed: %w", err)
 		}
-		*clientInfoPtr = newState // IMPORTANT: Update the clientInfo in the HandleConnection scope
+		*clientInfoPtr = newState
 
 		return ipc.NewOKResponse("Client registered successfully")
 
-	// Removed get_config
-
-	// Removed update_ports
-
 	case "get_status":
-		// This command doesn't require registration? If yes, HandleConnection check is sufficient.
-		// If it requires registration, add check here:
-		// if currentClientInfo == nil {
-		//     return nil, errors.New("get_status requires registration")
-		// }
-		return h.getStatusResponse() // Call helper function
 
-	case "get_interfaces":
-		// Same registration consideration as get_status
-		return h.getInterfacesResponse() // Call helper function
+		return h.getStatusResponse()
 
 	case "ping_status":
 		if currentClientInfo == nil {
@@ -189,11 +168,11 @@ func (h *IpcHandler) processIPCCommand(conn net.Conn, cmd *ipc.Command, clientIn
 		if err := ipc.DecodeData(cmd.Data, &data); err != nil {
 			return nil, fmt.Errorf("invalid ping_status data: %w", err)
 		}
-		// UpdateClientStatus returns false if client was removed between read and processing
+
 		if !clientManager.UpdateClientStatus(conn, data) {
 			return nil, errors.New("client disconnected before status ping could be processed")
 		}
-		// No data needed in OK response for ping
+
 		return ipc.NewOKResponse(nil)
 
 	default:
@@ -201,66 +180,41 @@ func (h *IpcHandler) processIPCCommand(conn net.Conn, cmd *ipc.Command, clientIn
 	}
 }
 
-// getStatusResponse retrieves status information.
 func (h *IpcHandler) getStatusResponse() (*ipc.Response, error) {
-	cfg := h.stateManager.GetConfig() // Get current config
+	cfg := h.stateManager.GetConfig()
 	clientManager := h.stateManager.GetClientManager()
 	bpfMgr := h.stateManager.GetBpfManager()
 	startTime := h.stateManager.GetStartTime()
-	serviceVersion := "dev" // TODO: Inject actual version
+	serviceVersion := "dev"
 
 	clientDetails, clientKerberosStates := clientManager.GetAllClientDetails()
 	clientCount := len(clientDetails)
 
 	statusData := ipc.GetStatusData{
-		Status:               "running", // Assume running unless BPF fails
-		ActiveInterface:      cfg.EBPF.Interface,
-		ActivePorts:          cfg.EBPF.TargetPorts, // Reflect currently configured ports
+		Status:               "running",
+		ActivePorts:          cfg.EBPF.TargetPorts,
 		LoadMode:             cfg.EBPF.LoadMode,
 		UptimeSeconds:        int64(time.Since(startTime).Seconds()),
 		ServiceVersion:       serviceVersion,
 		ConnectedClients:     clientCount,
 		ClientDetails:        clientDetails,
-		ClientKerberosStates: clientKerberosStates, // Include Kerberos status from pings
+		ClientKerberosStates: clientKerberosStates,
 	}
 
 	if bpfMgr != nil {
-		_, matched, err := bpfMgr.GetStats() // Get stats from BPF manager cache
+		stats, err := bpfMgr.GetStats()
 		if err != nil {
 			slog.Warn("Failed to get eBPF stats for status response", "error", err)
-			statusData.Status = "degraded (bpf stats error)" // More specific status
+			statusData.Status = "degraded (bpf stats error)"
 		} else {
-			statusData.MatchedConns = matched.Packets
+			statusData.TotalRedirected = stats.Redirected
+			statusData.TotalGetsockoptOK = stats.GetsockoptOk
+			statusData.TotalGetsockoptFail = stats.GetsockoptFail
 		}
 	} else {
 		slog.Warn("BPF manager not available for status response")
 		statusData.Status = "degraded (bpf manager unavailable)"
 	}
 
-	// Check notification channel utilization
-	notifChan := h.stateManager.GetNotificationChannel()
-	if notifChan != nil && cap(notifChan) > 0 {
-		usage := float64(len(notifChan)) / float64(cap(notifChan))
-		if usage > 0.8 { // Example threshold
-			slog.Warn("High BPF notification channel usage detected", "usage", usage)
-			if statusData.Status == "running" { // Append warning if not already degraded
-				statusData.Status = "warning (high channel usage)"
-			}
-		}
-	}
-
 	return ipc.NewOKResponse(statusData)
-}
-
-// getInterfacesResponse retrieves available network interfaces.
-func (h *IpcHandler) getInterfacesResponse() (*ipc.Response, error) {
-	interfaces, err := bpfutil.GetAvailableInterfaces()
-	if err != nil {
-		slog.Error("Failed to get network interfaces for response", "error", err)
-		return nil, fmt.Errorf("failed to list network interfaces: %w", err)
-	}
-	// Get current interface from config held by state manager
-	currentInterface := h.stateManager.GetConfig().EBPF.Interface
-	data := ipc.GetInterfacesData{Interfaces: interfaces, CurrentInterface: currentInterface}
-	return ipc.NewOKResponse(data)
 }

@@ -1,8 +1,9 @@
+// FILE: pkg/ebpf/manager.go
 package ebpf
 
 //go:generate go run -tags linux github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpf -cflags "-O2 -g -Wall -Werror -DDEBUG -I./bpf -I/usr/include/bpf" bpf_connect4 ./bpf/connect4.c -- -I./bpf
 //go:generate go run -tags linux github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpf -cflags "-O2 -g -Wall -Werror -DDEBUG -I./bpf -I/usr/include/bpf" bpf_sockops ./bpf/sockops.c -- -I./bpf
-//go:generate go run -tags linux github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpf -cflags "-O2 -g -Wall -Werror -DDEBUG -I./bpf -I/usr/include/bpf" bpf_skmsg ./bpf/skmsg.c -- -I./bpf
+//go:generate go run -tags linux github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpf -cflags "-O2 -g -Wall -Werror -DDEBUG -I./bpf -I/usr/include/bpf" bpf_getsockopt ./bpf/getsockopt.c -- -I./bpf
 
 import (
 	"context"
@@ -17,66 +18,53 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/ringbuf"
+
 	"github.com/cilium/ebpf/rlimit"
 
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 )
 
 const (
-	GlobalStatsMatchedIndex uint32 = 1
-	DefaultCgroupPath              = "/sys/fs/cgroup"
-	verifierLogSize                = 2 * 1024 * 1024
+	StatsRedirectedIndex     uint32 = 1
+	StatsGetsockoptOkIndex   uint32 = 2
+	StatsGetsockoptFailIndex uint32 = 3
+	DefaultCgroupPath               = "/sys/fs/cgroup"
 )
 
 type GlobalStats struct {
-	Packets uint64
-	Bytes   uint64
+	Packets        uint64
+	Bytes          uint64
+	Redirected     uint64
+	GetsockoptOk   uint64
+	GetsockoptFail uint64
 }
 
-type NotificationTuple struct {
-	PidTgid     uint64
-	SrcIP       net.IP
-	OrigDstIP   net.IP
-	SrcPort     uint16
-	OrigDstPort uint16
-	Protocol    uint8
-}
-
-type BpfConnectionDetailsT = bpf_connect4ConnectionDetailsT
-
-type BpfNotificationTupleT struct {
-	PidTgid     uint64
-	SrcIp       uint32
-	OrigDstIp   uint32
-	SrcPort     uint16
-	OrigDstPort uint16
-	Protocol    uint8
-	Padding     [5]uint8
-}
+type OriginalDestT = bpf_connect4OriginalDestT
 
 type BpfGlobalStatsT = bpf_connect4GlobalStatsT
+type BpfKgConfigT = bpf_connect4KgConfigT
 
 type bpfObjects struct {
 	bpf_connect4Objects
 	bpf_sockopsObjects
-	bpf_skmsgObjects
+	bpf_getsockoptObjects
 
-	KernelgatekeeperConnect4 *ebpf.Program `ebpf:"kernelgatekeeper_connect4"`
-	KernelgatekeeperSockops  *ebpf.Program `ebpf:"kernelgatekeeper_sockops"`
-	KernelgatekeeperSkmsg    *ebpf.Program `ebpf:"kernelgatekeeper_skmsg"`
-	ConnectionDetailsMap     *ebpf.Map     `ebpf:"connection_details_map"`
-	TargetPorts              *ebpf.Map     `ebpf:"target_ports"`
-	ProxySockMap             *ebpf.Map     `ebpf:"proxy_sock_map"`
-	NotificationRingbuf      *ebpf.Map     `ebpf:"notification_ringbuf"`
-	GlobalStats              *ebpf.Map     `ebpf:"global_stats"`
+	KernelgatekeeperConnect4   *ebpf.Program `ebpf:"kernelgatekeeper_connect4"`
+	KernelgatekeeperSockops    *ebpf.Program `ebpf:"kernelgatekeeper_sockops"`
+	KernelgatekeeperGetsockopt *ebpf.Program `ebpf:"kernelgatekeeper_getsockopt"`
+	KgOrigDest                 *ebpf.Map     `ebpf:"kg_orig_dest"`
+	KgPortToCookie             *ebpf.Map     `ebpf:"kg_port_to_cookie"`
+	TargetPorts                *ebpf.Map     `ebpf:"target_ports"`
+	KgClientPids               *ebpf.Map     `ebpf:"kg_client_pids"`
+	KgConfig                   *ebpf.Map     `ebpf:"kg_config"`
+	KgStats                    *ebpf.Map     `ebpf:"kg_stats"`
 }
 
 func (o *bpfObjects) Close() error {
 	closers := []io.Closer{
 		&o.bpf_connect4Objects,
 		&o.bpf_sockopsObjects,
-		&o.bpf_skmsgObjects,
+		&o.bpf_getsockoptObjects,
 	}
 	var errs []error
 	for _, closer := range closers {
@@ -100,31 +88,36 @@ func (o *bpfObjects) Close() error {
 }
 
 type BPFManager struct {
-	cfg                 *config.EBPFConfig
-	objs                bpfObjects
-	connect4Link        link.Link
-	cgroupLink          link.Link
-	skMsgLink           link.Link
-	notificationReader  *ringbuf.Reader
-	notificationChannel chan<- NotificationTuple
-	stopOnce            sync.Once
-	stopChan            chan struct{}
-	statsCache          StatsCache
-	mu                  sync.Mutex
+	cfg            *config.EBPFConfig
+	objs           bpfObjects
+	connect4Link   link.Link
+	sockopsLink    link.Link
+	getsockoptLink link.Link
+	stopOnce       sync.Once
+	stopChan       chan struct{}
+	statsCache     StatsCache
+	mu             sync.Mutex
 }
 
-func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (*BPFManager, error) {
-	slog.Info("Initializing BPF Manager", "mode", "connect4/sockops/skmsg")
+func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint16) (*BPFManager, error) {
+	slog.Info("Initializing BPF Manager", "mode", "connect4/sockops/getsockopt")
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return nil, fmt.Errorf("failed to remove memlock rlimit: %w", err)
 	}
 
 	var objs bpfObjects
 	opts := &ebpf.CollectionOptions{
-		Maps: ebpf.MapOptions{},
+		Maps: ebpf.MapOptions{
+			PinPath: "/sys/fs/bpf/kernelgatekeeper",
+		},
 		Programs: ebpf.ProgramOptions{
 			LogLevel: ebpf.LogLevelInstruction,
 		},
+	}
+
+	opts.MapSpecReplacements = map[string]ebpf.MapSpec{
+		"kg_orig_dest":      {MaxEntries: uint32(cfg.OrigDestMapSize)},
+		"kg_port_to_cookie": {MaxEntries: uint32(cfg.PortMapSize)},
 	}
 
 	specConnect4, err := loadBpf_connect4()
@@ -135,9 +128,9 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 	if err != nil {
 		return nil, fmt.Errorf("failed to load sockops BPF spec: %w", err)
 	}
-	specSkmsg, err := loadBpf_skmsg()
+	specGetsockopt, err := loadBpf_getsockopt()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load skmsg BPF spec: %w", err)
+		return nil, fmt.Errorf("failed to load getsockopt BPF spec: %w", err)
 	}
 
 	if err := specConnect4.LoadAndAssign(&objs.bpf_connect4Objects, opts); err != nil {
@@ -145,19 +138,22 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 		return nil, fmt.Errorf("failed to load eBPF connect4 objects: %w", err)
 	}
 	slog.Debug("eBPF connect4 objects loaded successfully.")
+
 	objs.KernelgatekeeperConnect4 = objs.bpf_connect4Objects.KernelgatekeeperConnect4
-	objs.ConnectionDetailsMap = objs.bpf_connect4Objects.ConnectionDetailsMap
+	objs.KgOrigDest = objs.bpf_connect4Objects.KgOrigDest
+	objs.KgPortToCookie = objs.bpf_connect4Objects.KgPortToCookie
 	objs.TargetPorts = objs.bpf_connect4Objects.TargetPorts
-	objs.ProxySockMap = objs.bpf_connect4Objects.ProxySockMap
-	objs.NotificationRingbuf = objs.bpf_connect4Objects.NotificationRingbuf
-	objs.GlobalStats = objs.bpf_connect4Objects.GlobalStats
+	objs.KgClientPids = objs.bpf_connect4Objects.KgClientPids
+	objs.KgConfig = objs.bpf_connect4Objects.KgConfig
+	objs.KgStats = objs.bpf_connect4Objects.KgStats
 
 	opts.MapReplacements = map[string]*ebpf.Map{
-		"connection_details_map": objs.ConnectionDetailsMap,
-		"target_ports":           objs.TargetPorts,
-		"proxy_sock_map":         objs.ProxySockMap,
-		"notification_ringbuf":   objs.NotificationRingbuf,
-		"global_stats":           objs.GlobalStats,
+		"kg_orig_dest":      objs.KgOrigDest,
+		"kg_port_to_cookie": objs.KgPortToCookie,
+		"target_ports":      objs.TargetPorts,
+		"kg_client_pids":    objs.KgClientPids,
+		"kg_config":         objs.KgConfig,
+		"kg_stats":          objs.KgStats,
 	}
 	if err := specSockops.LoadAndAssign(&objs.bpf_sockopsObjects, opts); err != nil {
 		handleVerifierError("sockops", err)
@@ -168,44 +164,42 @@ func NewBPFManager(cfg *config.EBPFConfig, notifChan chan<- NotificationTuple) (
 	objs.KernelgatekeeperSockops = objs.bpf_sockopsObjects.KernelgatekeeperSockops
 
 	opts.MapReplacements = map[string]*ebpf.Map{
-		"proxy_sock_map": objs.ProxySockMap,
+		"kg_orig_dest":      objs.KgOrigDest,
+		"kg_port_to_cookie": objs.KgPortToCookie,
+		"kg_stats":          objs.KgStats,
 	}
-	if err := specSkmsg.LoadAndAssign(&objs.bpf_skmsgObjects, opts); err != nil {
-		handleVerifierError("skmsg", err)
+	if err := specGetsockopt.LoadAndAssign(&objs.bpf_getsockoptObjects, opts); err != nil {
+		handleVerifierError("getsockopt", err)
 		objs.bpf_connect4Objects.Close()
 		objs.bpf_sockopsObjects.Close()
-		return nil, fmt.Errorf("failed to load eBPF skmsg objects: %w", err)
+		return nil, fmt.Errorf("failed to load eBPF getsockopt objects: %w", err)
 	}
-	slog.Debug("eBPF skmsg objects loaded successfully.")
-	objs.KernelgatekeeperSkmsg = objs.bpf_skmsgObjects.KernelgatekeeperSkmsg
+	slog.Debug("eBPF getsockopt objects loaded successfully.")
+	objs.KernelgatekeeperGetsockopt = objs.bpf_getsockoptObjects.KernelgatekeeperGetsockopt
 
 	manager := &BPFManager{
-		cfg:                 cfg,
-		objs:                objs,
-		notificationChannel: notifChan,
-		stopChan:            make(chan struct{}),
+		cfg:      cfg,
+		objs:     objs,
+		stopChan: make(chan struct{}),
 	}
 	manager.statsCache.lastStatsTime = time.Now()
 
-	if objs.KernelgatekeeperConnect4 == nil || objs.KernelgatekeeperSockops == nil || objs.KernelgatekeeperSkmsg == nil ||
-		objs.ConnectionDetailsMap == nil || objs.TargetPorts == nil || objs.ProxySockMap == nil ||
-		objs.NotificationRingbuf == nil || objs.GlobalStats == nil {
+	if objs.KernelgatekeeperConnect4 == nil || objs.KernelgatekeeperSockops == nil || objs.KernelgatekeeperGetsockopt == nil ||
+		objs.KgOrigDest == nil || objs.KgPortToCookie == nil || objs.TargetPorts == nil || objs.KgClientPids == nil ||
+		objs.KgConfig == nil || objs.KgStats == nil {
 		manager.objs.Close()
 		return nil, errors.New("one or more required BPF programs or maps failed to load or assign after merging objects")
+	}
+
+	if err := manager.UpdateConfigMap(listenerIP, listenerPort); err != nil {
+		manager.Close()
+		return nil, fmt.Errorf("failed to set initial BPF config map: %w", err)
 	}
 
 	if err := manager.attachPrograms(DefaultCgroupPath); err != nil {
 		manager.Close()
 		return nil, err
 	}
-
-	var ringbufErr error
-	manager.notificationReader, ringbufErr = ringbuf.NewReader(objs.NotificationRingbuf)
-	if ringbufErr != nil {
-		manager.Close()
-		return nil, fmt.Errorf("failed to create ring buffer reader: %w", ringbufErr)
-	}
-	slog.Info("BPF ring buffer reader initialized")
 
 	if err := manager.UpdateTargetPorts(cfg.TargetPorts); err != nil {
 		manager.Close()
@@ -226,11 +220,12 @@ func handleVerifierError(objType string, err error) {
 func (m *BPFManager) attachPrograms(cgroupPath string) error {
 	connect4Prog := m.objs.KernelgatekeeperConnect4
 	sockopsProg := m.objs.KernelgatekeeperSockops
-	skmsgProg := m.objs.KernelgatekeeperSkmsg
-	sockMap := m.objs.ProxySockMap
-	if connect4Prog == nil || sockopsProg == nil || skmsgProg == nil || sockMap == nil {
-		return errors.New("internal error: one or more required BPF programs or the sockmap are nil during attach phase")
+	getsockoptProg := m.objs.KernelgatekeeperGetsockopt
+
+	if connect4Prog == nil || sockopsProg == nil || getsockoptProg == nil {
+		return errors.New("internal error: one or more required BPF programs are nil during attach phase")
 	}
+
 	fi, err := os.Stat(cgroupPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -241,42 +236,38 @@ func (m *BPFManager) attachPrograms(cgroupPath string) error {
 	if !fi.IsDir() {
 		return fmt.Errorf("cgroup v2 path '%s' is not a directory", cgroupPath)
 	}
+
 	var linkErr error
 	m.connect4Link, linkErr = link.AttachCgroup(link.CgroupOptions{Path: cgroupPath, Program: connect4Prog, Attach: ebpf.AttachCGroupInet4Connect})
 	if linkErr != nil {
 		return fmt.Errorf("failed to attach connect4 program to cgroup '%s': %w", cgroupPath, linkErr)
 	}
 	slog.Info("eBPF connect4 program attached to cgroup", "path", cgroupPath)
-	m.cgroupLink, linkErr = link.AttachCgroup(link.CgroupOptions{Path: cgroupPath, Program: sockopsProg, Attach: ebpf.AttachCGroupSockOps})
+
+	m.sockopsLink, linkErr = link.AttachCgroup(link.CgroupOptions{Path: cgroupPath, Program: sockopsProg, Attach: ebpf.AttachCGroupSockOps})
 	if linkErr != nil {
 		m.connect4Link.Close()
 		return fmt.Errorf("failed to attach sock_ops program to cgroup '%s': %w", cgroupPath, linkErr)
 	}
 	slog.Info("eBPF sock_ops program attached to cgroup", "path", cgroupPath)
-	m.skMsgLink, linkErr = link.AttachRawLink(link.RawLinkOptions{Program: skmsgProg, Attach: ebpf.AttachSkMsgVerdict, Target: sockMap.FD(), Flags: 0})
+
+	m.getsockoptLink, linkErr = link.AttachCgroup(link.CgroupOptions{Path: cgroupPath, Program: getsockoptProg, Attach: ebpf.AttachCGroupGetsockopt})
 	if linkErr != nil {
-		m.cgroupLink.Close()
+		m.sockopsLink.Close()
 		m.connect4Link.Close()
-		return fmt.Errorf("failed to attach sk_msg program to proxy_sock_map (FD %d): %w", sockMap.FD(), linkErr)
+		return fmt.Errorf("failed to attach getsockopt program to cgroup '%s': %w", cgroupPath, linkErr)
 	}
-	slog.Info("eBPF sk_msg program attached to proxy_sock_map", "map_fd", sockMap.FD())
+	slog.Info("eBPF getsockopt program attached to cgroup", "path", cgroupPath)
+
 	return nil
 }
 
 func (m *BPFManager) Start(ctx context.Context, wg *sync.WaitGroup) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.notificationReader == nil {
-		return errors.New("BPF manager not fully initialized (notificationReader is nil), cannot start tasks")
-	}
-	slog.Info("Starting BPF Manager background tasks (ring buffer reader, stats updater)...")
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		slog.Info("BPF ring buffer reader task started.")
-		m.readNotifications(ctx)
-		slog.Info("BPF ring buffer reader task stopped.")
-	}()
+
+	slog.Info("Starting BPF Manager background tasks (stats updater)...")
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -299,36 +290,25 @@ func (m *BPFManager) Close() error {
 			close(m.stopChan)
 		}
 
-		if m.notificationReader != nil {
-			slog.Debug("Closing BPF ring buffer reader...")
-			if err := m.notificationReader.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, ringbuf.ErrClosed) {
-				slog.Error("Error closing BPF ringbuf reader", "error", err)
+		if m.getsockoptLink != nil {
+			slog.Debug("Closing BPF getsockopt link...")
+			if err := m.getsockoptLink.Close(); err != nil {
+				slog.Error("Error closing BPF getsockopt link", "error", err)
 				if firstErr == nil {
-					firstErr = fmt.Errorf("ringbuf close: %w", err)
+					firstErr = fmt.Errorf("getsockopt link close: %w", err)
 				}
 			}
-			m.notificationReader = nil
+			m.getsockoptLink = nil
 		}
-
-		if m.skMsgLink != nil {
-			slog.Debug("Closing BPF sk_msg link...")
-			if err := m.skMsgLink.Close(); err != nil {
-				slog.Error("Error closing BPF sk_msg link", "error", err)
-				if firstErr == nil {
-					firstErr = fmt.Errorf("sk_msg link close: %w", err)
-				}
-			}
-			m.skMsgLink = nil
-		}
-		if m.cgroupLink != nil {
+		if m.sockopsLink != nil {
 			slog.Debug("Closing BPF cgroup sock_ops link...")
-			if err := m.cgroupLink.Close(); err != nil {
+			if err := m.sockopsLink.Close(); err != nil {
 				slog.Error("Error closing BPF cgroup sock_ops link", "error", err)
 				if firstErr == nil {
 					firstErr = fmt.Errorf("cgroup sock_ops link close: %w", err)
 				}
 			}
-			m.cgroupLink = nil
+			m.sockopsLink = nil
 		}
 		if m.connect4Link != nil {
 			slog.Debug("Closing BPF cgroup connect4 link...")

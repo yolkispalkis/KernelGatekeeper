@@ -1,3 +1,4 @@
+// FILE: pkg/servicecore/ipc_listener.go
 package servicecore
 
 import (
@@ -17,7 +18,7 @@ import (
 type IpcListener struct {
 	socketPath string
 	listener   net.Listener
-	handler    *IpcHandler // Handler for accepted connections
+	handler    *IpcHandler
 	wg         *sync.WaitGroup
 }
 
@@ -32,7 +33,6 @@ func NewIpcListener(cfg *config.Config, handler *IpcHandler, wg *sync.WaitGroup)
 		return nil, fmt.Errorf("failed to create IPC directory %s: %w", dir, err)
 	}
 
-	// Remove stale socket file
 	if _, err := os.Stat(socketPath); err == nil {
 		slog.Info("Removing existing IPC socket file", "path", socketPath)
 		if err := os.Remove(socketPath); err != nil {
@@ -64,16 +64,15 @@ func NewIpcListener(cfg *config.Config, handler *IpcHandler, wg *sync.WaitGroup)
 }
 
 func (il *IpcListener) Run(ctx context.Context) {
-	// Goroutine to close listener on context cancellation
+
 	il.wg.Add(1)
 	go func() {
 		defer il.wg.Done()
 		<-ctx.Done()
 		slog.Info("Closing IPC listener due to context cancellation...")
-		il.Close() // Close the listener to stop Accept loop
+		il.Close()
 	}()
 
-	// Goroutine to accept incoming connections
 	il.wg.Add(1)
 	go func() {
 		defer il.wg.Done()
@@ -92,7 +91,7 @@ func (il *IpcListener) Run(ctx context.Context) {
 					return
 				}
 			}
-			// Handle connection in a new goroutine using the provided handler
+
 			il.wg.Add(1)
 			go func(c net.Conn) {
 				defer il.wg.Done()
@@ -105,15 +104,13 @@ func (il *IpcListener) Run(ctx context.Context) {
 func (il *IpcListener) Close() error {
 	if il.listener != nil {
 		err := il.listener.Close()
-		il.listener = nil // Prevent double closing
-		// Optional: remove socket file on close? Usually done on startup.
-		// os.Remove(il.socketPath)
+		il.listener = nil
+
 		return err
 	}
 	return nil
 }
 
-// Listener returns the underlying network listener.
 func (il *IpcListener) Listener() net.Listener {
 	return il.listener
 }

@@ -1,3 +1,4 @@
+// FILE: pkg/ebpf/stats.go
 package ebpf
 
 import (
@@ -13,8 +14,8 @@ import (
 
 type StatsCache struct {
 	sync.RWMutex
-	matchedConns, lastMatched GlobalStats
-	lastStatsTime             time.Time
+	totalStats, lastTotalStats GlobalStats
+	lastStatsTime              time.Time
 }
 
 func (m *BPFManager) statsUpdater(ctx context.Context) {
@@ -56,62 +57,74 @@ func (m *BPFManager) updateAndLogStats() error {
 		return nil
 	}
 
-	matchedCurrent, err := m.readGlobalStats(GlobalStatsMatchedIndex)
+	currentStats, err := m.readGlobalStats()
 	if err != nil {
-		return fmt.Errorf("failed to read matched BPF stats: %w", err)
+		return fmt.Errorf("failed to read BPF stats: %w", err)
 	}
 
-	matchedRateP := 0.0
-	deltaPackets := int64(matchedCurrent.Packets - m.statsCache.lastMatched.Packets)
-	if deltaPackets < 0 {
-		slog.Warn("BPF matched connection counter appeared to wrap or reset", "last", m.statsCache.lastMatched.Packets, "current", matchedCurrent.Packets)
-		deltaPackets = int64(matchedCurrent.Packets)
+	calculateRate := func(current, last uint64) float64 {
+		delta := int64(current - last)
+		if delta < 0 {
+			slog.Warn("BPF counter appeared to wrap or reset", "last", last, "current", current)
+			delta = int64(current)
+		}
+		if duration > 0 {
+			return float64(delta) / duration
+		}
+		return 0.0
 	}
-	if duration > 0 {
-		matchedRateP = float64(deltaPackets) / duration
-	}
+
+	redirectRate := calculateRate(currentStats.Redirected, m.statsCache.lastTotalStats.Redirected)
+	getsockoptOkRate := calculateRate(currentStats.GetsockoptOk, m.statsCache.lastTotalStats.GetsockoptOk)
+	getsockoptFailRate := calculateRate(currentStats.GetsockoptFail, m.statsCache.lastTotalStats.GetsockoptFail)
 
 	slog.Info("eBPF Statistics",
-		slog.Group("matched_conns",
-			"total_conns", matchedCurrent.Packets,
-			"conn_rate_per_sec", fmt.Sprintf("%.2f", matchedRateP),
-		),
+		"total_pkts", currentStats.Packets,
+		"total_redirected", currentStats.Redirected,
+		"redirect_rate_pps", fmt.Sprintf("%.2f", redirectRate),
+		"total_getsockopt_ok", currentStats.GetsockoptOk,
+		"getsockopt_ok_rate_pps", fmt.Sprintf("%.2f", getsockoptOkRate),
+		"total_getsockopt_fail", currentStats.GetsockoptFail,
+		"getsockopt_fail_rate_pps", fmt.Sprintf("%.2f", getsockoptFailRate),
 		"interval_sec", fmt.Sprintf("%.2f", duration),
 	)
 
-	m.statsCache.lastMatched = matchedCurrent
+	m.statsCache.lastTotalStats = currentStats
 	m.statsCache.lastStatsTime = now
 	return nil
 }
 
-func (m *BPFManager) readGlobalStats(index uint32) (GlobalStats, error) {
+func (m *BPFManager) readGlobalStats() (GlobalStats, error) {
 	var aggregate GlobalStats
-	globalStatsMap := m.objs.GlobalStats
+	globalStatsMap := m.objs.KgStats
 	if globalStatsMap == nil {
-		return aggregate, errors.New("BPF global_stats map is nil (was it loaded?)")
+		return aggregate, errors.New("BPF kg_stats map is nil (was it loaded?)")
 	}
 
 	var perCPUValues []BpfGlobalStatsT
-	err := globalStatsMap.Lookup(index, &perCPUValues)
+	var mapKey uint32 = 0
+	err := globalStatsMap.Lookup(mapKey, &perCPUValues)
 	if err != nil {
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
-			slog.Debug("Stats key not found in BPF global_stats map, returning zero stats.", "key", index)
+			slog.Debug("Stats key not found in BPF kg_stats map, returning zero stats.", "key", mapKey)
 			return aggregate, nil
 		}
-		return aggregate, fmt.Errorf("failed lookup stats key %d in BPF global_stats map: %w", index, err)
+		return aggregate, fmt.Errorf("failed lookup stats key %d in BPF kg_stats map: %w", mapKey, err)
 	}
 
 	for _, cpuStat := range perCPUValues {
 		aggregate.Packets += cpuStat.Packets
 		aggregate.Bytes += cpuStat.Bytes
+		aggregate.Redirected += cpuStat.Redirected
+		aggregate.GetsockoptOk += cpuStat.GetsockoptOk
+		aggregate.GetsockoptFail += cpuStat.GetsockoptFail
 	}
 	return aggregate, nil
 }
 
-func (m *BPFManager) GetStats() (totalIgnored GlobalStats, matched GlobalStats, err error) {
+func (m *BPFManager) GetStats() (GlobalStats, error) {
 	m.statsCache.RLock()
 	defer m.statsCache.RUnlock()
-	totalIgnored = GlobalStats{}
-	matched = m.statsCache.lastMatched
-	return totalIgnored, matched, nil
+
+	return m.statsCache.lastTotalStats, nil
 }
