@@ -49,7 +49,7 @@ int kernelgatekeeper_connect4(struct bpf_sock_addr *ctx) {
     }
 
 
-    __u8 *is_excluded = bpf_map_lookup_elem(&kg_client_pids, ¤t_pid_connect4);
+    __u8 *is_excluded = bpf_map_lookup_elem(&kg_client_pids, &current_pid_connect4);
     if (is_excluded && *is_excluded == 1) {
         #ifdef DEBUG
         bpf_printk("CONNECT4: Skipping connection from excluded client PID %u\n", current_pid_connect4);
