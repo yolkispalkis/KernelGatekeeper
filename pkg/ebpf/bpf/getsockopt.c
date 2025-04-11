@@ -117,6 +117,11 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     __s32 sockaddr_size = sizeof(struct sockaddr_in);
     ctx->optlen = sockaddr_size; // Set the output length
 
+    // Add a volatile read operation between the two writes to prevent the compiler
+    // from merging them into a single 64-bit write instruction (stxdw).
+    // Reading 'level' is arbitrary; any volatile read from ctx should work.
+    volatile __u32 dummy_read __attribute__((unused)) = ctx->level;
+
     // Set the return value of the getsockopt syscall to 0 (success)
     ctx->retval = 0;
 
