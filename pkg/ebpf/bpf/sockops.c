@@ -68,6 +68,20 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
         return BPF_OK;
     }
 
+    // Log PID immediately after lookup
+    #ifdef DEBUG
+    bpf_printk("SOCKOPS_READ: Read details for Cookie=%llu, PID in details=%u\n", sock_cookie, details->pid);
+    #endif
+
+    // Check if PID is 0 after reading
+    if (details->pid == 0) {
+        bpf_printk("SOCKOPS_WARN: PID read from kg_orig_dest map is 0 for Cookie=%llu. Skipping notification.\n", sock_cookie);
+        // Optionally delete the map entry? Depends if getsockopt still needs it.
+        // For now, just skip notification.
+        return BPF_OK;
+    }
+
+
     // Key for the port_to_cookie map is the source port (local port in sockops context)
     __u16 src_port_h = (__u16)skops->local_port; // Source port (Host Byte Order)
 
@@ -80,7 +94,7 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
         bpf_map_delete_elem(&kg_orig_dest, &sock_cookie);
     } else {
         #ifdef DEBUG
-        bpf_printk("SOCKOPS: Stored port->cookie mapping (%u -> %llu)\n", src_port_h, sock_cookie);
+        // bpf_printk("SOCKOPS: Stored port->cookie mapping (%u -> %llu)\n", src_port_h, sock_cookie);
         #endif
 
         // Send notification to userspace via ring buffer
@@ -90,12 +104,12 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
             bpf_printk("SOCKOPS_ERR: Failed to reserve space in ring buffer for notification.\n");
             // If reserve fails, should we clean up maps? Maybe not immediately, could retry later.
         } else {
-            // --- MODIFICATION START ---
-            // Use the PID stored during the connect4 hook (details->pid)
-            // instead of calling bpf_get_current_pid_tgid() here.
-            notif->pid_tgid = (__u64)details->pid;
-            // --- MODIFICATION END ---
+            // Log PID just before submitting
+            #ifdef DEBUG
+            bpf_printk("SOCKOPS_SUBMIT: Submitting notification for PID=%u (from details), Cookie=%llu\n", details->pid, sock_cookie);
+            #endif
 
+            notif->pid_tgid = (__u64)details->pid; // Use PID from details
             notif->src_ip = skops->local_ip4;         // Source IP is local IP in this context (the app's IP)
             notif->orig_dst_ip = details->dst_ip;     // Original Dest IP from connect4 hook
             notif->src_port = bpf_htons(src_port_h);   // Source port (network order)
@@ -103,9 +117,6 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
             notif->protocol = IPPROTO_TCP;            // Assuming TCP
 
             bpf_ringbuf_submit(notif, 0);
-            #ifdef DEBUG
-            bpf_printk("SOCKOPS: Submitted notification for PID %u (from details) to ring buffer.\n", details->pid);
-            #endif
         }
     }
 
