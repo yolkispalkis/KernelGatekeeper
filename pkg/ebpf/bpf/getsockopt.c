@@ -3,8 +3,6 @@
 
 #include <linux/bpf.h>
 #include <linux/in.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include <linux/socket.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
@@ -19,6 +17,19 @@
 #ifndef SOL_IP
 #define SOL_IP IPPROTO_IP
 #endif
+
+#ifndef _LINUX_SOCKET_H
+struct sockaddr_in {
+    unsigned short sin_family;
+    unsigned short sin_port;
+    struct in_addr sin_addr;
+    unsigned char sin_zero[8];
+};
+struct in_addr {
+    unsigned int s_addr;
+};
+#endif
+
 
 static __always_inline void kg_stats_inc(int field) {
     __u32 key = 0;
@@ -35,6 +46,7 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     if (ctx->level != SOL_IP || ctx->optname != SO_ORIGINAL_DST) {
         return 1;
     }
+
     if (ctx->sk == NULL || ctx->sk->family != AF_INET || ctx->sk->protocol != IPPROTO_TCP) {
          #ifdef DEBUG
          bpf_printk("GETSOCKOPT: Ignoring non-IPv4/TCP getsockopt or NULL sk.\n");
