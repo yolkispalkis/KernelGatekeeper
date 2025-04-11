@@ -3,7 +3,9 @@
 
 #include <linux/bpf.h>
 #include <linux/in.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
+#include <linux/socket.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include "bpf_shared.h"
@@ -13,6 +15,9 @@
 #endif
 #ifndef IPPROTO_TCP
 #define IPPROTO_TCP 6
+#endif
+#ifndef SOL_IP
+#define SOL_IP IPPROTO_IP
 #endif
 
 static __always_inline void kg_stats_inc(int field) {
@@ -72,7 +77,6 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_ERR: Invalid optval buffer for cookie %llu (port %u).\n", cookie, peer_port_h);
         #endif
-
         bpf_map_delete_elem(&kg_orig_dest, &cookie);
         bpf_map_delete_elem(&kg_port_to_cookie, &peer_port_h);
         kg_stats_inc(3);
