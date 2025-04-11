@@ -50,24 +50,27 @@ func (cm *ClientManager) AddClientConn(conn net.Conn, reportedPID int) (*ClientS
 		return nil, errors.New("cannot add nil connection")
 	}
 
+	// Get credentials from the connection
 	peerCred, err := getPeerCredFromConn(conn)
 	if err != nil {
-
+		// Log error getting credentials
 		remoteAddr := "unknown"
 		if conn.RemoteAddr() != nil {
 			remoteAddr = conn.RemoteAddr().String()
 		}
 		slog.Error("Failed to get peer credentials for registering client", "remote_addr", remoteAddr, "error", err)
-
+		// Return error - critical for security/mapping
 		return nil, fmt.Errorf("security check failed: could not get peer credentials: %w", err)
 	}
 
 	uid := peerCred.Uid
-	credentialPID := peerCred.Pid
+	credentialPID := peerCred.Pid // Use PID from credentials as the source of truth
 
+	// Compare reported PID with credential PID (optional logging)
 	if int32(reportedPID) != credentialPID {
 		slog.Warn("Client reported PID differs from socket credential PID",
 			"reported_pid", reportedPID, "credential_pid", credentialPID, "uid", uid, "remote_addr", conn.RemoteAddr())
+		// Decide if this is an error or just a warning. For now, warning.
 	} else {
 		slog.Debug("Client reported PID matches socket credential PID", "pid", credentialPID, "uid", uid)
 	}
@@ -75,27 +78,31 @@ func (cm *ClientManager) AddClientConn(conn net.Conn, reportedPID int) (*ClientS
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
+	// Check if this connection already exists (should not happen ideally)
 	if existingState, exists := cm.clients[conn]; exists {
 		slog.Warn("Client connection already exists in map during add? Replacing.",
 			"remote_addr", conn.RemoteAddr(), "existing_uid", existingState.UID, "existing_pid", existingState.PID)
-
+		// Consider removing the old PID from BPF exclusion first?
+		// If cm.bpfManager != nil { cm.bpfManager.RemoveExcludedPID(existingState.PID) }
 	}
 
+	// Create the new state using the credential PID
 	newState := &ClientState{
 		UID:         uid,
 		PID:         uint32(credentialPID),
-		ReportedPID: reportedPID,
+		ReportedPID: reportedPID, // Store reported PID for reference/logging
 		Conn:        conn,
 		Registered:  time.Now(),
-		LastPing:    time.Now(),
+		LastPing:    time.Now(), // Initialize last ping time
 	}
 	cm.clients[conn] = newState
 	clientCount := len(cm.clients)
 
+	// Add the credential PID to BPF exclusion map
 	if cm.bpfManager != nil {
 		if err := cm.bpfManager.AddExcludedPID(newState.PID); err != nil {
 			slog.Error("Failed to add client PID to BPF exclusion map", "pid", newState.PID, "error", err)
-
+			// If adding to BPF fails, registration fails. Remove the client state.
 			delete(cm.clients, conn)
 			return nil, fmt.Errorf("failed to update BPF exclusion map: %w", err)
 		}
@@ -122,24 +129,24 @@ func (cm *ClientManager) RemoveClientConn(conn net.Conn) {
 
 	if ok {
 		slog.Info("IPC client removed", "remote_addr", conn.RemoteAddr(), "uid", state.UID, "pid", state.PID, "total_clients", clientCount)
-
+		// Remove PID from BPF exclusion map
 		if cm.bpfManager != nil {
 			if err := cm.bpfManager.RemoveExcludedPID(state.PID); err != nil {
 				slog.Error("Failed to remove client PID from BPF exclusion map", "pid", state.PID, "error", err)
-
+				// Continue cleanup even if BPF removal fails
 			}
 		} else {
 			slog.Warn("BPFManager not available, cannot remove client PID from exclusion map", "pid", state.PID)
 		}
-
+		// Close the connection
 		if err := conn.Close(); err != nil {
-
+			// Avoid logging expected errors on already closed connections
 			if !errors.Is(err, net.ErrClosed) && !common.IsConnectionClosedErr(err) {
 				slog.Warn("Error closing removed IPC client connection", "remote_addr", conn.RemoteAddr(), "error", err)
 			}
 		}
 	} else {
-
+		// Connection might have been removed already, or was never added
 		slog.Debug("Attempted to remove non-existent or already removed IPC client", "remote_addr", conn.RemoteAddr())
 	}
 }
@@ -150,14 +157,29 @@ func (cm *ClientManager) GetClientCount() int {
 	return len(cm.clients)
 }
 
+// GetClientState retrieves the state associated with a connection.
 func (cm *ClientManager) GetClientState(conn net.Conn) *ClientState {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
-
+	// Returns nil if not found, which is the desired behavior
 	state := cm.clients[conn]
 	return state
 }
 
+// FindClientConnByUID searches for an active client connection by its UID.
+// Returns the connection if found, otherwise nil.
+func (cm *ClientManager) FindClientConnByUID(uid uint32) net.Conn {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	for conn, state := range cm.clients {
+		if state.UID == uid {
+			return conn // Found the client's connection
+		}
+	}
+	return nil // Not found
+}
+
+// UpdateClientStatus updates the last ping time and status for a client.
 func (cm *ClientManager) UpdateClientStatus(conn net.Conn, status ipc.PingStatusData) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -171,36 +193,42 @@ func (cm *ClientManager) UpdateClientStatus(conn net.Conn, status ipc.PingStatus
 	return false
 }
 
+// GetAllClientDetails returns info for all currently connected clients.
 func (cm *ClientManager) GetAllClientDetails() ([]ipc.ClientInfo, map[uint32]ipc.ClientKerberosStatus) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
 	clientDetails := make([]ipc.ClientInfo, 0, len(cm.clients))
-
+	// Use UID as key for Kerberos status map, as one user might have multiple client instances (though unlikely)
 	clientKerberosStates := make(map[uint32]ipc.ClientKerberosStatus)
 	now := time.Now()
 
 	for _, state := range cm.clients {
-
+		// Add basic info
 		clientDetails = append(clientDetails, ipc.ClientInfo{PID: state.PID, UID: state.UID})
 
+		// Add Kerberos status if the last ping was recent enough
 		if !state.LastPing.IsZero() && now.Sub(state.LastPing) < clientStatusTTL {
-
+			// Only add if status is initialized or has useful info?
+			// For now, add whatever the client sent last.
 			clientKerberosStates[state.UID] = state.LastStatus.KerberosStatus
 		} else if !state.LastPing.IsZero() {
 			slog.Debug("Kerberos status for client expired", "uid", state.UID, "pid", state.PID, "last_ping", state.LastPing)
-
+			// Optionally add an entry indicating expired status?
+			// clientKerberosStates[state.UID] = ipc.ClientKerberosStatus{ Initialized: false, TgtTimeLeft: "Expired (TTL)" }
 		} else {
 			slog.Debug("No recent ping status available for client", "uid", state.UID, "pid", state.PID)
-
+			// Optionally add an entry indicating unknown status?
+			// clientKerberosStates[state.UID] = ipc.ClientKerberosStatus{ Initialized: false, TgtTimeLeft: "Unknown (No Ping)" }
 		}
 	}
 	return clientDetails, clientKerberosStates
 }
 
+// CloseAllClients closes all managed client connections.
 func (cm *ClientManager) CloseAllClients(ctx context.Context) {
 	cm.mu.Lock()
-
+	// Create copies of connections and PIDs to avoid holding lock during close/BPF operations
 	connsToClose := make([]net.Conn, 0, len(cm.clients))
 	pidsToRemove := make([]uint32, 0, len(cm.clients))
 	slog.Info("Closing all client connections", "count", len(cm.clients))
@@ -209,9 +237,11 @@ func (cm *ClientManager) CloseAllClients(ctx context.Context) {
 		pidsToRemove = append(pidsToRemove, s.PID)
 		slog.Debug("Marking client connection for closure", "uid", s.UID, "pid", s.PID)
 	}
+	// Clear the map while still holding the lock
 	cm.clients = make(map[net.Conn]*ClientState)
-	cm.mu.Unlock()
+	cm.mu.Unlock() // Release lock before closing connections and interacting with BPF
 
+	// Remove PIDs from BPF map
 	if cm.bpfManager != nil {
 		for _, pid := range pidsToRemove {
 			if err := cm.bpfManager.RemoveExcludedPID(pid); err != nil {
@@ -227,6 +257,7 @@ func (cm *ClientManager) CloseAllClients(ctx context.Context) {
 		return
 	}
 
+	// Close connections concurrently
 	closeWg := sync.WaitGroup{}
 	closeWg.Add(len(connsToClose))
 
@@ -234,7 +265,7 @@ func (cm *ClientManager) CloseAllClients(ctx context.Context) {
 		go func(c net.Conn) {
 			defer closeWg.Done()
 			if err := c.Close(); err != nil {
-
+				// Log only unexpected errors
 				if !errors.Is(err, net.ErrClosed) && !common.IsConnectionClosedErr(err) {
 					remoteAddr := "unknown"
 					if c.RemoteAddr() != nil {
@@ -246,6 +277,7 @@ func (cm *ClientManager) CloseAllClients(ctx context.Context) {
 		}(conn)
 	}
 
+	// Wait for all closes to complete, with timeout from context
 	closeDone := make(chan struct{})
 	go func() {
 		closeWg.Wait()
@@ -260,10 +292,12 @@ func (cm *ClientManager) CloseAllClients(ctx context.Context) {
 	}
 }
 
+// getPeerCredFromConn extracts UID/PID from a Unix domain socket connection.
 func getPeerCredFromConn(conn net.Conn) (*unix.Ucred, error) {
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
-
+		// Fallback for non-UnixConn types (e.g., TCP connection proxied through systemd socket activation)
+		// Try to get the underlying file descriptor
 		fileConn, okFile := conn.(interface{ File() (*os.File, error) })
 		if !okFile {
 			return nil, fmt.Errorf("connection type %T does not support peer credentials", conn)
@@ -282,13 +316,14 @@ func getPeerCredFromConn(conn net.Conn) (*unix.Ucred, error) {
 			return nil, fmt.Errorf("getsockopt SO_PEERCRED failed on fd %d: %w", fdInt, err)
 		}
 		if ucred == nil {
-
+			// This case should ideally not happen if getsockopt returns no error
 			return nil, fmt.Errorf("getsockopt SO_PEERCRED on fd %d returned nil credentials without error", fdInt)
 		}
 		slog.Debug("Successfully obtained peer credentials via File()", "fd", fdInt, "uid", ucred.Uid, "pid", ucred.Pid)
 		return ucred, nil
 	}
 
+	// Preferred method for UnixConn
 	rawConn, err := unixConn.SyscallConn()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get SyscallConn from UnixConn: %w", err)
@@ -310,7 +345,7 @@ func getPeerCredFromConn(conn net.Conn) (*unix.Ucred, error) {
 		return nil, fmt.Errorf("getsockopt SO_PEERCRED failed: %w", sockoptErr)
 	}
 	if ucred == nil {
-
+		// This case should ideally not happen if getsockopt returns no error
 		return nil, errors.New("getsockopt SO_PEERCRED returned nil credentials without error via SyscallConn")
 	}
 

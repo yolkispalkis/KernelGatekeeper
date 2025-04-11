@@ -23,7 +23,7 @@ const (
 type BpfProcessor struct {
 	stateManager *StateManager
 	clientMgr    *ClientManager
-	notifChan    <-chan ebpf.NotificationTuple
+	notifChan    <-chan ebpf.NotificationTuple // Use the type from ebpf package
 }
 
 func NewBpfProcessor(stateMgr *StateManager) *BpfProcessor {
@@ -37,7 +37,7 @@ func NewBpfProcessor(stateMgr *StateManager) *BpfProcessor {
 		slog.Error("FATAL: BpfProcessor created with nil ClientManager in StateManager")
 		return nil
 	}
-	if stateMgr.GetNotificationChannel() == nil {
+	if stateMgr.GetNotificationChannel() == nil { // Call the new method
 		slog.Error("FATAL: BpfProcessor created with nil NotificationChannel in StateManager")
 		return nil
 	}
@@ -45,7 +45,7 @@ func NewBpfProcessor(stateMgr *StateManager) *BpfProcessor {
 	return &BpfProcessor{
 		stateManager: stateMgr,
 		clientMgr:    stateMgr.GetClientManager(),
-		notifChan:    stateMgr.GetNotificationChannel(),
+		notifChan:    stateMgr.GetNotificationChannel(), // Call the new method
 	}
 }
 
@@ -94,7 +94,7 @@ func (bp *BpfProcessor) Run(ctx context.Context) {
 }
 
 // processSingleNotification handles one BPF event.
-func (bp *BpfProcessor) processSingleNotification(ctx context.Context, notification ebpf.NotificationTuple, excludedPaths []string) {
+func (bp *BpfProcessor) processSingleNotification(ctx context.Context, notification ebpf.NotificationTuple, excludedPaths []string) { // Use the type from ebpf package
 	pidTgid := notification.PidTgid
 	pid := uint32(pidTgid & 0xFFFFFFFF) // Extract PID
 
@@ -147,7 +147,7 @@ func (bp *BpfProcessor) processSingleNotification(ctx context.Context, notificat
 	}
 	logCtx = logCtx.With("uid", uid) // Add UID to log context
 
-	clientConn := bp.clientMgr.FindClientConnByUID(uid)
+	clientConn := bp.clientMgr.FindClientConnByUID(uid) // Call the new method
 	if clientConn == nil {
 		logCtx.Debug("No registered client found for UID, skipping notification")
 		return // No client to send the notification to
@@ -158,7 +158,7 @@ func (bp *BpfProcessor) processSingleNotification(ctx context.Context, notificat
 
 	// Ensure ports are in expected format (assuming BPF gives network byte order, IPC wants host?)
 	// Let's assume IPC expects host byte order for ports for now.
-	ipcNotifData := ipc.NotifyAcceptData{
+	ipcNotifData := ipc.NotifyAcceptData{ // Use the newly defined struct
 		SrcIP:    notification.SrcIP.String(),
 		DstIP:    notification.OrigDstIP.String(),
 		SrcPort:  notification.SrcPort,     // Keep as is if BPF outputs host byte order

@@ -17,6 +17,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf" // Added import
 	"github.com/cilium/ebpf/rlimit"
 
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
@@ -56,6 +57,7 @@ type bpfObjects struct {
 	KgClientPids               *ebpf.Map     `ebpf:"kg_client_pids"`
 	KgConfig                   *ebpf.Map     `ebpf:"kg_config"`
 	KgStats                    *ebpf.Map     `ebpf:"kg_stats"`
+	KgNotifRb                  *ebpf.Map     `ebpf:"kg_notif_rb"` // Added for ring buffer map
 }
 
 func (o *bpfObjects) Close() error {
@@ -95,8 +97,8 @@ type BPFManager struct {
 	stopChan            chan struct{}
 	statsCache          StatsCache
 	mu                  sync.Mutex
-	notificationReader  *ringbuf.Reader             // Added field
-	notificationChannel chan ebpf.NotificationTuple // Added field
+	notificationReader  *ringbuf.Reader        // Added field
+	notificationChannel chan NotificationTuple // Changed type to local NotificationTuple
 }
 
 func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint16) (*BPFManager, error) {
@@ -114,11 +116,14 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 			LogLevel: ebpf.LogLevelInstruction,
 		},
 	}
-
-	opts.MapReplacements = map[string]*ebpf.MapSpec{
-		"kg_orig_dest":      {Name: "kg_orig_dest", MaxEntries: uint32(cfg.OrigDestMapSize)},
-		"kg_port_to_cookie": {Name: "kg_port_to_cookie", MaxEntries: uint32(cfg.PortMapSize)},
-	}
+	// The MapReplacements should use *ebpf.Map, not *ebpf.MapSpec.
+	// MapSpec replacements are usually handled directly by LoadAndAssign finding pinned maps
+	// or by providing specs in CollectionOptions.
+	// We will load connect4 first, then use its maps for the subsequent loads.
+	// opts.MapReplacements = map[string]*ebpf.MapSpec{
+	// 	"kg_orig_dest":      {Name: "kg_orig_dest", MaxEntries: uint32(cfg.OrigDestMapSize)},
+	// 	"kg_port_to_cookie": {Name: "kg_port_to_cookie", MaxEntries: uint32(cfg.PortMapSize)},
+	// }
 
 	specConnect4, err := loadBpf_connect4()
 	if err != nil {
@@ -133,12 +138,21 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 		return nil, fmt.Errorf("failed to load getsockopt BPF spec: %w", err)
 	}
 
+	// Set MapReplacements for specific maps if needed before loading connect4,
+	// especially if overriding pinned maps or default specs.
+	// Example: (uncomment and adjust if specific spec override is needed here)
+	// opts.MapReplacements = map[string]*ebpf.Map{
+	// 	"kg_orig_dest": {Spec: &ebpf.MapSpec{Name: "kg_orig_dest", MaxEntries: uint32(cfg.OrigDestMapSize)}},
+	// 	// ... etc
+	// }
+
 	if err := specConnect4.LoadAndAssign(&objs.bpf_connect4Objects, opts); err != nil {
 		handleVerifierError("connect4", err)
 		return nil, fmt.Errorf("failed to load eBPF connect4 objects: %w", err)
 	}
 	slog.Debug("eBPF connect4 objects loaded successfully.")
 
+	// Assign references from the loaded connect4 objects
 	objs.KernelgatekeeperConnect4 = objs.bpf_connect4Objects.KernelgatekeeperConnect4
 	objs.KgOrigDest = objs.bpf_connect4Objects.KgOrigDest
 	objs.KgPortToCookie = objs.bpf_connect4Objects.KgPortToCookie
@@ -146,7 +160,9 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 	objs.KgClientPids = objs.bpf_connect4Objects.KgClientPids
 	objs.KgConfig = objs.bpf_connect4Objects.KgConfig
 	objs.KgStats = objs.bpf_connect4Objects.KgStats
+	objs.KgNotifRb = objs.bpf_connect4Objects.KgNotifRb // Assign ring buffer map
 
+	// Now set MapReplacements using the actual *Map objects loaded by connect4
 	opts.MapReplacements = map[string]*ebpf.Map{
 		"kg_orig_dest":      objs.KgOrigDest,
 		"kg_port_to_cookie": objs.KgPortToCookie,
@@ -154,6 +170,7 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 		"kg_client_pids":    objs.KgClientPids,
 		"kg_config":         objs.KgConfig,
 		"kg_stats":          objs.KgStats,
+		"kg_notif_rb":       objs.KgNotifRb, // Pass ring buffer map to subsequent loads
 	}
 	if err := specSockops.LoadAndAssign(&objs.bpf_sockopsObjects, opts); err != nil {
 		handleVerifierError("sockops", err)
@@ -163,10 +180,12 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 	slog.Debug("eBPF sockops objects loaded successfully.")
 	objs.KernelgatekeeperSockops = objs.bpf_sockopsObjects.KernelgatekeeperSockops
 
+	// Reduce replacements for getsockopt as it uses fewer maps
 	opts.MapReplacements = map[string]*ebpf.Map{
 		"kg_orig_dest":      objs.KgOrigDest,
 		"kg_port_to_cookie": objs.KgPortToCookie,
 		"kg_stats":          objs.KgStats,
+		// Note: kg_notif_rb is not used by getsockopt.c
 	}
 	if err := specGetsockopt.LoadAndAssign(&objs.bpf_getsockoptObjects, opts); err != nil {
 		handleVerifierError("getsockopt", err)
@@ -182,11 +201,11 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 		objs:                objs,
 		stopChan:            make(chan struct{}),
 		notificationChannel: make(chan NotificationTuple, cfg.NotificationChannelSize), // Initialize channel
-	}
+	} // Use local NotificationTuple
 	manager.statsCache.lastStatsTime = time.Now()
 
 	if objs.KernelgatekeeperConnect4 == nil || objs.KernelgatekeeperSockops == nil || objs.KernelgatekeeperGetsockopt == nil ||
-		objs.KgOrigDest == nil || objs.KgPortToCookie == nil || objs.TargetPorts == nil || objs.KgClientPids == nil ||
+		objs.KgOrigDest == nil || objs.KgPortToCookie == nil || objs.TargetPorts == nil || objs.KgClientPids == nil || objs.KgNotifRb == nil || // Check ring buffer map
 		objs.KgConfig == nil || objs.KgStats == nil {
 		manager.objs.Close()
 		return nil, errors.New("one or more required BPF programs or maps failed to load or assign after merging objects")
@@ -194,7 +213,7 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 
 	// Initialize ring buffer reader if the map exists
 	if objs.KgNotifRb != nil {
-		rd, err := ringbuf.NewReader(objs.KgNotifRb)
+		rd, err := ringbuf.NewReader(objs.KgNotifRb) // Use ringbuf subpackage
 		if err != nil {
 			manager.Close()
 			return nil, fmt.Errorf("failed to create ring buffer reader: %w", err)
@@ -383,6 +402,6 @@ func (m *BPFManager) Close() error {
 }
 
 // GetNotificationChannel returns the channel for receiving BPF notifications.
-func (m *BPFManager) GetNotificationChannel() <-chan NotificationTuple {
+func (m *BPFManager) GetNotificationChannel() <-chan NotificationTuple { // Use local NotificationTuple
 	return m.notificationChannel
 }

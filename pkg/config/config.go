@@ -60,13 +60,14 @@ type KerberosConfig struct {
 }
 
 type EBPFConfig struct {
-	ProgramPath     string   `mapstructure:"programPath"`
-	TargetPorts     []int    `mapstructure:"targetPorts"`
-	LoadMode        string   `mapstructure:"loadMode"`
-	StatsInterval   int      `mapstructure:"statsInterval"`
-	Excluded        []string `mapstructure:"excluded"`
-	OrigDestMapSize int      `mapstructure:"origDestMapSize"`
-	PortMapSize     int      `mapstructure:"portMapSize"`
+	ProgramPath             string   `mapstructure:"programPath"`
+	TargetPorts             []int    `mapstructure:"targetPorts"`
+	LoadMode                string   `mapstructure:"loadMode"`
+	StatsInterval           int      `mapstructure:"statsInterval"`
+	Excluded                []string `mapstructure:"excluded"`
+	NotificationChannelSize int      `mapstructure:"notificationChannelSize"`
+	OrigDestMapSize         int      `mapstructure:"origDestMapSize"`
+	PortMapSize             int      `mapstructure:"portMapSize"`
 }
 
 func LoadConfig(configPath string) (*Config, error) {
@@ -75,7 +76,7 @@ func LoadConfig(configPath string) (*Config, error) {
 		v.SetConfigFile(configPath)
 		v.SetConfigType(filepath.Ext(configPath)[1:])
 	} else {
-
+		// Look for config in standard locations
 		v.AddConfigPath("/etc/kernelgatekeeper/")
 		v.AddConfigPath("$HOME/.config/kernelgatekeeper")
 		v.AddConfigPath(".")
@@ -92,13 +93,13 @@ func LoadConfig(configPath string) (*Config, error) {
 	if err := v.ReadInConfig(); err != nil {
 		var configFileNotFoundError viper.ConfigFileNotFoundError
 		if errors.As(err, &configFileNotFoundError) && configPath == "" {
-
+			// Config file not found in default paths; rely on defaults/env vars
 			slog.Warn("Configuration file not found in default locations, using defaults and environment variables.")
 		} else if errors.As(err, &configFileNotFoundError) && configPath != "" {
-
+			// Config file not found at specified path
 			return nil, fmt.Errorf("configuration file not found at specified path %s: %w", configPath, err)
 		} else {
-
+			// Some other error reading the config file
 			return nil, fmt.Errorf("error reading configuration file %s: %w", v.ConfigFileUsed(), err)
 		}
 	} else {
@@ -106,13 +107,15 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 
 	var config Config
-
+	// Unmarshal the config
 	if err := v.Unmarshal(&config); err != nil {
 		return nil, fmt.Errorf("error unmarshalling configuration: %w", err)
 	}
 
+	// Explicitly handle duration conversion for ShutdownTimeout
 	config.ShutdownTimeout = time.Duration(v.GetInt("shutdownTimeout")) * time.Second
 
+	// Validate the configuration
 	if err := validateConfig(&config); err != nil {
 		return nil, fmt.Errorf("configuration validation failed: %w", err)
 	}
@@ -121,7 +124,7 @@ func LoadConfig(configPath string) (*Config, error) {
 }
 
 func validateConfig(cfg *Config) error {
-
+	// Validate Proxy settings
 	validProxyTypes := map[string]bool{"http": true, "https": true, "wpad": true, "none": true}
 	if !validProxyTypes[strings.ToLower(cfg.Proxy.Type)] {
 		return fmt.Errorf("invalid proxy.type: '%s', must be one of: http, https, wpad, none", cfg.Proxy.Type)
@@ -139,7 +142,7 @@ func validateConfig(cfg *Config) error {
 		if cfg.Proxy.WpadURL == "" {
 			return errors.New("proxy.wpadUrl is required when proxy.type is 'wpad'")
 		}
-
+		// Validate wpadUrl format
 		u, err := url.Parse(cfg.Proxy.WpadURL)
 		if err != nil {
 			return fmt.Errorf("invalid proxy.wpadUrl: %w", err)
@@ -159,6 +162,7 @@ func validateConfig(cfg *Config) error {
 		cfg.Proxy.PacFileTTL = DefaultPacFileTTL
 	}
 
+	// Validate EBPF settings
 	if len(cfg.EBPF.TargetPorts) == 0 {
 		slog.Warn("ebpf.targetPorts is empty, no connections will be proxied by default")
 	}
@@ -178,17 +182,20 @@ func validateConfig(cfg *Config) error {
 		slog.Warn("ebpf.origDestMapSize is not positive, using default", "default", DefaultEBPFMapSize)
 		cfg.EBPF.OrigDestMapSize = DefaultEBPFMapSize
 	}
+	// Note: NotificationChannelSize validation could be added here if needed
 	if cfg.EBPF.PortMapSize <= 0 {
 		slog.Warn("ebpf.portMapSize is not positive, using default", "default", DefaultEBPFMapSize)
 		cfg.EBPF.PortMapSize = DefaultEBPFMapSize
 	}
 
+	// Validate Log settings
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLogLevels[strings.ToLower(cfg.LogLevel)] {
 		slog.Warn("Invalid logLevel in config, using default", "configured", cfg.LogLevel, "default", DefaultLogLevel)
 		cfg.LogLevel = DefaultLogLevel
 	}
 
+	// Validate General settings
 	if cfg.ShutdownTimeout <= 0 {
 		slog.Warn("shutdownTimeout must be positive, using default", "default", DefaultShutdownTimeout)
 		cfg.ShutdownTimeout = time.Duration(DefaultShutdownTimeout) * time.Second
@@ -213,13 +220,16 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("proxy.pacExecutionTimeout", DefaultPacExecTimeout)
 	v.SetDefault("proxy.pacFileTtl", DefaultPacFileTTL)
 
+	// Kerberos defaults (client mostly relies on environment/system config)
 	v.SetDefault("kerberos.enableCache", true)
+	// Other kerberos settings like realm, kdcHost, principal, keytabPath are intentionally not defaulted
 
 	v.SetDefault("ebpf.loadMode", DefaultEBPFLoadMode)
 	v.SetDefault("ebpf.statsInterval", DefaultEBPFStatsInterval)
 	v.SetDefault("ebpf.targetPorts", []int{80, 443})
 	v.SetDefault("ebpf.excluded", []string{})
 	v.SetDefault("ebpf.origDestMapSize", DefaultEBPFMapSize)
+	v.SetDefault("ebpf.notificationChannelSize", 4096) // Default size
 	v.SetDefault("ebpf.portMapSize", DefaultEBPFMapSize)
 
 	v.SetDefault("logLevel", DefaultLogLevel)

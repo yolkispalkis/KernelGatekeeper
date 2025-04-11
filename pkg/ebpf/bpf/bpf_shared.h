@@ -72,4 +72,20 @@ struct {
     __type(value, struct global_stats_t);
 } kg_stats SEC(".maps");
 
+// Ring buffer for sending connection details to userspace service
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024); // 256 KB buffer size
+} kg_notif_rb SEC(".maps");
+
+// Struct sent via ring buffer
+struct notification_tuple_t {
+    __u64 pid_tgid;      // PID and TGID of the process initiating connection
+    __be32 src_ip;       // Source IP address
+    __be32 orig_dst_ip;  // Original Destination IP address (before redirection)
+    __be16 src_port;     // Source Port (network byte order)
+    __be16 orig_dst_port;// Original Destination Port (before redirection, network byte order)
+    __u8   protocol;     // L4 protocol (e.g., IPPROTO_TCP)
+};
+
 #endif // BPF_SHARED_H

@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	localListenAddr = "127.0.0.1"
+	LocalListenAddr = "127.0.0.1" // Exported constant
 )
 
 type LocalListener struct {
@@ -24,7 +24,7 @@ func NewLocalListener(port uint16) *LocalListener {
 		slog.Warn("Client listener port not configured or zero, using default", "default", port)
 	}
 	return &LocalListener{
-		address: fmt.Sprintf("%s:%d", localListenAddr, port),
+		address: fmt.Sprintf("%s:%d", LocalListenAddr, port), // Use exported constant
 	}
 }
 
@@ -81,6 +81,7 @@ func (l *LocalListener) IP() net.IP {
 	return tcpAddr.IP
 }
 
+// ParseListenerIP is deprecated if only LocalListenAddr is used, but kept for potential future use.
 func ParseListenerIP(ipStr string) (uint32, error) {
 	ip := net.ParseIP(ipStr).To4()
 	if ip == nil {

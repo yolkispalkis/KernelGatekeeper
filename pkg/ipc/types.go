@@ -30,6 +30,16 @@ type PingStatusData struct {
 	KerberosStatus    ClientKerberosStatus `json:"kerberos_status"`
 }
 
+// NotifyAcceptData contains details about a connection redirected by BPF,
+// sent from the service to the client.
+type NotifyAcceptData struct {
+	SrcIP    string `json:"src_ip"`
+	DstIP    string `json:"dst_ip"` // Original destination
+	SrcPort  uint16 `json:"src_port"`
+	DstPort  uint16 `json:"dst_port"` // Original destination
+	Protocol uint8  `json:"protocol"`
+}
+
 type ClientKerberosStatus struct {
 	Initialized         bool   `json:"initialized"`
 	Principal           string `json:"principal,omitempty"`
