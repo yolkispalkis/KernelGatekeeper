@@ -9,6 +9,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_core_read.h> // Для CO-RE
 #include "bpf_shared.h"
+#include "vmlinux.h"
 
 #ifndef AF_INET
 #define AF_INET 2
