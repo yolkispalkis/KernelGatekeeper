@@ -47,9 +47,9 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
 
     // --- Чтение family и protocol сразу после проверки на NULL ---
     // Используем временные переменные для хранения результатов
-    // volatile может помочь верификатору
-    volatile __u16 family;
-    volatile __u8 protocol;
+    // Убрали volatile
+    __u16 family;
+    __u8 protocol;
     int err;
 
     // Используем хелпер bpf_core_read вместо макроса BPF_CORE_READ
