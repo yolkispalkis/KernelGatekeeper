@@ -7,7 +7,7 @@
 
 #define SO_ORIGINAL_DST 80
 
-// --- Struct definitions remain the same ---
+// --- Struct definitions ---
 struct dev_inode_key {
     __u64 dev_id;
     __u64 inode_id;
@@ -43,16 +43,48 @@ struct notification_tuple_t {
     __u8   protocol;
 };
 
-
-// --- Map definitions remain the same ---
+// --- Map definitions ---
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024); // Make sure max_entries is appropriate
+    __uint(max_entries, 1024); 
     __type(key, struct dev_inode_key);
     __type(value, __u8);
 } excluded_dev_inodes SEC(".maps");
 
-// ... (other map definitions) ...
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32); // PID
+    __type(value, __u8);
+} kg_client_pids SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u16); // Port number
+    __type(value, __u8);
+} target_ports SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64); // Socket cookie
+    __type(value, struct original_dest_t);
+} kg_orig_dest SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u16); // Source port
+    __type(value, __u64); // Socket cookie
+} kg_port_to_cookie SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct kg_config_t);
+} kg_config SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -66,10 +98,7 @@ struct {
     __uint(max_entries, 256 * 1024); // Default size, adjust if needed
 } kg_notif_rb SEC(".maps");
 
-
-// <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-// ADD the stats helper function definition here
-// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+// Stats helper function
 // field 0: packets (connect4)
 // field 1: redirected (connect4)
 // field 2: getsockopt_ok (getsockopt)
