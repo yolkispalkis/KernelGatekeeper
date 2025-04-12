@@ -5,8 +5,6 @@
 #include <linux/in.h>
 #include <linux/fs.h>       // Для структур file, inode, super_block
 #include <linux/sched.h>    // Для task_struct, mm_struct
-#include <linux/nsproxy.h>  // Может понадобиться для mount ns id
-#include <linux/mount.h>    // Может понадобиться для mount ns id
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_core_read.h> // Для CO-RE
