@@ -83,8 +83,9 @@ func (o *bpfObjects) Close() error {
 	for _, closer := range closers {
 		if c, ok := closer.(interface{ Close() error }); ok && c != nil {
 			// Проверка на nil перед вызовом Close
-			if closer != nil { // Дополнительная проверка, т.к. bpf_xxObjects могут быть nil если load не удался
-				if err := c.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, ebpf.ErrObjectClosed) {
+			if closer != nil {
+				// Use os.ErrClosed instead of ebpf.ErrObjectClosed
+				if err := c.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 					errs = append(errs, err)
 				}
 			}
@@ -133,8 +134,7 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 			// PinPath: "/sys/fs/bpf/kernelgatekeeper", // Опционально, если нужно пинить
 		},
 		Programs: ebpf.ProgramOptions{
-			LogLevel: ebpf.LogLevelInstruction, // Более детально для отладки
-			LogSize:  ebpf.DefaultVerifierLogSize * 8,
+			LogLevel: ebpf.LogLevelInstruction, // Set LogLevel
 		},
 	}
 
@@ -538,7 +538,8 @@ func (m *BPFManager) Close() error {
 		for i, l := range links {
 			if l != nil {
 				slog.Debug(fmt.Sprintf("Closing BPF %s link...", linkNames[i]))
-				if err := l.Close(); err != nil && !errors.Is(err, link.ErrNotAttached) {
+				// Remove check for link.ErrNotAttached as it might not exist in v0.18.0
+				if err := l.Close(); err != nil {
 					slog.Error(fmt.Sprintf("Error closing BPF %s link", linkNames[i]), "error", err)
 					if firstErr == nil {
 						firstErr = fmt.Errorf("%s link close: %w", linkNames[i], err)
