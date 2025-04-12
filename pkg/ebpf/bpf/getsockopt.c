@@ -1,9 +1,9 @@
 // FILE: pkg/ebpf/bpf/getsockopt.c
 //go:build ignore
 
-#include "vmlinux.h" // Должен содержать определения struct sock, bpf_sock, inet_sock и т.д. из BTF
+#include "vmlinux.h" // Содержит struct sock, bpf_sock, sock_common и т.д.
 #include <bpf/bpf_helpers.h>
-#include <bpf/bpf_endian.h>
+#include <bpf/bpf_endian.h> // Нужен для bpf_ntohs на порте назначения
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
 #include "bpf_shared.h" // Включает определение карты kg_redir_sport_to_orig
@@ -39,7 +39,7 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
 
     if (bpf_sk->protocol != IPPROTO_TCP) {
         #ifdef DEBUG
-        bpf_printk("GETSOCKOPT_WARN: Socket is not TCP (protocol: %u), cannot get full sock struct reliably.\n", bpf_sk->protocol);
+        bpf_printk("GETSOCKOPT_WARN: Socket is not TCP (protocol: %u).\n", bpf_sk->protocol);
         #endif
         kg_stats_inc(3);
         ctx->retval = -95; // -EOPNOTSUPP
@@ -56,20 +56,16 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     }
 
     // --- Читаем порт источника из структуры сокета ---
-    // Пробуем прямой доступ к inet_sport, предполагая, что inet_sock встроена
-    __be16 sport_n; // Порт источника в сетевом порядке байт
-    // Используем sk->inet_sport напрямую как часть CO-RE пути
-    if (BPF_CORE_READ_INTO(&sport_n, sk, inet_sport)) { // <- ИСПРАВЛЕННЫЙ ПУТЬ
+    __u16 local_port_h; // Порт источника в хостовом порядке байт
+    // Путь: sk -> __sk_common -> skc_num
+    if (BPF_CORE_READ_INTO(&local_port_h, sk, __sk_common.skc_num)) { // <- ОКОНЧАТЕЛЬНЫЙ ПУТЬ
          #ifdef DEBUG
-        bpf_printk("GETSOCKOPT_ERR: Failed to read inet_sport from sock struct.\n");
+        bpf_printk("GETSOCKOPT_ERR: Failed to read __sk_common.skc_num.\n");
         #endif
         kg_stats_inc(3);
         ctx->retval = -1; // EPERM или другая ошибка
         return 0;
     }
-
-    // Преобразуем порт источника в хостовый порядок байт для поиска в карте.
-    __u16 local_port_h = bpf_ntohs(sport_n);
     // --- Конец получения порта источника ---
 
     // Ищем оригинальный адрес назначения, используя порт источника перенаправленного сокета.
@@ -85,8 +81,7 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     if (!ctx->optval || !ctx->optval_end ||
         (void *)(ctx->optval + sizeof(struct sockaddr_in)) > ctx->optval_end) {
         #ifdef DEBUG
-        bpf_printk("GETSOCKOPT_ERR: Invalid optval buffer for redir_src_port %u. optval=%p optval_end=%p needed=%d\n",
-                  local_port_h, ctx->optval, ctx->optval_end, sizeof(struct sockaddr_in));
+        bpf_printk("GETSOCKOPT_ERR: Invalid optval buffer for redir_src_port %u.\n", local_port_h);
         #endif
         bpf_map_delete_elem(&kg_redir_sport_to_orig, &local_port_h);
         kg_stats_inc(3);
@@ -98,7 +93,7 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     struct sockaddr_in sa_out = {};
     sa_out.sin_family = AF_INET;
     bpf_core_read(&sa_out.sin_addr.s_addr, sizeof(sa_out.sin_addr.s_addr), &orig_dest->dst_ip);
-    bpf_core_read(&sa_out.sin_port, sizeof(sa_out.sin_port), &orig_dest->dst_port);
+    bpf_core_read(&sa_out.sin_port, sizeof(sa_out.sin_port), &orig_dest->dst_port); // dst_port в карте хранится в сетевом порядке
 
     // Записываем оригинальный адрес назначения в буфер пользователя.
     long ret = bpf_probe_write_user(ctx->optval, &sa_out, sizeof(sa_out));
@@ -121,8 +116,8 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     bpf_map_delete_elem(&kg_redir_sport_to_orig, &local_port_h);
 
     #ifdef DEBUG
-    bpf_printk("GETSOCKOPT_OK: Provided original dest %x:%u for redir_src_port %u\n",
-              sa_out.sin_addr.s_addr, bpf_ntohs(sa_out.sin_port), local_port_h);
+    bpf_printk("GETSOCKOPT_OK: Provided original dest %x:%u (network order %u) for redir_src_port %u\n",
+              sa_out.sin_addr.s_addr, bpf_ntohs(sa_out.sin_port), sa_out.sin_port, local_port_h);
     #endif
 
     return 0; // Говорим ядру, что мы успешно обработали вызов getsockopt.
