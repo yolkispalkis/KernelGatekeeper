@@ -74,7 +74,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
+    __uint(max_entries, 8192);
     __type(key, __u16); // Source port
     __type(value, __u64); // Socket cookie
 } kg_port_to_cookie SEC(".maps");
