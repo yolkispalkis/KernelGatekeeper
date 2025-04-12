@@ -39,8 +39,35 @@ struct super_block_struct {
 
 SEC("cgroup/connect4")
 int kernelgatekeeper_connect4(struct bpf_sock_addr *ctx) {
+    // Объявляем все переменные в начале функции
+    __u16 family;
+    __u8 protocol;
+    __be16 user_port;
+    __be32 user_ip4;
+    __u16 orig_dst_port_h;
+    __u32 orig_dst_ip_n;
+    __u64 cookie;
+    int ret;
+    __u64 current_pid_tgid;
+    __u32 current_pid;
+    __u32 current_uid;
+    struct original_dest_t details = {};
+    __u32 cfg_key;
+    struct kg_config_t *cfg;
+    struct task_struct *task;
+    struct mm_struct *mm = NULL;
+    struct file *exe_file = NULL;
+    struct inode *inode = NULL;
+    struct super_block *sb = NULL;
+    __u64 dev_kernel = 0;
+    unsigned long ino_kernel = 0;
+    struct dev_inode_key key = {};
+    __u8 *excluded_flag;
+    __u8 *is_kg_client;
+    __u8 *target_flag;
+    
     // --- Начало логики исключения по dev/inode ---
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+    task = (struct task_struct *)bpf_get_current_task_btf();
     if (!task) {
         #ifdef DEBUG
         bpf_printk("CONNECT4_WARN: bpf_get_current_task_btf failed. Proceeding without exclusion check.\n");
@@ -48,7 +75,6 @@ int kernelgatekeeper_connect4(struct bpf_sock_addr *ctx) {
         goto proceed_to_main_logic;
     }
 
-    struct mm_struct *mm = NULL;
     if (bpf_core_read(&mm, sizeof(mm), &task->mm) || !mm) {
         #ifdef DEBUG
         // bpf_printk("CONNECT4_DEBUG: No mm struct for task, likely kernel thread. Proceeding.\n");
@@ -56,7 +82,6 @@ int kernelgatekeeper_connect4(struct bpf_sock_addr *ctx) {
         goto proceed_to_main_logic;
     }
 
-    struct file *exe_file = NULL;
     if (bpf_core_read(&exe_file, sizeof(exe_file), &mm->exe_file) || !exe_file) {
         #ifdef DEBUG
         bpf_printk("CONNECT4_WARN: Cannot read task->mm->exe_file. Proceeding without exclusion check.\n");
@@ -64,7 +89,6 @@ int kernelgatekeeper_connect4(struct bpf_sock_addr *ctx) {
         goto proceed_to_main_logic;
     }
 
-    struct inode *inode = NULL;
     if (bpf_core_read(&inode, sizeof(inode), &exe_file->f_inode) || !inode) {
         #ifdef DEBUG
         bpf_printk("CONNECT4_WARN: Cannot read exe_file->f_inode. Proceeding without exclusion check.\n");
@@ -72,16 +96,12 @@ int kernelgatekeeper_connect4(struct bpf_sock_addr *ctx) {
         goto proceed_to_main_logic;
     }
 
-    struct super_block *sb = NULL;
     if (bpf_core_read(&sb, sizeof(sb), &inode->i_sb) || !sb) {
         #ifdef DEBUG
         bpf_printk("CONNECT4_WARN: Cannot read inode->i_sb. Proceeding without exclusion check.\n");
         #endif
         goto proceed_to_main_logic;
     }
-
-    __u64 dev_kernel = 0;
-    unsigned long ino_kernel = 0;
     
     if (bpf_core_read(&dev_kernel, sizeof(dev_kernel), &sb->s_dev)) {
         #ifdef DEBUG
@@ -97,12 +117,11 @@ int kernelgatekeeper_connect4(struct bpf_sock_addr *ctx) {
         goto proceed_to_main_logic;
     }
 
-    struct dev_inode_key key = {};
     key.dev_id = (__u64)dev_kernel;
     key.inode_id = (__u64)ino_kernel;
 
     // Проверяем наличие в карте исключений
-    __u8 *excluded_flag = bpf_map_lookup_elem(&excluded_dev_inodes, &key);
+    excluded_flag = bpf_map_lookup_elem(&excluded_dev_inodes, &key);
     if (excluded_flag && *excluded_flag == 1) {
         #ifdef DEBUG
         char comm[16];
@@ -117,9 +136,6 @@ int kernelgatekeeper_connect4(struct bpf_sock_addr *ctx) {
 proceed_to_main_logic:
     // --- Основная логика перенаправления ---
     // Безопасное чтение полей структуры ctx
-    __u16 family;
-    __u8 protocol;
-    
     if (bpf_core_read(&family, sizeof(family), &ctx->family)) {
         return 1;
     }
@@ -134,9 +150,9 @@ proceed_to_main_logic:
     
     kg_stats_inc(0);
 
-    __u64 current_pid_tgid = bpf_get_current_pid_tgid();
-    __u32 current_pid = (__u32)(current_pid_tgid & 0xFFFFFFFF);
-    __u32 current_uid = (__u32)(bpf_get_current_uid_gid() & 0xFFFFFFFF);
+    current_pid_tgid = bpf_get_current_pid_tgid();
+    current_pid = (__u32)(current_pid_tgid & 0xFFFFFFFF);
+    current_uid = (__u32)(bpf_get_current_uid_gid() & 0xFFFFFFFF);
 
     if (current_pid == 0) {
         #ifdef DEBUG
@@ -147,7 +163,7 @@ proceed_to_main_logic:
     }
 
     // Проверка списка PID клиентов
-    __u8 *is_kg_client = bpf_map_lookup_elem(&kg_client_pids, &current_pid);
+    is_kg_client = bpf_map_lookup_elem(&kg_client_pids, &current_pid);
     if (is_kg_client && *is_kg_client == 1) {
         #ifdef DEBUG
         bpf_printk("CONNECT4_SKIP: Skipping connection from known client PID %u\n", current_pid);
@@ -156,18 +172,17 @@ proceed_to_main_logic:
     }
 
     // Получение порта назначения и проверка целевых портов
-    __be16 user_port;
     if (bpf_core_read(&user_port, sizeof(user_port), &ctx->user_port)) {
         return 1;
     }
     
-    __u16 orig_dst_port_h = bpf_ntohs(user_port);
-    __u8 *target_flag = bpf_map_lookup_elem(&target_ports, &orig_dst_port_h);
+    orig_dst_port_h = bpf_ntohs(user_port);
+    target_flag = bpf_map_lookup_elem(&target_ports, &orig_dst_port_h);
     if (!target_flag || *target_flag != 1) {
         return 1;
     }
 
-    __u64 cookie = bpf_get_socket_cookie(ctx);
+    cookie = bpf_get_socket_cookie(ctx);
     if (cookie == 0) {
         #ifdef DEBUG
         bpf_printk("CONNECT4_ERR: Failed to get socket cookie for PID %u.\n", current_pid);
@@ -176,18 +191,16 @@ proceed_to_main_logic:
     }
 
     // Получение IP адреса назначения
-    __be32 user_ip4;
     if (bpf_core_read(&user_ip4, sizeof(user_ip4), &ctx->user_ip4)) {
         return 1;
     }
 
-    struct original_dest_t details = {};
     details.pid = current_pid;
     details.uid = current_uid;
     details.dst_ip = user_ip4;
     details.dst_port = user_port;
 
-    int ret = bpf_map_update_elem(&kg_orig_dest, &cookie, &details, BPF_ANY);
+    ret = bpf_map_update_elem(&kg_orig_dest, &cookie, &details, BPF_ANY);
     if (ret != 0) {
         #ifdef DEBUG
         bpf_printk("CONNECT4_ERR: Failed update kg_orig_dest (PID %u, cookie %llu): %d\n", 
@@ -197,8 +210,8 @@ proceed_to_main_logic:
     }
 
     // Получение и проверка конфигурации
-    __u32 cfg_key = 0;
-    struct kg_config_t *cfg = bpf_map_lookup_elem(&kg_config, &cfg_key);
+    cfg_key = 0;
+    cfg = bpf_map_lookup_elem(&kg_config, &cfg_key);
     if (!cfg || cfg->listener_ip == 0 || cfg->listener_port == 0) {
         #ifdef DEBUG
         bpf_printk("CONNECT4_ERR: Failed lookup config or config invalid (PID %u, cookie %llu)\n", 
@@ -208,32 +221,17 @@ proceed_to_main_logic:
         return 1;
     }
 
-    // --- Перенаправление ---
-    __u32 orig_dst_ip_n = user_ip4;
-    
-    if (bpf_core_write(&ctx->user_ip4, cfg->listener_ip)) {
-        #ifdef DEBUG
-        bpf_printk("CONNECT4_ERR: Failed to write ctx->user_ip4\n");
-        #endif
-        bpf_map_delete_elem(&kg_orig_dest, &cookie);
-        return 1;
-    }
-    
-    if (bpf_core_write(&ctx->user_port, bpf_htons(cfg->listener_port))) {
-        #ifdef DEBUG
-        bpf_printk("CONNECT4_ERR: Failed to write ctx->user_port\n");
-        #endif
-        bpf_map_delete_elem(&kg_orig_dest, &cookie);
-        return 1;
-    }
-    
+    // --- Перенаправление - используем прямое присваивание вместо bpf_core_write ---
+    orig_dst_ip_n = user_ip4;
+    ctx->user_ip4 = cfg->listener_ip;
+    ctx->user_port = bpf_htons(cfg->listener_port);
     kg_stats_inc(1);
 
     #ifdef DEBUG
     char comm[16];
     bpf_get_current_comm(&comm, sizeof(comm));
     bpf_printk("CONNECT4_REDIR: Redirected PID %u (comm %s, cookie %llu) dest %x:%u -> %x:%u\n",
-              current_pid, comm, cookie, orig_dst_ip_n, orig_dst_port_h, cfg->listener_ip, cfg->listener_port);
+              current_pid, comm, cookie, orig_dst_ip_n, orig_dst_port_h, ctx->user_ip4, cfg->listener_port);
     #endif
 
     return 1;
