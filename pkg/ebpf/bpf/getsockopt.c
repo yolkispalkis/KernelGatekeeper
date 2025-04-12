@@ -18,19 +18,19 @@
 #define SOL_IP IPPROTO_IP
 #endif
 
-// Используем BPF CO-RE для определения смещения полей структуры сокета
-struct sock_common_fields {
-    __u16 skc_family;
-    __u16 skc_dport;
-} __attribute__((preserve_access_index));
-
-struct sock_fields {
-    struct sock_common_fields __sk_common;
-    __u8 sk_protocol;
-} __attribute__((preserve_access_index));
-
 SEC("cgroup/getsockopt")
 int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
+    // Объявляем все переменные в начале функции
+    __u16 family;
+    __u8 protocol;
+    __be16 peer_port_n;
+    __u16 peer_port_h;
+    __u64 *cookie_ptr;
+    __u64 cookie;
+    struct original_dest_t *orig_dest;
+    struct sockaddr_in sa_out = {};
+    long ret;
+
     // Проверяем, интересует ли нас данный вызов
     if (ctx->level != SOL_IP || ctx->optname != SO_ORIGINAL_DST) {
         return 1;
@@ -41,23 +41,21 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
         return 1;
     }
 
-    // Используем временный указатель для доступа к полям сокета через CO-RE
-    const struct sock *sk = ctx->sk;
+    // Используем BPF_CORE_READ для доступа к полям непосредственно, без временной переменной
+    if (bpf_core_read(&family, sizeof(family), &ctx->sk->__sk_common.skc_family)) {
+        return 1;
+    }
     
-    // Получаем семейство и протокол с помощью bpf_core_read
-    __u16 family;
-    bpf_core_read(&family, sizeof(family), &sk->__sk_common.skc_family);
-    
-    __u8 protocol;
-    bpf_core_read(&protocol, sizeof(protocol), &sk->sk_protocol);
+    if (bpf_core_read(&protocol, sizeof(protocol), &ctx->sk->sk_protocol)) {
+        return 1;
+    }
 
     if (family != AF_INET || protocol != IPPROTO_TCP) {
         return 1;
     }
 
-    // Получаем порт назначения более надежным способом через bpf_core_read
-    __be16 peer_port_n;
-    if (bpf_core_read(&peer_port_n, sizeof(peer_port_n), &sk->__sk_common.skc_dport)) {
+    // Получаем порт назначения напрямую из структуры
+    if (bpf_core_read(&peer_port_n, sizeof(peer_port_n), &ctx->sk->__sk_common.skc_dport)) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_ERR: Failed to read skc_dport\n");
         #endif
@@ -65,7 +63,7 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
         return 1;
     }
 
-    __u16 peer_port_h = bpf_ntohs(peer_port_n);
+    peer_port_h = bpf_ntohs(peer_port_n);
 
     if (peer_port_h == 0) {
         #ifdef DEBUG
@@ -76,7 +74,7 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     }
 
     // Поиск cookie по порту
-    __u64 *cookie_ptr = bpf_map_lookup_elem(&kg_port_to_cookie, &peer_port_h);
+    cookie_ptr = bpf_map_lookup_elem(&kg_port_to_cookie, &peer_port_h);
     if (!cookie_ptr) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_WARN: Cookie not found for peer port %u.\n", peer_port_h);
@@ -84,10 +82,10 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
         kg_stats_inc(3);
         return 1;
     }
-    __u64 cookie = *cookie_ptr;
+    cookie = *cookie_ptr;
 
     // Поиск оригинального адреса назначения
-    struct original_dest_t *orig_dest = bpf_map_lookup_elem(&kg_orig_dest, &cookie);
+    orig_dest = bpf_map_lookup_elem(&kg_orig_dest, &cookie);
     if (!orig_dest) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_WARN: Original destination not found for cookie %llu (port %u).\n", 
@@ -112,13 +110,12 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     }
 
     // Создаем и заполняем структуру sockaddr_in
-    struct sockaddr_in sa_out = {};
     sa_out.sin_family = AF_INET;
     sa_out.sin_addr.s_addr = orig_dest->dst_ip;
     sa_out.sin_port = orig_dest->dst_port;
 
     // Копируем данные в буфер пользователя
-    long ret = bpf_probe_write_user(ctx->optval, &sa_out, sizeof(sa_out));
+    ret = bpf_probe_write_user(ctx->optval, &sa_out, sizeof(sa_out));
     if (ret != 0) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_ERR: bpf_probe_write_user failed: %ld\n", ret);
