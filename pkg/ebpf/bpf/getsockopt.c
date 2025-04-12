@@ -41,12 +41,12 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
         return 1;
     }
 
-    // Используем BPF_CORE_READ для доступа к полям непосредственно, без временной переменной
-    if (bpf_core_read(&family, sizeof(family), &ctx->sk->__sk_common.skc_family)) {
+    // Используем поля, доступные непосредственно в структуре bpf_sock
+    if (bpf_core_read(&family, sizeof(family), &ctx->sk->family)) {
         return 1;
     }
     
-    if (bpf_core_read(&protocol, sizeof(protocol), &ctx->sk->sk_protocol)) {
+    if (bpf_core_read(&protocol, sizeof(protocol), &ctx->sk->protocol)) {
         return 1;
     }
 
@@ -54,10 +54,10 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
         return 1;
     }
 
-    // Получаем порт назначения напрямую из структуры
-    if (bpf_core_read(&peer_port_n, sizeof(peer_port_n), &ctx->sk->__sk_common.skc_dport)) {
+    // Получаем порт назначения напрямую из структуры (используем dst_port)
+    if (bpf_core_read(&peer_port_n, sizeof(peer_port_n), &ctx->sk->dst_port)) {
         #ifdef DEBUG
-        bpf_printk("GETSOCKOPT_ERR: Failed to read skc_dport\n");
+        bpf_printk("GETSOCKOPT_ERR: Failed to read dst_port\n");
         #endif
         kg_stats_inc(3);
         return 1;
