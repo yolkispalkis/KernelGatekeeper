@@ -643,12 +643,12 @@ func (m *BPFManager) Close() error {
 			if l != nil {
 				slog.Debug(fmt.Sprintf("Closing BPF %s link...", linkNames[i]))
 				// Check against link.ErrNotAttached (ensure link import is correct)
-				if err := l.Close(); err != nil && !errors.Is(err, link.ErrNotAttached) {
+				if err := l.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 					slog.Error(fmt.Sprintf("Error closing BPF %s link", linkNames[i]), "error", err)
 					if firstErr == nil {
 						firstErr = fmt.Errorf("%s link close: %w", linkNames[i], err)
 					}
-				} else if errors.Is(err, link.ErrNotAttached) {
+				} else if errors.Is(err, os.ErrClosed) {
 					slog.Debug(fmt.Sprintf("BPF %s link was already detached", linkNames[i]))
 				}
 			}
