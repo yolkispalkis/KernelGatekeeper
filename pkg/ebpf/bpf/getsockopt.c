@@ -1,13 +1,10 @@
 // FILE: pkg/ebpf/bpf/getsockopt.c
 //go:build ignore
 
-// Includes for CO-RE
-#include "vmlinux.h" // Include vmlinux.h for struct bpf_sockopt and others if defined there
+#include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
-#include <bpf/bpf_core_read.h> // Include for BPF_CORE_READ
-
-// Custom shared definitions
+#include <bpf/bpf_core_read.h> // Теперь используем хелпер bpf_core_read
 #include "bpf_shared.h"
 
 #ifndef AF_INET
@@ -20,7 +17,7 @@
 #define SOL_IP IPPROTO_IP
 #endif
 
-// sockaddr_in should be defined via vmlinux.h now
+// sockaddr_in должен быть определен в vmlinux.h
 
 static __always_inline void kg_stats_inc(int field) {
     __u32 key = 0;
@@ -34,109 +31,151 @@ static __always_inline void kg_stats_inc(int field) {
 SEC("cgroup/getsockopt")
 int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
 
-    // Only interested in SO_ORIGINAL_DST for IP level
+    // Интересуют только SO_ORIGINAL_DST для IP уровня
     if (ctx->level != SOL_IP || ctx->optname != SO_ORIGINAL_DST) {
-        return 1; // Pass to next hook
+        return 1; // Передать следующему хуку
     }
 
-    // --- Изменено: Убрана локальная переменная 'sk', проверка и чтение напрямую из ctx->sk ---
-    // Check sk validity first
+    // Сначала проверка на NULL sk
     if (ctx->sk == NULL) {
          #ifdef DEBUG
-         bpf_printk("GETSOCKOPT: Ignoring getsockopt with NULL sk.\n");
+         // Минимизируем printk
+         // bpf_printk("GETSOCKOPT: NULL sk pointer.\n");
          #endif
-         return 1; // Pass to next hook
+         return 1; // Передать следующему хуку
     }
 
-    // Check if it's an IPv4 TCP socket directly using ctx->sk
-    if (BPF_CORE_READ(ctx->sk, family) != AF_INET || BPF_CORE_READ(ctx->sk, protocol) != IPPROTO_TCP) {
+    // --- Чтение family и protocol сразу после проверки на NULL ---
+    // Используем временные переменные для хранения результатов
+    // volatile может помочь верификатору
+    volatile __u16 family;
+    volatile __u8 protocol;
+    int err;
+
+    // Используем хелпер bpf_core_read вместо макроса BPF_CORE_READ
+    err = bpf_core_read(&family, sizeof(family), &ctx->sk->family);
+    if (err != 0) {
+        #ifdef DEBUG
+        // bpf_printk("GETSOCKOPT: Failed core read family: %d\n", err);
+        #endif
+        return 1; // Ошибка чтения, передать дальше
+    }
+
+    err = bpf_core_read(&protocol, sizeof(protocol), &ctx->sk->protocol);
+     if (err != 0) {
+        #ifdef DEBUG
+        // bpf_printk("GETSOCKOPT: Failed core read protocol: %d\n", err);
+        #endif
+        return 1; // Ошибка чтения, передать дальше
+    }
+
+    // Теперь проверяем значения
+    if (family != AF_INET || protocol != IPPROTO_TCP) {
          #ifdef DEBUG
-         bpf_printk("GETSOCKOPT: Ignoring non-IPv4/TCP getsockopt.\n");
+         // bpf_printk("GETSOCKOPT: Not AF_INET/TCP (Family: %u, Proto: %u)\n", family, protocol);
          #endif
-        return 1; // Pass to next hook
+        return 1; // Передать следующему хуку
     }
+    // --- Конец немедленного чтения ---
 
-    // Get the destination port (peer port in this context, source port of original conn)
-    // Read in network order, then convert to host order for map key lookup
-    __u16 peer_port_n = BPF_CORE_READ(ctx->sk, dst_port); // Read port in network byte order
-    __u16 peer_port_h = bpf_ntohs(peer_port_n);           // Convert to host byte order for map lookup
-    // --- Конец изменений ---
+    // Получаем порт назначения (порт узла в данном контексте, исходный порт оригинального соединения)
+    __u16 peer_port_n; // В сетевом порядке байт
+    err = bpf_core_read(&peer_port_n, sizeof(peer_port_n), &ctx->sk->dst_port);
+    if (err != 0) {
+        #ifdef DEBUG
+        // bpf_printk("GETSOCKOPT: Failed core read dst_port: %d\n", err);
+        #endif
+        return 1; // Ошибка чтения, передать дальше
+    }
+    __u16 peer_port_h = bpf_ntohs(peer_port_n); // Конвертируем в host byte order для ключа карты
 
     if (peer_port_h == 0) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_WARN: Peer port is 0, cannot lookup cookie.\n");
         #endif
-        kg_stats_inc(3); // Increment failure count
-        return 1; // Pass to next hook
+        kg_stats_inc(3); // Увеличить счетчик неудач
+        return 1; // Передать следующему хуку
     }
 
-    // Lookup the original connection cookie using the source port (host byte order)
+    // Ищем куку оригинального соединения по исходному порту (host byte order)
     __u64 *cookie_ptr = bpf_map_lookup_elem(&kg_port_to_cookie, &peer_port_h);
     if (!cookie_ptr) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_WARN: Cookie not found for peer port %u.\n", peer_port_h);
         #endif
-        kg_stats_inc(3); // Increment failure count
-        return 1; // Pass to next hook
+        kg_stats_inc(3); // Увеличить счетчик неудач
+        return 1; // Передать следующему хуку
     }
     __u64 cookie = *cookie_ptr;
 
-    // Lookup the original destination details using the cookie
+    // Ищем оригинальные данные назначения по куке
     struct original_dest_t *orig_dest = bpf_map_lookup_elem(&kg_orig_dest, &cookie);
     if (!orig_dest) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_WARN: Original destination not found for cookie %llu (port %u).\n", cookie, peer_port_h);
         #endif
-        // Clean up the port->cookie mapping if the destination is gone
+        // Очистить маппинг порт->кука, если назначение исчезло
         bpf_map_delete_elem(&kg_port_to_cookie, &peer_port_h);
-        kg_stats_inc(3); // Increment failure count
-        return 1; // Pass to next hook
+        kg_stats_inc(3); // Увеличить счетчик неудач
+        return 1; // Передать следующему хуку
     }
 
-    // Check if the userspace buffer (optval) is valid and large enough
+    // Проверяем валидность буфера пользователя (optval) и достаточен ли его размер
+    // Инициализация sockaddr_in должна быть в vmlinux.h
     if (ctx->optval == NULL || ctx->optval_end == NULL ||
         (void *)(ctx->optval + sizeof(struct sockaddr_in)) > ctx->optval_end) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_ERR: Invalid optval buffer for cookie %llu (port %u).\n", cookie, peer_port_h);
         #endif
-        // Clean up maps if the buffer is invalid
+        // Очистить карты, если буфер невалиден
         bpf_map_delete_elem(&kg_orig_dest, &cookie);
         bpf_map_delete_elem(&kg_port_to_cookie, &peer_port_h);
-        kg_stats_inc(3); // Increment failure count
-        return 1; // Pass to next hook
+        kg_stats_inc(3); // Увеличить счетчик неудач
+        return 1; // Передать следующему хуку
     }
 
-    // Fill the userspace buffer (ctx->optval) with the original destination
-    struct sockaddr_in *sa = (struct sockaddr_in *)ctx->optval;
-    sa->sin_family = AF_INET;
-    sa->sin_addr.s_addr = orig_dest->dst_ip; // Already in network byte order from connect4
-    sa->sin_port = orig_dest->dst_port;     // Already in network byte order from connect4
-    // bpf_memset(sa->sin_zero, 0, sizeof(sa->sin_zero)); // Zero out padding if needed/paranoid
+    // --- Используем bpf_probe_write_user для записи в буфер пользователя ---
+    // Сначала создаем структуру на стеке BPF
+    struct sockaddr_in sa_out = {}; // Инициализируем нулями
+    sa_out.sin_family = AF_INET;
+    sa_out.sin_addr.s_addr = orig_dest->dst_ip; // Уже в network byte order
+    sa_out.sin_port = orig_dest->dst_port;     // Уже в network byte order
 
-    // Explicitly assign the size as s32 to potentially help the compiler/verifier
-    __s32 sockaddr_size = sizeof(struct sockaddr_in);
-    ctx->optlen = sockaddr_size; // Set the output length
+    // Копируем данные в буфер пользователя
+    long ret = bpf_probe_write_user(ctx->optval, &sa_out, sizeof(sa_out));
+    if (ret != 0) {
+        #ifdef DEBUG
+        bpf_printk("GETSOCKOPT_ERR: bpf_probe_write_user failed: %ld\n", ret);
+        #endif
+        // Очистить карты при ошибке записи
+        bpf_map_delete_elem(&kg_orig_dest, &cookie);
+        bpf_map_delete_elem(&kg_port_to_cookie, &peer_port_h);
+        kg_stats_inc(3);
+        return 1; // Передать дальше, пусть syscall завершится с ошибкой
+    }
+    // --- Конец использования bpf_probe_write_user ---
 
-    // Add a volatile read operation between the two writes to prevent the compiler
-    // from merging them into a single 64-bit write instruction (stxdw).
-    // Reading 'level' is arbitrary; any volatile read from ctx should work.
-    volatile __u32 dummy_read __attribute__((unused)) = ctx->level;
+    // Устанавливаем выходную длину
+    // Важно: делать это ПОСЛЕ успешной записи
+    ctx->optlen = sizeof(struct sockaddr_in);
 
-    // Set the return value of the getsockopt syscall to 0 (success)
+    // Устанавливаем возвращаемое значение системного вызова getsockopt в 0 (успех)
+    // Важно: делать это ПОСЛЕ успешной записи
     ctx->retval = 0;
 
-    // Clean up the maps now that the original destination has been retrieved
+    // Очищаем карты теперь, когда оригинальное назначение было получено
     bpf_map_delete_elem(&kg_orig_dest, &cookie);
     bpf_map_delete_elem(&kg_port_to_cookie, &peer_port_h);
-    kg_stats_inc(2); // Increment success count
+    kg_stats_inc(2); // Увеличить счетчик успехов
 
     #ifdef DEBUG
-    bpf_printk("GETSOCKOPT: Successfully returned original dest %x:%u for cookie %llu (port %u).\n",
+    // Оставляем минимальный лог успеха
+    bpf_printk("GETSOCKOPT: OK orig dest %x:%u cookie %llu port %u\n",
                orig_dest->dst_ip, bpf_ntohs(orig_dest->dst_port), cookie, peer_port_h);
     #endif
 
-    // Return 1 to allow the modified getsockopt result to be passed to userspace.
-    // Returning 0 would mean BPF handled it and the syscall should return -EPERM.
+    // Возвращаем 1, чтобы позволить измененному результату getsockopt передаться в userspace.
+    // Возврат 0 означал бы, что BPF обработал его, и syscall должен вернуть -EPERM.
     return 1;
 }
 
