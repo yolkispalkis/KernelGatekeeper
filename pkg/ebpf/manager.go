@@ -19,6 +19,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe" // Added for struct size calculation in readNotifications
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -46,16 +47,20 @@ type OriginalDestT = bpf_connect4OriginalDestT
 type BpfGlobalStatsT = bpf_connect4GlobalStatsT
 type BpfKgConfigT = bpf_connect4KgConfigT
 type BpfDevInodeKey = bpf_connect4DevInodeKey
-type BpfNotificationTupleT = bpf_connect4NotificationTupleT // Используем правильный сгенерированный тип
+
+// type BpfNotificationTupleT = bpf_connect4NotificationTupleT // Removed alias as type wasn't generated
 
 // --- Типы данных Go ---
+// NotificationTuple mirrors the layout of struct notification_tuple_t in bpf_shared.h
+// Make sure field order and types match exactly for binary.Read
 type NotificationTuple struct {
-	PidTgid     uint64
-	SrcIP       net.IP
-	OrigDstIP   net.IP
-	SrcPort     uint16
-	OrigDstPort uint16
-	Protocol    uint8
+	PidTgid     uint64   // __u64 pid_tgid;
+	SrcIP       uint32   // __be32 src_ip; (Stored as BigEndian)
+	OrigDstIP   uint32   // __be32 orig_dst_ip; (Stored as BigEndian)
+	SrcPort     uint16   // __be16 src_port; (Stored as BigEndian)
+	OrigDstPort uint16   // __be16 orig_dst_port; (Stored as BigEndian)
+	Protocol    uint8    // __u8   protocol;
+	Padding     [3]uint8 // __u8   padding[3];
 }
 
 type StatsCache struct {
@@ -91,7 +96,6 @@ func (o *bpfObjects) Close() error {
 	}
 	var errs []error
 	for _, closer := range closers {
-		// Check if the closer itself is non-nil before calling Close
 		if c, ok := closer.(interface{ Close() error }); ok && !isNil(c) {
 			if err := c.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, ringbuf.ErrClosed) {
 				errs = append(errs, err)
@@ -109,20 +113,22 @@ func (o *bpfObjects) Close() error {
 	return nil
 }
 
-// Helper function to check if an interface is nil (needed for embedded structs)
+// Helper function to check if an interface is nil
 func isNil(i interface{}) bool {
 	if i == nil {
 		return true
 	}
-	switch v := i.(type) {
-	case interface{ isNil() bool }: // Check if the type has an isNil method (common for pointers in generated code)
-		return v.isNil()
-	default:
-		// Fallback using reflection for other types
-		// Be cautious with reflection performance if called frequently
-		// return reflect.ValueOf(i).IsNil() // Requires careful handling of non-pointer/interface types
-		return false // Assume not nil if no isNil method and not directly nil
+	// Add specific checks for generated object types if needed
+	switch i.(type) {
+	case *bpf_connect4Objects, *bpf_sockopsObjects, *bpf_getsockoptObjects,
+		*bpf_connect4Maps, *bpf_sockopsMaps, *bpf_getsockoptMaps,
+		*bpf_connect4Programs, *bpf_sockopsPrograms, *bpf_getsockoptPrograms:
+		// If the type is known and a pointer, check underlying value?
+		// For now, rely on the initial nil check.
+		// Generated code might have internal nil checks.
 	}
+	// Potentially use reflection as a fallback, but can be slow.
+	return false
 }
 
 type BPFManager struct {
@@ -136,12 +142,9 @@ type BPFManager struct {
 	statsCache          StatsCache
 	mu                  sync.Mutex
 	notificationReader  *ringbuf.Reader
-	notificationChannel chan NotificationTuple
+	notificationChannel chan NotificationTuple // Use the Go struct type
 	currentExcluded     map[BpfDevInodeKey]string
 }
-
-// Configurable EBPF parameters (now part of pkg/config)
-// type EBPFConfig struct { ... }
 
 // GlobalStats structure mirroring the C struct
 type GlobalStats struct {
@@ -166,8 +169,8 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 			// PinPath: "/sys/fs/bpf/kernelgatekeeper", // Optional pinning
 		},
 		Programs: ebpf.ProgramOptions{
-			LogLevel: ebpf.LogLevelInstruction, // Adjust log level as needed
-			LogSize:  1024 * 1024 * 4,          // Use LogSize (VerifierLogSize is likely incorrect)
+			LogLevel: ebpf.LogLevelInstruction,
+			// LogSize / VerifierLogSize removed as it caused errors
 		},
 	}
 
@@ -199,7 +202,7 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 
 		adjustMapSpec(maps["excluded_dev_inodes"], "excluded_dev_inodes", ExcludedMapMaxEntries)
 		adjustMapSpec(maps["target_ports"], "target_ports", 65536)
-		adjustMapSpec(maps["kg_client_pids"], "kg_client_pids", 1024) // Example size
+		adjustMapSpec(maps["kg_client_pids"], "kg_client_pids", 1024)
 	}
 
 	if err := specConnect4.LoadAndAssign(&objs.bpf_connect4Objects, opts); err != nil {
@@ -270,7 +273,7 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 		cfg:                 cfg,
 		objs:                objs,
 		stopChan:            make(chan struct{}),
-		notificationChannel: make(chan NotificationTuple, cfg.NotificationChannelSize),
+		notificationChannel: make(chan NotificationTuple, cfg.NotificationChannelSize), // Use Go struct
 		currentExcluded:     make(map[BpfDevInodeKey]string),
 		statsCache: StatsCache{
 			lastStatsTime: time.Now(),
@@ -293,7 +296,7 @@ func NewBPFManager(cfg *config.EBPFConfig, listenerIP net.IP, listenerPort uint1
 		manager.Close()
 		return nil, fmt.Errorf("failed to set initial target ports in BPF map: %w", err)
 	}
-	// Initial exclude update is handled by the caller (StateManager) after BPFManager is created
+	// Initial exclude update is handled by the caller (StateManager)
 
 	if err := manager.attachPrograms(DefaultCgroupPath); err != nil {
 		manager.Close()
@@ -368,12 +371,14 @@ func (m *BPFManager) readGlobalStats() (GlobalStats, error) {
 
 	var perCPUValues []BpfGlobalStatsT // Read the BPF struct type
 	var mapKey uint32 = 0
-	// Corrected: Use LookupPerCPU, the map type is PERCPU_ARRAY
-	if err := globalStatsMap.LookupPerCPU(mapKey, &perCPUValues); err != nil {
-		// Note: LookupPerCPU doesn't return ErrKeyNotExist. It returns an empty slice if key 0 doesn't exist (unlikely for array)
-		// or if map is empty/uninitialized.
-		// Handle the error generally.
-		return aggregate, fmt.Errorf("failed to lookup per-CPU stats key %d in BPF kg_stats map: %w", mapKey, err)
+	// Corrected: Use Lookup, which reads per-CPU values for PERCPU arrays into a slice
+	err := globalStatsMap.Lookup(mapKey, &perCPUValues)
+	if err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) { // Check if Lookup can return this for arrays (unlikely but safe)
+			slog.Debug("Stats key not found in BPF kg_stats map, returning zero stats.", "key", mapKey)
+			return aggregate, nil
+		}
+		return aggregate, fmt.Errorf("failed lookup stats key %d in BPF kg_stats map: %w", mapKey, err)
 	}
 
 	for _, cpuStat := range perCPUValues {
@@ -554,7 +559,11 @@ func (m *BPFManager) UpdateExcludedExecutables(paths []string) error {
 
 	slog.Info("BPF excluded executables map updated successfully", "current_excluded_count", len(m.currentExcluded))
 	if m.cfg != nil {
-		m.cfg.Excluded = paths
+		// Update the config stored in the manager to reflect the applied state
+		m.cfg.Excluded = make([]string, 0, len(desiredExcluded))
+		for _, path := range desiredExcluded {
+			m.cfg.Excluded = append(m.cfg.Excluded, path)
+		}
 	}
 	return nil
 }
@@ -634,7 +643,6 @@ func (m *BPFManager) Close() error {
 		for i, l := range links {
 			if l != nil {
 				slog.Debug(fmt.Sprintf("Closing BPF %s link...", linkNames[i]))
-				// Corrected: Use link.ErrNotAttached from the correct package
 				if err := l.Close(); err != nil && !errors.Is(err, link.ErrNotAttached) {
 					slog.Error(fmt.Sprintf("Error closing BPF %s link", linkNames[i]), "error", err)
 					if firstErr == nil {
@@ -678,7 +686,7 @@ func (m *BPFManager) GetStats() (GlobalStats, error) {
 	return statsCopy, nil
 }
 
-func (m *BPFManager) GetNotificationChannel() <-chan NotificationTuple {
+func (m *BPFManager) GetNotificationChannel() <-chan NotificationTuple { // Use Go struct
 	return m.notificationChannel
 }
 
@@ -776,7 +784,7 @@ func (m *BPFManager) UpdateConfigMap(listenerIP net.IP, listenerPort uint16) err
 
 	cfgValue := BpfKgConfigT{
 		ListenerIp:   listenerIPInt,
-		ListenerPort: listenerPort, // BPF side expects Host Byte Order here, htons is done in BPF C code if needed
+		ListenerPort: listenerPort,
 	}
 
 	var mapKey uint32 = 0
@@ -824,10 +832,20 @@ func (m *BPFManager) RemoveExcludedPID(pid uint32) error {
 }
 
 func (m *BPFManager) readNotifications(ctx context.Context) {
-	var bpfTuple BpfNotificationTupleT // Use the alias defined earlier
-	tupleSize := binary.Size(bpfTuple)
+	// Define a local struct that matches the expected binary layout for decoding
+	var bpfRawTuple struct {
+		PidTgid     uint64
+		SrcIP       uint32 // __be32
+		OrigDstIP   uint32 // __be32
+		SrcPort     uint16 // __be16
+		OrigDstPort uint16 // __be16
+		Protocol    uint8
+		Padding     [3]uint8
+	}
+	// Calculate size based on the local struct definition
+	tupleSize := unsafe.Sizeof(bpfRawTuple) // Use unsafe.Sizeof for accurate size
 	if tupleSize <= 0 {
-		slog.Error("Could not determine size of BpfNotificationTupleT", "size", tupleSize)
+		slog.Error("Could not determine size of BPF notification tuple struct", "size", tupleSize)
 		return
 	}
 	slog.Debug("BPF ring buffer reader expecting record size", "size", tupleSize)
@@ -865,29 +883,48 @@ func (m *BPFManager) readNotifications(ctx context.Context) {
 		}
 		slog.Debug("Received raw BPF ring buffer record", "len", len(record.RawSample))
 
-		if len(record.RawSample) < tupleSize {
+		if uintptr(len(record.RawSample)) < tupleSize {
 			slog.Warn("Received BPF ring buffer event with unexpected size, skipping.", "expected_min", tupleSize, "received", len(record.RawSample))
 			continue
 		}
 
+		// Decode directly into the local raw struct
 		reader := bytes.NewReader(record.RawSample)
-		if err := binary.Read(reader, common.NativeEndian, &bpfTuple); err != nil {
-			slog.Error("Failed to decode BPF ring buffer event data into BpfNotificationTupleT", "error", err)
+		if err := binary.Read(reader, common.NativeEndian, &bpfRawTuple); err != nil {
+			slog.Error("Failed to decode BPF ring buffer event data", "error", err)
 			continue
 		}
 
+		// Convert from the raw struct format to the application Go format (NotificationTuple)
 		event := NotificationTuple{
-			PidTgid:     bpfTuple.PidTgid,
-			SrcIP:       bpfutil.IpFromInt(bpfTuple.SrcIp),
-			OrigDstIP:   bpfutil.IpFromInt(bpfTuple.OrigDstIp),
-			SrcPort:     bpfutil.Ntohs(bpfTuple.SrcPort),
-			OrigDstPort: bpfutil.Ntohs(bpfTuple.OrigDstPort),
-			Protocol:    bpfTuple.Protocol,
+			PidTgid:     bpfRawTuple.PidTgid,
+			SrcIP:       bpfRawTuple.SrcIP,       // Keep as uint32 for now
+			OrigDstIP:   bpfRawTuple.OrigDstIP,   // Keep as uint32 for now
+			SrcPort:     bpfRawTuple.SrcPort,     // Keep as uint16 for now
+			OrigDstPort: bpfRawTuple.OrigDstPort, // Keep as uint16 for now
+			Protocol:    bpfRawTuple.Protocol,
+			// Padding is ignored
+		}
+
+		// Perform conversions needed for application logic (e.g., uint32 IP to net.IP, uint16 port Ntohs)
+		srcIPNet := bpfutil.IpFromInt(event.SrcIP)
+		origDstIPNet := bpfutil.IpFromInt(event.OrigDstIP)
+		srcPortHost := bpfutil.Ntohs(event.SrcPort)
+		origDstPortHost := bpfutil.Ntohs(event.OrigDstPort)
+
+		// Create the final event to send on the channel
+		appEvent := NotificationTuple{ // Use the Go type here for the channel
+			PidTgid:     event.PidTgid,
+			SrcIP:       srcIPNet,
+			OrigDstIP:   origDstIPNet,
+			SrcPort:     srcPortHost,
+			OrigDstPort: origDstPortHost,
+			Protocol:    event.Protocol,
 		}
 
 		select {
-		case m.notificationChannel <- event:
-			slog.Debug("Sent BPF connection notification to service processor", "pid_tgid", event.PidTgid, "src_ip", event.SrcIP, "src_port", event.SrcPort, "orig_dst_ip", event.OrigDstIP, "orig_dst_port", event.OrigDstPort)
+		case m.notificationChannel <- appEvent: // Send the application-formatted event
+			slog.Debug("Sent BPF connection notification to service processor", "pid_tgid", appEvent.PidTgid, "src_ip", appEvent.SrcIP, "src_port", appEvent.SrcPort, "orig_dst_ip", appEvent.OrigDstIP, "orig_dst_port", appEvent.OrigDstPort)
 		case <-ctx.Done():
 			slog.Info("Stopping BPF ring buffer reader while sending notification (context cancelled).")
 			return
@@ -895,7 +932,7 @@ func (m *BPFManager) readNotifications(ctx context.Context) {
 			slog.Info("Stopping BPF ring buffer reader while sending notification (stop signal).")
 			return
 		default:
-			slog.Warn("BPF notification channel is full, dropping event.", "channel_cap", cap(m.notificationChannel), "channel_len", len(m.notificationChannel), "event_dst_port", event.OrigDstPort)
+			slog.Warn("BPF notification channel is full, dropping event.", "channel_cap", cap(m.notificationChannel), "channel_len", len(m.notificationChannel), "event_dst_port", appEvent.OrigDstPort)
 		}
 	}
 }
