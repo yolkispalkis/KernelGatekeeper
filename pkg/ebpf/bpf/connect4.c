@@ -124,7 +124,7 @@ proceed_to_main_logic:
 
     // Исключаем сами клиентские процессы KernelGatekeeper по PID (если они попали сюда)
     // Эта карта теперь используется только для ЭТОГО.
-    __u8 *is_kg_client = bpf_map_lookup_elem(&kg_client_pids, ¤t_pid);
+    __u8 *is_kg_client = bpf_map_lookup_elem(&kg_client_pids, &current_pid);
     if (is_kg_client && *is_kg_client == 1) {
         #ifdef DEBUG
         bpf_printk("CONNECT4_SKIP: Skipping connection from known client PID %u\n", current_pid);
