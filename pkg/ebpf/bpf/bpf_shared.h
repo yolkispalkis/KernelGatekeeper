@@ -67,7 +67,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
+    __uint(max_entries, 8192);
     __type(key, __u64); // Socket cookie
     __type(value, struct original_dest_t);
 } kg_orig_dest SEC(".maps");
