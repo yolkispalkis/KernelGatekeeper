@@ -20,23 +20,7 @@
 #define SOL_IP IPPROTO_IP
 #endif
 
-// Define sockaddr_in locally ONLY IF IT'S NOT in vmlinux.h
-// Usually, common structures like sockaddr_in ARE included in vmlinux.h
-// generated from modern kernels. Check your vmlinux.h. If it's there, remove/comment this block.
-/*
-#ifndef _LINUX_SOCKET_H // This guard might not be sufficient if vmlinux.h defines it without the guard
-struct in_addr {
-    unsigned int s_addr;
-};
-struct sockaddr_in {
-    unsigned short sin_family;
-    unsigned short sin_port;
-    struct in_addr sin_addr;
-    unsigned char sin_zero[8];
-};
-#endif
-*/
-
+// sockaddr_in should be defined via vmlinux.h now
 
 static __always_inline void kg_stats_inc(int field) {
     __u32 key = 0;
@@ -55,23 +39,29 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
         return 1; // Pass to next hook
     }
 
-    // Check if it's an IPv4 TCP socket (via the bpf_sock struct)
-    // Accessing ctx->sk requires kernel 5.3+ with CO-RE BPF sock struct support.
-    // Ensure struct bpf_sock is defined (should be in vmlinux.h or bpf_helpers.h)
-    struct bpf_sock *sk = ctx->sk; // Read into a local variable
-    // Use BPF_CORE_READ for accessing fields for portability
-    if (sk == NULL || BPF_CORE_READ(sk, family) != AF_INET || BPF_CORE_READ(sk, protocol) != IPPROTO_TCP) {
+    // --- Изменено: Убрана локальная переменная 'sk', проверка и чтение напрямую из ctx->sk ---
+    // Check sk validity first
+    if (ctx->sk == NULL) {
          #ifdef DEBUG
-         bpf_printk("GETSOCKOPT: Ignoring non-IPv4/TCP getsockopt or NULL sk.\n");
+         bpf_printk("GETSOCKOPT: Ignoring getsockopt with NULL sk.\n");
+         #endif
+         return 1; // Pass to next hook
+    }
+
+    // Check if it's an IPv4 TCP socket directly using ctx->sk
+    if (BPF_CORE_READ(ctx->sk, family) != AF_INET || BPF_CORE_READ(ctx->sk, protocol) != IPPROTO_TCP) {
+         #ifdef DEBUG
+         bpf_printk("GETSOCKOPT: Ignoring non-IPv4/TCP getsockopt.\n");
          #endif
         return 1; // Pass to next hook
     }
 
-    // Get the source port (local port in sockops context) to find the cookie
-    // Note: ctx->sk->src_port exists in some contexts, but might not be reliable here.
-    // Using the peer port (ctx->sk->dst_port) as the key to find the cookie stored by sockops.
-    // Destination port of the socket struct == source port of the original connection
-    __u16 peer_port_h = bpf_ntohs(BPF_CORE_READ(sk, dst_port)); // Use BPF_CORE_READ for portability
+    // Get the destination port (peer port in this context, source port of original conn)
+    // Read in network order, then convert to host order for map key lookup
+    __u16 peer_port_n = BPF_CORE_READ(ctx->sk, dst_port); // Read port in network byte order
+    __u16 peer_port_h = bpf_ntohs(peer_port_n);           // Convert to host byte order for map lookup
+    // --- Конец изменений ---
+
     if (peer_port_h == 0) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_WARN: Peer port is 0, cannot lookup cookie.\n");
@@ -80,8 +70,7 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
         return 1; // Pass to next hook
     }
 
-
-    // Lookup the original connection cookie using the source port
+    // Lookup the original connection cookie using the source port (host byte order)
     __u64 *cookie_ptr = bpf_map_lookup_elem(&kg_port_to_cookie, &peer_port_h);
     if (!cookie_ptr) {
         #ifdef DEBUG
@@ -105,7 +94,6 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     }
 
     // Check if the userspace buffer (optval) is valid and large enough
-    // Note: sockaddr_in should be defined via vmlinux.h now
     if (ctx->optval == NULL || ctx->optval_end == NULL ||
         (void *)(ctx->optval + sizeof(struct sockaddr_in)) > ctx->optval_end) {
         #ifdef DEBUG
