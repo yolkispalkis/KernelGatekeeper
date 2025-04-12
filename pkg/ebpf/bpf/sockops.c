@@ -1,12 +1,12 @@
 // FILE: pkg/ebpf/bpf/sockops.c
 //go:build ignore
 
-#include <linux/bpf.h>
-#include <linux/types.h>
+// Includes for CO-RE
+#include "vmlinux.h"        // Generated kernel types (might not be strictly needed if not accessing sk fields directly)
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
-#include <linux/socket.h>
-#include <linux/in.h>
+
+// Custom shared definitions
 #include "bpf_shared.h"
 #include <bpf/bpf_tracing.h> // Include for IPPROTO_TCP if not elsewhere
 

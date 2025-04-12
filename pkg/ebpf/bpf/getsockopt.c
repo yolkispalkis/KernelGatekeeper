@@ -1,11 +1,13 @@
 // FILE: pkg/ebpf/bpf/getsockopt.c
 //go:build ignore
 
-#include <linux/bpf.h>
-#include <linux/in.h>
-#include <linux/socket.h>
+// Includes for CO-RE
+#include "vmlinux.h" // Include vmlinux.h for struct bpf_sockopt and others if defined there
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+#include <bpf/bpf_core_read.h> // Include for BPF_CORE_READ
+
+// Custom shared definitions
 #include "bpf_shared.h"
 
 #ifndef AF_INET
@@ -18,8 +20,11 @@
 #define SOL_IP IPPROTO_IP
 #endif
 
-// Define sockaddr_in locally if not included, matching kernel definition
-#ifndef _LINUX_SOCKET_H
+// Define sockaddr_in locally ONLY IF IT'S NOT in vmlinux.h
+// Usually, common structures like sockaddr_in ARE included in vmlinux.h
+// generated from modern kernels. Check your vmlinux.h. If it's there, remove/comment this block.
+/*
+#ifndef _LINUX_SOCKET_H // This guard might not be sufficient if vmlinux.h defines it without the guard
 struct in_addr {
     unsigned int s_addr;
 };
@@ -30,6 +35,7 @@ struct sockaddr_in {
     unsigned char sin_zero[8];
 };
 #endif
+*/
 
 
 static __always_inline void kg_stats_inc(int field) {
@@ -51,7 +57,10 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
 
     // Check if it's an IPv4 TCP socket (via the bpf_sock struct)
     // Accessing ctx->sk requires kernel 5.3+ with CO-RE BPF sock struct support.
-    if (ctx->sk == NULL || ctx->sk->family != AF_INET || ctx->sk->protocol != IPPROTO_TCP) {
+    // Ensure struct bpf_sock is defined (should be in vmlinux.h or bpf_helpers.h)
+    struct bpf_sock *sk = ctx->sk; // Read into a local variable
+    // Use BPF_CORE_READ for accessing fields for portability
+    if (sk == NULL || BPF_CORE_READ(sk, family) != AF_INET || BPF_CORE_READ(sk, protocol) != IPPROTO_TCP) {
          #ifdef DEBUG
          bpf_printk("GETSOCKOPT: Ignoring non-IPv4/TCP getsockopt or NULL sk.\n");
          #endif
@@ -61,7 +70,8 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     // Get the source port (local port in sockops context) to find the cookie
     // Note: ctx->sk->src_port exists in some contexts, but might not be reliable here.
     // Using the peer port (ctx->sk->dst_port) as the key to find the cookie stored by sockops.
-    __u16 peer_port_h = bpf_ntohs(ctx->sk->dst_port); // Destination port of the socket struct == source port of the original connection
+    // Destination port of the socket struct == source port of the original connection
+    __u16 peer_port_h = bpf_ntohs(BPF_CORE_READ(sk, dst_port)); // Use BPF_CORE_READ for portability
     if (peer_port_h == 0) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_WARN: Peer port is 0, cannot lookup cookie.\n");
@@ -95,6 +105,7 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     }
 
     // Check if the userspace buffer (optval) is valid and large enough
+    // Note: sockaddr_in should be defined via vmlinux.h now
     if (ctx->optval == NULL || ctx->optval_end == NULL ||
         (void *)(ctx->optval + sizeof(struct sockaddr_in)) > ctx->optval_end) {
         #ifdef DEBUG
@@ -112,6 +123,7 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     sa->sin_family = AF_INET;
     sa->sin_addr.s_addr = orig_dest->dst_ip; // Already in network byte order from connect4
     sa->sin_port = orig_dest->dst_port;     // Already in network byte order from connect4
+    // bpf_memset(sa->sin_zero, 0, sizeof(sa->sin_zero)); // Zero out padding if needed/paranoid
 
     // Explicitly assign the size as s32 to potentially help the compiler/verifier
     __s32 sockaddr_size = sizeof(struct sockaddr_in);

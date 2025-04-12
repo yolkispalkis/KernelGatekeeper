@@ -1,15 +1,14 @@
 // FILE: pkg/ebpf/bpf/connect4.c
 //go:build ignore
 
-#include <linux/bpf.h>
-#include <linux/in.h>
-#include <linux/fs.h>       // Для структур file, inode, super_block
-#include <linux/sched.h>    // Для task_struct, mm_struct
+// Includes for CO-RE
+#include "vmlinux.h"        // Generated kernel types
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
-#include <bpf/bpf_core_read.h> // Для CO-RE
+
+// Custom shared definitions
 #include "bpf_shared.h"
-#include "vmlinux.h"
+#include <bpf/bpf_core_read.h> // Для CO-RE (должен идти после vmlinux.h и bpf_helpers.h)
 
 #ifndef AF_INET
 #define AF_INET 2
@@ -77,14 +76,15 @@ int kernelgatekeeper_connect4(struct bpf_sock_addr *ctx) {
     }
 
     // Читаем dev_t и номер inode
-    // BPF_CORE_READ_KERNEL для чтения напрямую (без указателя)
-    dev_t dev_kernel = BPF_CORE_READ_KERNEL(sb, s_dev);
-    unsigned long ino_kernel = BPF_CORE_READ_KERNEL(inode, i_ino);
+    // ПРИМЕЧАНИЕ: BPF_CORE_READ_KERNEL может быть недоступен в старых libbpf/ядре.
+    // Используем стандартный BPF_CORE_READ. Типы полей (__u64, unsigned long) берутся из vmlinux.h
+    __u64 dev_kernel = BPF_CORE_READ(sb, s_dev);
+    unsigned long ino_kernel = BPF_CORE_READ(inode, i_ino);
 
     // Формируем ключ для карты
     struct dev_inode_key key = {};
-    key.dev_id = (__u64)dev_kernel; // Простое приведение типа. Может потребовать уточнения для 32-бит dev_t.
-    key.inode_id = (__u64)ino_kernel;
+    key.dev_id = (__u64)dev_kernel; // dev_t в __u64
+    key.inode_id = (__u64)ino_kernel; // unsigned long в __u64
 
     // Проверяем наличие в карте исключений
     __u8 *excluded_flag = bpf_map_lookup_elem(&excluded_dev_inodes, &key);
@@ -125,7 +125,7 @@ proceed_to_main_logic:
 
     // Исключаем сами клиентские процессы KernelGatekeeper по PID (если они попали сюда)
     // Эта карта теперь используется только для ЭТОГО.
-    __u8 *is_kg_client = bpf_map_lookup_elem(&kg_client_pids, &current_pid);
+    __u8 *is_kg_client = bpf_map_lookup_elem(&kg_client_pids, &current_pid); 
     if (is_kg_client && *is_kg_client == 1) {
         #ifdef DEBUG
         bpf_printk("CONNECT4_SKIP: Skipping connection from known client PID %u\n", current_pid);
