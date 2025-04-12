@@ -1,3 +1,4 @@
+// FILE: pkg/servicecore/state.go
 package servicecore
 
 import (
@@ -7,17 +8,18 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"sync" // Correct placement
+	"reflect" // Добавлено для DeepEqual
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/bpfutil"
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/clientcore" // Correct placement
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/clientcore"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/ebpf"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/logging"
 )
 
+// StateManager управляет состоянием сервиса.
 type StateManager struct {
 	configPath         string
 	config             atomic.Pointer[config.Config]
@@ -27,10 +29,11 @@ type StateManager struct {
 	wg                 sync.WaitGroup
 	startTime          time.Time
 	stopOnce           sync.Once
-	fatalErrChan       chan error  // Channel for critical errors from background tasks
-	statsLoggerRunning atomic.Bool // Tracks if the periodic stats logger is active
+	fatalErrChan       chan error
+	statsLoggerRunning atomic.Bool
 }
 
+// NewStateManager создает новый StateManager.
 func NewStateManager(configPath string, initialCfg *config.Config) (*StateManager, error) {
 	if initialCfg == nil {
 		return nil, errors.New("initial configuration cannot be nil")
@@ -39,145 +42,93 @@ func NewStateManager(configPath string, initialCfg *config.Config) (*StateManage
 	sm := &StateManager{
 		configPath:   configPath,
 		startTime:    time.Now(),
-		fatalErrChan: make(chan error, 5), // Buffered channel
+		fatalErrChan: make(chan error, 5),
 	}
-	sm.config.Store(initialCfg) // Store initial config
+	sm.config.Store(initialCfg)
 
-	// Initialize BPF Manager
-	// Use the client's listener address/port as the target for BPF redirection
-	listenerIP := net.ParseIP(clientcore.LocalListenAddr) // Use exported constant
+	// Инициализация BPF Manager
+	listenerIP := net.ParseIP(clientcore.LocalListenAddr)
 	if listenerIP == nil {
-		return nil, fmt.Errorf("failed to parse default client listener IP: %s", clientcore.LocalListenAddr) // Use exported constant
+		return nil, fmt.Errorf("failed to parse default client listener IP: %s", clientcore.LocalListenAddr)
 	}
 	listenerPort := initialCfg.ClientListenerPort
 	if listenerPort == 0 {
-		listenerPort = config.DefaultClientListenerPort // Use default if not set
+		listenerPort = config.DefaultClientListenerPort
 		slog.Warn("Client listener port not set in config, using default", "port", listenerPort)
 	}
 
 	var bpfErr error
 	sm.bpfManager, bpfErr = ebpf.NewBPFManager(&initialCfg.EBPF, listenerIP, listenerPort)
 	if bpfErr != nil {
+		// Попытаемся очистить ресурсы, если BPFManager частично создался
+		if sm.bpfManager != nil {
+			sm.bpfManager.Close()
+		}
 		return nil, fmt.Errorf("failed to initialize BPF manager: %w", bpfErr)
 	}
 	slog.Info("BPF Manager initialized successfully.")
 
-	// Initialize Client Manager
-	sm.clientManager = NewClientManager(sm.bpfManager) // Pass BPF manager for PID exclusion
+	// <<< Вызываем обновление исключений после создания BPF Manager >>>
+	if err := sm.bpfManager.UpdateExcludedExecutables(initialCfg.EBPF.Excluded); err != nil {
+		slog.Error("Failed to set initial excluded executables in BPF map", "error", err)
+		// Продолжаем работу, но логируем ошибку
+		// Возможно, стоит вернуть ошибку здесь? Зависит от критичности.
+		// sm.bpfManager.Close()
+		// return nil, fmt.Errorf("failed to set initial BPF exclusions: %w", err)
+	}
+
+	// Инициализация Client Manager
+	sm.clientManager = NewClientManager(sm.bpfManager)
 
 	return sm, nil
 }
 
-// StartBackgroundTasks launches long-running tasks like BPF processing and stats logging.
+// StartBackgroundTasks запускает фоновые задачи.
 func (sm *StateManager) StartBackgroundTasks(ctx context.Context) error {
 	slog.Info("Starting service background tasks...")
 
-	if sm.bpfManager != nil {
-		// Start BPF Manager's internal tasks (stats, potentially ring buffer reader)
-		if err := sm.bpfManager.Start(ctx, &sm.wg); err != nil {
-			errFatal := fmt.Errorf("FATAL: Failed to start BPF manager core tasks: %w", err)
-			sm.fatalErrChan <- errFatal // Send fatal error
-			return errFatal
-		}
-		slog.Info("BPF Manager core tasks (stats updater) started.")
-
-		// Start the BPF notification processor if the channel exists
-		if sm.GetNotificationChannel() != nil {
-			bpfProcessor := NewBpfProcessor(sm)
-			if bpfProcessor != nil {
-				sm.wg.Add(1)
-				go func() {
-					defer sm.wg.Done()
-					bpfProcessor.Run(ctx)
-				}()
-				slog.Info("BPF Notification Processor task started.")
-			} else {
-				errFatal := errors.New("FATAL: Failed to initialize BPF Processor")
-				sm.fatalErrChan <- errFatal
-				return errFatal
-			}
-		} else {
-			slog.Warn("BPF notification channel not available, processor task not started.")
-		}
-
-	} else {
+	if sm.bpfManager == nil {
 		errFatal := errors.New("FATAL: BPF Manager is nil, cannot start background tasks")
-		sm.fatalErrChan <- errFatal // Send fatal error
+		sm.fatalErrChan <- errFatal
 		return errFatal
 	}
 
-	// Start the periodic stats logger
+	// Запуск внутренних задач BPF Manager (статистика и т.д.)
+	if err := sm.bpfManager.Start(ctx, &sm.wg); err != nil {
+		errFatal := fmt.Errorf("FATAL: Failed to start BPF manager core tasks: %w", err)
+		sm.fatalErrChan <- errFatal
+		return errFatal
+	}
+	slog.Info("BPF Manager core tasks started.")
+
+	// Запуск обработчика уведомлений BPF
+	if sm.GetNotificationChannel() != nil {
+		bpfProcessor := NewBpfProcessor(sm)
+		if bpfProcessor == nil {
+			errFatal := errors.New("FATAL: Failed to initialize BPF Processor")
+			sm.fatalErrChan <- errFatal
+			return errFatal
+		}
+		sm.wg.Add(1)
+		go func() {
+			defer sm.wg.Done()
+			bpfProcessor.Run(ctx)
+		}()
+		slog.Info("BPF Notification Processor task started.")
+	} else {
+		slog.Warn("BPF notification channel not available, processor task not started.")
+	}
+
+	// Запуск периодического логгера статистики
 	sm.wg.Add(1)
-	go sm.logPeriodicStats(ctx)
-	sm.statsLoggerRunning.Store(true)
-	slog.Info("Periodic service stats logger task started.")
+	go sm.logPeriodicStats(ctx) // Используем внутренний метод
+	// statsLoggerRunning устанавливается внутри logPeriodicStats
 
 	slog.Info("All background tasks successfully initiated.")
 	return nil
 }
 
-// GetFatalErrorChannel returns a read-only channel for critical errors.
-func (sm *StateManager) GetFatalErrorChannel() <-chan error {
-	return sm.fatalErrChan
-}
-
-// GetNotificationChannel returns the channel for receiving BPF notifications.
-func (sm *StateManager) GetNotificationChannel() <-chan ebpf.NotificationTuple {
-	if sm.bpfManager == nil {
-		// Return a closed channel or nil? Returning nil might be safer.
-		return nil
-	}
-	return sm.bpfManager.GetNotificationChannel()
-}
-
-// GetConfig returns a deep copy of the current configuration.
-func (sm *StateManager) GetConfig() *config.Config {
-	cfg := sm.config.Load()
-	if cfg == nil {
-		slog.Error("GetConfig called when configuration pointer was nil!")
-		return &config.Config{} // Return empty config to avoid nil pointer dereference
-	}
-	// Create a shallow copy first
-	newCfg := *cfg
-	// Deep copy slices to prevent modification through the returned pointer
-	newCfg.EBPF.TargetPorts = append([]int(nil), cfg.EBPF.TargetPorts...)
-	newCfg.EBPF.Excluded = append([]string(nil), cfg.EBPF.Excluded...)
-	return &newCfg
-}
-
-func (sm *StateManager) GetBpfManager() *ebpf.BPFManager {
-	return sm.bpfManager
-}
-
-func (sm *StateManager) GetClientManager() *ClientManager {
-	return sm.clientManager
-}
-
-func (sm *StateManager) GetStartTime() time.Time {
-	return sm.startTime
-}
-
-func (sm *StateManager) AddWaitGroup(delta int) {
-	sm.wg.Add(delta)
-}
-
-func (sm *StateManager) WaitGroupDone() {
-	sm.wg.Done()
-}
-
-func (sm *StateManager) WG() *sync.WaitGroup {
-	return &sm.wg
-}
-
-func (sm *StateManager) Wait() {
-	sm.wg.Wait()
-}
-
-func (sm *StateManager) SetIPCListener(l net.Listener) {
-	sm.ipcListener = l
-}
-
-// ReloadConfig loads and applies configuration changes where possible.
+// ReloadConfig перезагружает конфигурацию и применяет изменения.
 func (sm *StateManager) ReloadConfig() error {
 	slog.Info("Reloading configuration...", "path", sm.configPath)
 	newCfgPtr, err := config.LoadConfig(sm.configPath)
@@ -185,96 +136,258 @@ func (sm *StateManager) ReloadConfig() error {
 		return fmt.Errorf("failed to load new configuration: %w", err)
 	}
 
-	oldCfg := sm.GetConfig() // Get a copy of the old config
+	oldCfg := sm.GetConfig() // Получаем копию старой конфигурации
 
-	// Re-setup logging based on new config
+	// Перенастройка логирования
 	logging.Setup(newCfgPtr.LogLevel, newCfgPtr.LogPath, os.Stderr)
 	slog.Info("Logging reconfigured based on reloaded settings.")
 
-	// --- Apply Changes ---
+	// --- Применение изменений ---
 
-	// Update Target Ports in BPF Map
-	portsChanged := !bpfutil.EqualIntSliceUnordered(oldCfg.EBPF.TargetPorts, newCfgPtr.EBPF.TargetPorts)
-	if portsChanged {
-		slog.Info("Applying updated target ports from reloaded configuration...", "ports", newCfgPtr.EBPF.TargetPorts)
+	// Обновление целевых портов в BPF
+	// Используем reflect.DeepEqual для сравнения срезов, т.к. порядок важен для BPFManager.UpdateTargetPorts
+	if !reflect.DeepEqual(oldCfg.EBPF.TargetPorts, newCfgPtr.EBPF.TargetPorts) {
+		slog.Info("Applying updated target ports...", "ports", newCfgPtr.EBPF.TargetPorts)
 		if sm.bpfManager != nil {
 			if err := sm.bpfManager.UpdateTargetPorts(newCfgPtr.EBPF.TargetPorts); err != nil {
 				slog.Error("Failed to update target ports in BPF map on config reload", "error", err)
-				// Revert the ports in the new config object if BPF update failed
-				newCfgPtr.EBPF.TargetPorts = oldCfg.EBPF.TargetPorts
+				newCfgPtr.EBPF.TargetPorts = oldCfg.EBPF.TargetPorts // Восстанавливаем старое значение в объекте конфига
 			} else {
 				slog.Info("Target ports successfully updated in BPF map.")
 			}
 		} else {
 			slog.Warn("Cannot update target ports: BPF manager not initialized.")
-			// Revert ports in the new config object
 			newCfgPtr.EBPF.TargetPorts = oldCfg.EBPF.TargetPorts
 		}
 	}
 
-	// Update Client Listener Port in BPF Map (affects redirection target)
+	// <<< Обновление исключенных исполняемых файлов в BPF >>>
+	if !reflect.DeepEqual(oldCfg.EBPF.Excluded, newCfgPtr.EBPF.Excluded) {
+		slog.Info("Applying updated excluded executable paths...")
+		if sm.bpfManager != nil {
+			// Вызываем новый метод BPFManager
+			if err := sm.bpfManager.UpdateExcludedExecutables(newCfgPtr.EBPF.Excluded); err != nil {
+				slog.Error("Failed to update excluded executables in BPF map on config reload", "error", err)
+				newCfgPtr.EBPF.Excluded = oldCfg.EBPF.Excluded // Восстанавливаем старое значение
+			} else {
+				slog.Info("Excluded executables successfully updated in BPF map.")
+			}
+		} else {
+			slog.Warn("Cannot update excluded executables: BPF manager not initialized.")
+			newCfgPtr.EBPF.Excluded = oldCfg.EBPF.Excluded
+		}
+	}
+
+	// Обновление порта слушателя клиента в BPF
 	if oldCfg.ClientListenerPort != newCfgPtr.ClientListenerPort {
 		slog.Info("Applying updated client listener port for BPF redirection...", "port", newCfgPtr.ClientListenerPort)
-		listenerIP := net.ParseIP(clientcore.LocalListenAddr) // Use exported constant
+		listenerIP := net.ParseIP(clientcore.LocalListenAddr)
 		if listenerIP != nil && sm.bpfManager != nil {
 			if err := sm.bpfManager.UpdateConfigMap(listenerIP, newCfgPtr.ClientListenerPort); err != nil {
 				slog.Error("Failed to update BPF config map with new listener port during reload", "error", err)
-				// Revert the port in the new config object
 				newCfgPtr.ClientListenerPort = oldCfg.ClientListenerPort
 			} else {
 				slog.Info("Updated BPF config map with new client listener port.")
 			}
 		} else {
-			slog.Error("Could not update listener port in BPF map", "listenerIP", listenerIP, "bpfManager", sm.bpfManager)
-			// Revert the port
+			slog.Error("Could not update listener port in BPF map", "listenerIP_valid", listenerIP != nil, "bpfManager_valid", sm.bpfManager != nil)
 			newCfgPtr.ClientListenerPort = oldCfg.ClientListenerPort
 		}
 	}
 
-	// Note changes requiring restart
+	// Предупреждения о параметрах, требующих перезапуска
 	if oldCfg.EBPF.StatsInterval != newCfgPtr.EBPF.StatsInterval {
-		slog.Warn("Config reload detected change in 'ebpf.stats_interval', requires service restart to take effect for BPF internal stats.")
+		slog.Warn("Config reload detected change in 'ebpf.stats_interval', requires service restart for the stats *updater* interval change. BPF internal stats work regardless.")
 	}
 	if oldCfg.SocketPath != newCfgPtr.SocketPath {
 		slog.Warn("Config reload detected change in 'socket_path', requires service restart to take effect.")
 	}
-	// Shutdown timeout can be updated dynamically
 	if oldCfg.ShutdownTimeout != newCfgPtr.ShutdownTimeout {
 		slog.Info("Shutdown timeout updated.", "old", oldCfg.ShutdownTimeout, "new", newCfgPtr.ShutdownTimeout)
 	}
-	// Excluded paths are handled dynamically by BpfProcessor
 
-	// Atomically store the new configuration
+	// Атомарно сохраняем новую конфигурацию
 	sm.config.Store(newCfgPtr)
 	slog.Info("Configuration reload finished. Stored new configuration.")
-
-	// Note: We don't restart BpfProcessor here. It reads excluded paths periodically.
-	// If other BPF parameters change (like map sizes), a restart would be needed.
 
 	return nil
 }
 
-// Shutdown performs graceful shutdown of managed components.
+// --- Остальные методы StateManager (GetConfig, GetBpfManager, etc.) ---
+// Они остаются без изменений, кроме logPeriodicStats
+
+// logPeriodicStats является оберткой для запуска фоновой задачи логирования.
+func (sm *StateManager) logPeriodicStats(ctx context.Context) {
+	sm.statsLoggerRunning.Store(true) // Устанавливаем флаг здесь
+	defer sm.statsLoggerRunning.Store(false)
+	defer sm.wg.Done() // Убедимся, что WaitGroup уменьшается при выходе
+
+	slog.Debug("Stats logger goroutine started.") // Изменено на Debug
+
+	cfg := sm.GetConfig() // Получаем актуальный конфиг
+	interval := time.Duration(cfg.EBPF.StatsInterval) * time.Second
+	if interval <= 1*time.Second { // Используем ту же логику валидации, что и в statsUpdater
+		interval = 15 * time.Second
+		slog.Warn("Invalid or too frequent ebpf.stats_interval for periodic logging, using default.", "default", interval)
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Логируем сразу при старте
+	sm.performPeriodicStatsLog()
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("Stopping periodic service stats logger due to context cancellation.")
+			return
+		// Канал stopChan не доступен здесь напрямую, используем ctx.Done()
+		case <-ticker.C:
+			sm.performPeriodicStatsLog()
+		}
+	}
+}
+
+// performPeriodicStatsLog выполняет фактическое логирование статистики.
+func (sm *StateManager) performPeriodicStatsLog() {
+	if sm == nil {
+		slog.Error("Cannot log stats, StateManager is nil")
+		return
+	}
+
+	bpfMgr := sm.GetBpfManager()
+	clientMgr := sm.GetClientManager()
+
+	startTime := sm.GetStartTime()
+	uptime := time.Since(startTime).Round(time.Second)
+
+	clientCount := 0
+	if clientMgr != nil {
+		clientCount = clientMgr.GetClientCount()
+	} else {
+		slog.Warn("Client Manager not available for stats logging")
+	}
+
+	var currentStats ebpf.GlobalStats
+	var bpfErr error
+	if bpfMgr != nil {
+		// Используем GetStats() для получения кэшированных данных
+		currentStats, bpfErr = bpfMgr.GetStats()
+		if bpfErr != nil {
+			// GetStats() из кэша не должна возвращать ошибку,
+			// но если она принудительно читает и получает ошибку:
+			slog.Warn("Error retrieving BPF stats for logging", "error", bpfErr)
+		}
+	} else {
+		slog.Warn("BPF Manager not available for stats logging")
+	}
+
+	slog.Info("Service Status",
+		"uptime", uptime.String(),
+		"active_clients", clientCount,
+		"bpf_total_redirected", currentStats.Redirected,
+		"bpf_total_getsockopt_ok", currentStats.GetsockoptOk,
+		"bpf_total_getsockopt_fail", currentStats.GetsockoptFail,
+	)
+}
+
+// GetFatalErrorChannel возвращает канал для фатальных ошибок.
+func (sm *StateManager) GetFatalErrorChannel() <-chan error {
+	return sm.fatalErrChan
+}
+
+// GetNotificationChannel возвращает канал уведомлений от BPF.
+func (sm *StateManager) GetNotificationChannel() <-chan ebpf.NotificationTuple {
+	if sm.bpfManager == nil {
+		return nil
+	}
+	return sm.bpfManager.GetNotificationChannel()
+}
+
+// GetConfig возвращает копию текущей конфигурации.
+func (sm *StateManager) GetConfig() *config.Config {
+	cfg := sm.config.Load()
+	if cfg == nil {
+		slog.Error("GetConfig called when configuration pointer was nil!")
+		// Возвращаем пустую структуру, чтобы избежать паники
+		// но это серьезная проблема, если происходит
+		return &config.Config{}
+	}
+	// Создаем копию для безопасности
+	newCfg := *cfg
+	// Глубокое копирование срезов
+	newCfg.EBPF.TargetPorts = append([]int(nil), cfg.EBPF.TargetPorts...)
+	newCfg.EBPF.Excluded = append([]string(nil), cfg.EBPF.Excluded...)
+	return &newCfg
+}
+
+// GetBpfManager возвращает BPFManager.
+func (sm *StateManager) GetBpfManager() *ebpf.BPFManager {
+	return sm.bpfManager
+}
+
+// GetClientManager возвращает ClientManager.
+func (sm *StateManager) GetClientManager() *ClientManager {
+	return sm.clientManager
+}
+
+// GetStartTime возвращает время старта сервиса.
+func (sm *StateManager) GetStartTime() time.Time {
+	return sm.startTime
+}
+
+// AddWaitGroup увеличивает счетчик WaitGroup.
+func (sm *StateManager) AddWaitGroup(delta int) {
+	sm.wg.Add(delta)
+}
+
+// WaitGroupDone уменьшает счетчик WaitGroup.
+func (sm *StateManager) WaitGroupDone() {
+	sm.wg.Done()
+}
+
+// WG возвращает WaitGroup.
+func (sm *StateManager) WG() *sync.WaitGroup {
+	return &sm.wg
+}
+
+// Wait ожидает завершения всех задач в WaitGroup.
+func (sm *StateManager) Wait() {
+	sm.wg.Wait()
+}
+
+// SetIPCListener устанавливает слушатель IPC.
+func (sm *StateManager) SetIPCListener(l net.Listener) {
+	sm.ipcListener = l
+}
+
+// Shutdown выполняет корректное завершение работы.
 func (sm *StateManager) Shutdown(ctx context.Context) {
 	sm.stopOnce.Do(func() {
 		slog.Info("Initiating graceful shutdown...")
 
-		// 1. Stop accepting new IPC connections
+		// 1. Остановка приема новых IPC соединений
 		if sm.ipcListener != nil {
 			slog.Debug("Closing IPC listener...")
-			if err := sm.ipcListener.Close(); err != nil {
+			if err := sm.ipcListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 				slog.Error("Error closing IPC listener", "error", err)
 			} else {
 				slog.Debug("IPC listener closed.")
 			}
+		} else {
+			slog.Debug("IPC listener was already nil or not set.")
 		}
 
-		// 2. Close existing IPC client connections
-		// CloseAllClients now removes PIDs from BPF map as well
-		slog.Debug("Closing active IPC client connections...")
-		sm.clientManager.CloseAllClients(ctx) // Pass context for potential timeout
+		// 2. Закрытие существующих IPC клиентов
+		if sm.clientManager != nil {
+			slog.Debug("Closing active IPC client connections...")
+			sm.clientManager.CloseAllClients(ctx) // Передаем контекст
+		} else {
+			slog.Debug("Client Manager is nil, skipping client closure.")
+		}
 
-		// 3. Close the BPF manager (detaches programs, closes maps)
+		// 3. Закрытие BPF manager (отсоединение программ, закрытие карт)
 		if sm.bpfManager != nil {
 			slog.Debug("Closing BPF manager...")
 			if err := sm.bpfManager.Close(); err != nil {
@@ -282,26 +395,17 @@ func (sm *StateManager) Shutdown(ctx context.Context) {
 			} else {
 				slog.Debug("BPF manager closed.")
 			}
+		} else {
+			slog.Debug("BPF Manager is nil, skipping closure.")
 		}
 
-		// 4. Close the fatal error channel
+		// 4. Закрытие канала фатальных ошибок
 		if sm.fatalErrChan != nil {
 			close(sm.fatalErrChan)
 			sm.fatalErrChan = nil
 		}
 
-		slog.Info("Shutdown sequence complete. Waiting for remaining tasks via main WaitGroup...")
-		// The main loop will call sm.Wait() after this.
+		slog.Info("Shutdown sequence complete. Waiting for remaining tasks via WaitGroup...")
+		// Основной цикл вызовет sm.Wait() после этой функции
 	})
-}
-
-// logPeriodicStats is the target function for the stats logger goroutine.
-func (sm *StateManager) logPeriodicStats(ctx context.Context) {
-	defer sm.wg.Done()                       // Ensure WaitGroup is decremented on exit
-	defer sm.statsLoggerRunning.Store(false) // Mark as not running
-
-	slog.Info("Periodic service stats logger task started.")
-	bgTasks := NewBackgroundTasks(sm)
-	bgTasks.RunStatsLogger(ctx) // Run the actual logging loop
-	slog.Info("Periodic service stats logger task stopped.")
 }
