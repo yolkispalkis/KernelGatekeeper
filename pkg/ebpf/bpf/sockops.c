@@ -21,27 +21,22 @@
 #define BPF_OK 0
 #endif
 
-// Определение структуры skops для CO-RE
-struct bpf_sock_ops_kern {
-    __u32 op;
-    __u32 family;
-    __u32 local_ip4;
-    __u32 remote_ip4;
-    __u16 local_port;
-    __u16 remote_port;
-    __u32 reply;
-} __attribute__((preserve_access_index));
+// Удалил определение структуры bpf_sock_ops_kern, так как она уже определена в vmlinux.h
 
 SEC("sockops")
 int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
-    // Безопасное чтение полей структуры skops
+    // Объявляем переменные в начале функции
     __u16 op;
     __u16 family;
     __u16 local_port;
-    __be16 remote_port_n;
     __u32 local_ip4;
-    __u32 remote_ip4;
+    __u64 sock_cookie;
+    struct original_dest_t *details;
+    __u16 src_port_h;
+    int ret;
+    struct notification_tuple_t *notif;
     
+    // Безопасное чтение полей структуры skops
     if (bpf_core_read(&op, sizeof(op), &skops->op)) {
         return BPF_OK;
     }
@@ -65,7 +60,7 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
     }
 
     // Получаем cookie сокета
-    __u64 sock_cookie = bpf_get_socket_cookie(skops);
+    sock_cookie = bpf_get_socket_cookie(skops);
     if (sock_cookie == 0) {
         #ifdef DEBUG
         bpf_printk("SOCKOPS_ERR: Failed to get socket cookie (ACTIVE_ESTABLISHED_CB).\n");
@@ -74,7 +69,7 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
     }
 
     // Ищем оригинальный адрес назначения, сохраненный connect4
-    struct original_dest_t *details = bpf_map_lookup_elem(&kg_orig_dest, &sock_cookie);
+    details = bpf_map_lookup_elem(&kg_orig_dest, &sock_cookie);
     if (!details) {
         // Это соединение не было перенаправлено connect4 или данные были очищены
         return BPF_OK;
@@ -100,10 +95,10 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
         return BPF_OK;
     }
     
-    __u16 src_port_h = (__u16)local_port; // Порт источника (в сетевом порядке байт)
+    src_port_h = (__u16)local_port; // Порт источника (в сетевом порядке байт)
 
     // Сохраняем отображение порт_источника -> cookie
-    int ret = bpf_map_update_elem(&kg_port_to_cookie, &src_port_h, &sock_cookie, BPF_ANY);
+    ret = bpf_map_update_elem(&kg_port_to_cookie, &src_port_h, &sock_cookie, BPF_ANY);
     if (ret != 0) {
         bpf_printk("SOCKOPS_ERR: Failed to update kg_port_to_cookie (port %u, cookie %llu): %d\n", 
                   src_port_h, sock_cookie, ret);
@@ -123,7 +118,6 @@ int kernelgatekeeper_sockops(struct bpf_sock_ops *skops) {
         }
 
         // Отправляем уведомление в userspace через кольцевой буфер
-        struct notification_tuple_t *notif;
         notif = bpf_ringbuf_reserve(&kg_notif_rb, sizeof(*notif), 0);
         if (!notif) {
             bpf_printk("SOCKOPS_ERR: Failed to reserve space in ring buffer for notification.\n");
