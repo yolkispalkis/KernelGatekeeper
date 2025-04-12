@@ -7,6 +7,7 @@
 
 #define SO_ORIGINAL_DST 80
 
+// --- Struct definitions remain the same ---
 struct dev_inode_key {
     __u64 dev_id;
     __u64 inode_id;
@@ -42,49 +43,16 @@ struct notification_tuple_t {
     __u8   protocol;
 };
 
-// BPF Maps
 
+// --- Map definitions remain the same ---
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
+    __uint(max_entries, 1024); // Make sure max_entries is appropriate
     __type(key, struct dev_inode_key);
     __type(value, __u8);
 } excluded_dev_inodes SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 8192);
-    __type(key, __u64); // socket cookie
-    __type(value, struct original_dest_t);
-} kg_orig_dest SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 8192);
-    __type(key, __u16); // source port (host byte order)
-    __type(value, __u64); // socket cookie
-} kg_port_to_cookie SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
-    __type(key, __u16); // target port (host byte order)
-    __type(value, __u8); // 1 = target
-} target_ports SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
-    __type(key, __u32); // PID
-    __type(value, __u8); // 1 = excluded
-} kg_client_pids SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct kg_config_t);
-} kg_config SEC(".maps");
+// ... (other map definitions) ...
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -95,7 +63,27 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
+    __uint(max_entries, 256 * 1024); // Default size, adjust if needed
 } kg_notif_rb SEC(".maps");
+
+
+// <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+// ADD the stats helper function definition here
+// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+// field 0: packets (connect4)
+// field 1: redirected (connect4)
+// field 2: getsockopt_ok (getsockopt)
+// field 3: getsockopt_fail (getsockopt)
+static __always_inline void kg_stats_inc(int field) {
+    __u32 key = 0;
+    struct global_stats_t *stats = bpf_map_lookup_elem(&kg_stats, &key);
+    if (stats) {
+        if (field == 0) __sync_fetch_and_add(&stats->packets, 1);
+        else if (field == 1) __sync_fetch_and_add(&stats->redirected, 1);
+        else if (field == 2) __sync_fetch_and_add(&stats->getsockopt_ok, 1);
+        else if (field == 3) __sync_fetch_and_add(&stats->getsockopt_fail, 1);
+        // field 4 for bytes could be added if needed
+    }
+}
 
 #endif // BPF_SHARED_H
