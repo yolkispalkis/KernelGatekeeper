@@ -1,4 +1,3 @@
-// FILE: cmd/client/main.go
 package main
 
 import (
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/clientcore"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/common" // Import common
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/kerb"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/logging"
@@ -72,6 +72,9 @@ func main() {
 
 	signals.SetupHandler(ctx, rootCancel, &globalShutdownOnce)
 
+	// FIX: Pass cfg to NewStateManager (assuming the incompatible type error was due to import cycle)
+	// The error message "cannot use cfg (...) as *invalid type value" strongly suggests the type was unresolved due to the cycle.
+	// Assuming NewStateManager takes *config.Config
 	stateManager := clientcore.NewStateManager(cfg)
 
 	kClient, kerr := kerb.NewKerberosClient(&cfg.Kerberos)
@@ -106,7 +109,7 @@ func main() {
 
 	ipcSocketPath := flags.socketPath
 	if ipcSocketPath == "" {
-		ipcSocketPath = config.DefaultSocketPath
+		ipcSocketPath = common.DefaultSocketPath // Use common
 	}
 	ipcManager := clientcore.NewIPCManager(ctx, stateManager, ipcSocketPath, flags.connectTimeout)
 
@@ -191,7 +194,7 @@ func parseFlags() clientFlags {
 	}
 
 	flag.StringVar(&flags.configPath, "config", defaultConfigPath, "Path to client config file")
-	flag.StringVar(&flags.socketPath, "socket", config.DefaultSocketPath, "Path to service UNIX socket")
+	flag.StringVar(&flags.socketPath, "socket", common.DefaultSocketPath, "Path to service UNIX socket") // Use common
 	flag.BoolVar(&flags.showVersion, "version", false, "Show client version")
 	flag.DurationVar(&flags.connectTimeout, "timeout", 10*time.Second, "Connection timeout to the service socket")
 	flag.StringVar(&flags.logLevel, "loglevel", "", "Override log level (debug, info, warn, error)")

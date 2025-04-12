@@ -1,3 +1,4 @@
+// FILE: pkg/proxy/manager.go
 package proxy
 
 import (
@@ -8,16 +9,28 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	appconfig "github.com/yolkispalkis/kernelgatekeeper/pkg/config"
+	// Config import removed
 	// Removed pkg/pac import
 )
 
+// Define ProxyConfig locally if it's only needed here
+type ProxyConfig struct {
+	Type                string `mapstructure:"type"`
+	URL                 string `mapstructure:"url"`
+	WpadURL             string `mapstructure:"wpadUrl"`
+	ConnectionTimeout   int    `mapstructure:"connectionTimeout"`
+	RequestTimeout      int    `mapstructure:"requestTimeout"`
+	MaxRetries          int    `mapstructure:"maxRetries"`
+	PacCharset          string `mapstructure:"pacCharset"`
+	PacExecutionTimeout int    `mapstructure:"pacExecutionTimeout"`
+	PacFileTTL          int    `mapstructure:"pacFileTtl"`
+}
+
 // ProxyManager determines the appropriate proxy configuration based on settings.
 type ProxyManager struct {
-	config             *appconfig.ProxyConfig
-	pacParser          *PacParser // Replaced pacEngine with gopac based parser
-	staticProxyResult  PacResult  // Pre-calculated result for static config types
+	config             *ProxyConfig // Use local struct
+	pacParser          *PacParser   // Replaced pacEngine with gopac based parser
+	staticProxyResult  PacResult    // Pre-calculated result for static config types
 	proxyMutex         sync.RWMutex
 	stopChan           chan struct{} // For potential background tasks (none currently)
 	initializationDone bool
@@ -25,7 +38,7 @@ type ProxyManager struct {
 }
 
 // NewProxyManager creates and initializes a new ProxyManager.
-func NewProxyManager(cfg *appconfig.ProxyConfig) (*ProxyManager, error) {
+func NewProxyManager(cfg *ProxyConfig) (*ProxyManager, error) { // Use local struct
 	pm := &ProxyManager{
 		config:   cfg,
 		stopChan: make(chan struct{}),

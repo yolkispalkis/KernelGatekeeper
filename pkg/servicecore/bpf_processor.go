@@ -13,7 +13,7 @@ import (
 
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/bpfutil"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/common"
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/ebpf"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/ebpf" // Import ebpf
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/ipc"
 )
 
@@ -26,7 +26,8 @@ const (
 type BpfProcessor struct {
 	stateManager *StateManager
 	clientMgr    *ClientManager
-	notifChan    <-chan ebpf.NotificationTuple // Используем тип из ebpf
+	// FIX: Use the correct type from ebpf package
+	notifChan <-chan ebpf.NotificationTuple // Используем тип из ebpf
 }
 
 func NewBpfProcessor(stateMgr *StateManager) *BpfProcessor {
@@ -77,7 +78,9 @@ func (bp *BpfProcessor) Run(ctx context.Context) {
 
 // processSingleNotification обрабатывает одно событие BPF.
 // Больше НЕ принимает excludedPaths.
+// FIX: Use the correct type from ebpf package
 func (bp *BpfProcessor) processSingleNotification(ctx context.Context, notification ebpf.NotificationTuple) {
+
 	pidTgid := notification.PidTgid
 	pid := uint32(pidTgid & 0xFFFFFFFF) // Извлекаем PID
 

@@ -1,3 +1,4 @@
+// FILE: pkg/clientcore/listener.go
 package clientcore
 
 import (
@@ -6,12 +7,11 @@ import (
 	"log/slog"
 	"net"
 
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/common" // Import common
+	// config import removed
 )
 
-const (
-	LocalListenAddr = "127.0.0.1" // Exported constant
-)
+// LocalListenAddr moved to pkg/common
 
 type LocalListener struct {
 	listener net.Listener
@@ -20,11 +20,11 @@ type LocalListener struct {
 
 func NewLocalListener(port uint16) *LocalListener {
 	if port == 0 {
-		port = config.DefaultClientListenerPort
+		port = common.DefaultClientListenerPort // Use common
 		slog.Warn("Client listener port not configured or zero, using default", "default", port)
 	}
 	return &LocalListener{
-		address: fmt.Sprintf("%s:%d", LocalListenAddr, port), // Use exported constant
+		address: fmt.Sprintf("%s:%d", common.LocalListenAddr, port), // Use common constant
 	}
 }
 

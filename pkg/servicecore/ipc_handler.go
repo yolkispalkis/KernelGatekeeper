@@ -65,8 +65,10 @@ func (h *IpcHandler) HandleConnection(ctx context.Context, conn net.Conn) {
 
 		var cmd ipc.Command
 
+		// Set read deadline for idle timeout
 		conn.SetReadDeadline(time.Now().Add(ipcReadIdleTimeout))
 		err := decoder.Decode(&cmd)
+		// Clear deadline immediately after read attempt
 		conn.SetReadDeadline(time.Time{})
 
 		if err != nil {
@@ -103,10 +105,13 @@ func (h *IpcHandler) HandleConnection(ctx context.Context, conn net.Conn) {
 
 			resp, procErr = h.processIPCCommand(conn, &cmd, &clientInfo)
 			if procErr != nil {
-				resp = ipc.NewErrorResponse(procErr.Error())
+				// Ensure response is error type if processing failed
+				if resp == nil || resp.Status != ipc.StatusError {
+					resp = ipc.NewErrorResponse(procErr.Error())
+				}
 				logCtxCmd.Error("Error processing IPC command", "error", procErr)
 			} else if resp == nil {
-
+				// Should ideally not happen if processIPCCommand is well-behaved
 				logCtxCmd.Error("Internal error: processIPCCommand returned nil response and nil error")
 				resp = ipc.NewErrorResponse("internal server error processing command")
 			}
@@ -119,12 +124,12 @@ func (h *IpcHandler) HandleConnection(ctx context.Context, conn net.Conn) {
 
 			if encodeErr != nil {
 				logCtxCmd.Error("Failed to send IPC response", "error", encodeErr)
-
+				// If we can't send response, likely connection is dead, terminate handler
 				return
 			}
 			logCtxCmd.Debug("Sent IPC response", "status", resp.Status)
 		} else {
-
+			// Some commands might not require a response (though currently all do)
 			logCtxCmd.Debug("No response generated for command")
 		}
 	}
@@ -137,7 +142,7 @@ func (h *IpcHandler) processIPCCommand(conn net.Conn, cmd *ipc.Command, clientIn
 	switch cmd.Command {
 	case "register_client":
 		if currentClientInfo != nil {
-
+			// Client trying to register again on the same connection
 			slog.Warn("IPC client attempted to register again on the same connection", "uid", currentClientInfo.UID, "pid", currentClientInfo.PID)
 			return nil, errors.New("client already registered on this connection")
 		}
@@ -152,12 +157,13 @@ func (h *IpcHandler) processIPCCommand(conn net.Conn, cmd *ipc.Command, clientIn
 			slog.Error("Failed to add client connection during registration", "reported_pid", data.PID, "error", err)
 			return nil, fmt.Errorf("client registration failed: %w", err)
 		}
-		*clientInfoPtr = newState
+		*clientInfoPtr = newState // Update the caller's pointer
 
 		return ipc.NewOKResponse("Client registered successfully")
 
 	case "get_status":
-
+		// No need to check registration here, status is public?
+		// Or maybe require registration? Let's allow without for now.
 		return h.getStatusResponse()
 
 	case "ping_status":
@@ -169,10 +175,12 @@ func (h *IpcHandler) processIPCCommand(conn net.Conn, cmd *ipc.Command, clientIn
 			return nil, fmt.Errorf("invalid ping_status data: %w", err)
 		}
 
+		// Update status, check if client still exists
 		if !clientManager.UpdateClientStatus(conn, data) {
+			// Client might have disconnected between read and update
 			return nil, errors.New("client disconnected before status ping could be processed")
 		}
-
+		// Respond with simple OK, no data needed
 		return ipc.NewOKResponse(nil)
 
 	default:
@@ -185,7 +193,7 @@ func (h *IpcHandler) getStatusResponse() (*ipc.Response, error) {
 	clientManager := h.stateManager.GetClientManager()
 	bpfMgr := h.stateManager.GetBpfManager()
 	startTime := h.stateManager.GetStartTime()
-	serviceVersion := "dev"
+	serviceVersion := "dev" // TODO: Inject version properly
 
 	clientDetails, clientKerberosStates := clientManager.GetAllClientDetails()
 	clientCount := len(clientDetails)
@@ -202,8 +210,10 @@ func (h *IpcHandler) getStatusResponse() (*ipc.Response, error) {
 	}
 
 	if bpfMgr != nil {
+		// FIX: Use the implemented GetStats method
 		stats, err := bpfMgr.GetStats()
 		if err != nil {
+			// GetStats from cache shouldn't error, but handle defensively
 			slog.Warn("Failed to get eBPF stats for status response", "error", err)
 			statusData.Status = "degraded (bpf stats error)"
 		} else {

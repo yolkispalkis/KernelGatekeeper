@@ -1,3 +1,4 @@
+// FILE: pkg/kerb/kerberos.go
 package kerb
 
 import (
@@ -13,14 +14,20 @@ import (
 	gokrb5client "github.com/jcmturner/gokrb5/v8/client"
 	krb5config "github.com/jcmturner/gokrb5/v8/config"
 	"github.com/jcmturner/gokrb5/v8/credentials"
-
-	appconfig "github.com/yolkispalkis/kernelgatekeeper/pkg/config" // Keep for KerberosConfig struct reference if needed
+	// config import removed
 )
+
+// Define KerberosConfig locally if it's only needed here
+type KerberosConfig struct {
+	Realm     string `mapstructure:"realm"`
+	KDCHost   string `mapstructure:"kdcHost"`
+	CachePath string `mapstructure:"cachePath"` // Note: Primarily used by old logic, client uses env/defaults
+}
 
 type KerberosClient struct {
 	// config is kept minimally for potential future use (e.g. realm/kdc hints)
 	// but cachePath is NOT used from here anymore.
-	config *appconfig.KerberosConfig
+	config *KerberosConfig // Use local struct
 
 	client        *gokrb5client.Client
 	mu            sync.Mutex
@@ -31,7 +38,7 @@ type KerberosClient struct {
 
 // NewKerberosClient creates a Kerberos client configured to use the user's ccache.
 // The KerberosConfig is now mainly informational or for future hints.
-func NewKerberosClient(cfg *appconfig.KerberosConfig) (*KerberosClient, error) {
+func NewKerberosClient(cfg *KerberosConfig) (*KerberosClient, error) { // Use local struct
 	slog.Info("Initializing Kerberos client context (user ccache mode)")
 
 	k := &KerberosClient{

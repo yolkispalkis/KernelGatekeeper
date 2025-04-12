@@ -13,24 +13,24 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/clientcore"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/common" // Import common
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/ebpf"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/ebpf" // Import ebpf
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/logging"
 )
 
 // StateManager управляет состоянием сервиса.
 type StateManager struct {
-	configPath         string
-	config             atomic.Pointer[config.Config]
-	bpfManager         *ebpf.BPFManager
-	clientManager      *ClientManager
-	ipcListener        net.Listener
-	wg                 sync.WaitGroup
-	startTime          time.Time
-	stopOnce           sync.Once
-	fatalErrChan       chan error
-	statsLoggerRunning atomic.Bool
+	configPath    string
+	config        atomic.Pointer[config.Config]
+	bpfManager    *ebpf.BPFManager
+	clientManager *ClientManager
+	ipcListener   net.Listener
+	wg            sync.WaitGroup
+	startTime     time.Time
+	stopOnce      sync.Once
+	fatalErrChan  chan error
+	// statsLoggerRunning atomic.Bool // Removed, handled internally by goroutine state
 }
 
 // NewStateManager создает новый StateManager.
@@ -47,13 +47,17 @@ func NewStateManager(configPath string, initialCfg *config.Config) (*StateManage
 	sm.config.Store(initialCfg)
 
 	// Инициализация BPF Manager
-	listenerIP := net.ParseIP(clientcore.LocalListenAddr)
+	// FIX: Use common constant for listener IP
+	listenerIP := net.ParseIP(common.LocalListenAddr)
 	if listenerIP == nil {
-		return nil, fmt.Errorf("failed to parse default client listener IP: %s", clientcore.LocalListenAddr)
+		// FIX: Use common constant in error message
+		return nil, fmt.Errorf("failed to parse default client listener IP: %s", common.LocalListenAddr)
+
 	}
 	listenerPort := initialCfg.ClientListenerPort
 	if listenerPort == 0 {
-		listenerPort = config.DefaultClientListenerPort
+		// FIX: Use common constant for default port
+		listenerPort = common.DefaultClientListenerPort
 		slog.Warn("Client listener port not set in config, using default", "port", listenerPort)
 	}
 
@@ -90,6 +94,7 @@ func (sm *StateManager) StartBackgroundTasks(ctx context.Context) error {
 	if sm.bpfManager == nil {
 		errFatal := errors.New("FATAL: BPF Manager is nil, cannot start background tasks")
 		sm.fatalErrChan <- errFatal
+		close(sm.fatalErrChan) // Close channel after sending fatal error
 		return errFatal
 	}
 
@@ -97,6 +102,7 @@ func (sm *StateManager) StartBackgroundTasks(ctx context.Context) error {
 	if err := sm.bpfManager.Start(ctx, &sm.wg); err != nil {
 		errFatal := fmt.Errorf("FATAL: Failed to start BPF manager core tasks: %w", err)
 		sm.fatalErrChan <- errFatal
+		close(sm.fatalErrChan)
 		return errFatal
 	}
 	slog.Info("BPF Manager core tasks started.")
@@ -107,6 +113,7 @@ func (sm *StateManager) StartBackgroundTasks(ctx context.Context) error {
 		if bpfProcessor == nil {
 			errFatal := errors.New("FATAL: Failed to initialize BPF Processor")
 			sm.fatalErrChan <- errFatal
+			close(sm.fatalErrChan)
 			return errFatal
 		}
 		sm.wg.Add(1)
@@ -122,7 +129,6 @@ func (sm *StateManager) StartBackgroundTasks(ctx context.Context) error {
 	// Запуск периодического логгера статистики
 	sm.wg.Add(1)
 	go sm.logPeriodicStats(ctx) // Используем внутренний метод
-	// statsLoggerRunning устанавливается внутри logPeriodicStats
 
 	slog.Info("All background tasks successfully initiated.")
 	return nil
@@ -181,7 +187,8 @@ func (sm *StateManager) ReloadConfig() error {
 	// Обновление порта слушателя клиента в BPF
 	if oldCfg.ClientListenerPort != newCfgPtr.ClientListenerPort {
 		slog.Info("Applying updated client listener port for BPF redirection...", "port", newCfgPtr.ClientListenerPort)
-		listenerIP := net.ParseIP(clientcore.LocalListenAddr)
+		// FIX: Use common constant
+		listenerIP := net.ParseIP(common.LocalListenAddr)
 		if listenerIP != nil && sm.bpfManager != nil {
 			if err := sm.bpfManager.UpdateConfigMap(listenerIP, newCfgPtr.ClientListenerPort); err != nil {
 				slog.Error("Failed to update BPF config map with new listener port during reload", "error", err)
@@ -218,11 +225,10 @@ func (sm *StateManager) ReloadConfig() error {
 
 // logPeriodicStats является оберткой для запуска фоновой задачи логирования.
 func (sm *StateManager) logPeriodicStats(ctx context.Context) {
-	sm.statsLoggerRunning.Store(true) // Устанавливаем флаг здесь
-	defer sm.statsLoggerRunning.Store(false)
+	// sm.statsLoggerRunning.Store(true) // Removed
 	defer sm.wg.Done() // Убедимся, что WaitGroup уменьшается при выходе
 
-	slog.Debug("Stats logger goroutine started.") // Изменено на Debug
+	slog.Debug("Periodic stats logger goroutine started.") // Изменено на Debug
 
 	cfg := sm.GetConfig() // Получаем актуальный конфиг
 	interval := time.Duration(cfg.EBPF.StatsInterval) * time.Second
@@ -272,7 +278,7 @@ func (sm *StateManager) performPeriodicStatsLog() {
 	var currentStats ebpf.GlobalStats
 	var bpfErr error
 	if bpfMgr != nil {
-		// Используем GetStats() для получения кэшированных данных
+		// FIX: Use the implemented GetStats method
 		currentStats, bpfErr = bpfMgr.GetStats()
 		if bpfErr != nil {
 			// GetStats() из кэша не должна возвращать ошибку,
@@ -298,7 +304,9 @@ func (sm *StateManager) GetFatalErrorChannel() <-chan error {
 }
 
 // GetNotificationChannel возвращает канал уведомлений от BPF.
+// FIX: Use the correct type from ebpf package
 func (sm *StateManager) GetNotificationChannel() <-chan ebpf.NotificationTuple {
+
 	if sm.bpfManager == nil {
 		return nil
 	}
@@ -401,7 +409,13 @@ func (sm *StateManager) Shutdown(ctx context.Context) {
 
 		// 4. Закрытие канала фатальных ошибок
 		if sm.fatalErrChan != nil {
-			close(sm.fatalErrChan)
+			select {
+			case <-sm.fatalErrChan:
+				// Channel already closed or has pending error
+			default:
+				// Channel is open and empty, close it
+				close(sm.fatalErrChan)
+			}
 			sm.fatalErrChan = nil
 		}
 

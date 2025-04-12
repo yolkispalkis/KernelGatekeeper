@@ -13,7 +13,8 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/clientcore" // Need for default listener address
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/common" // Import common
+	// clientcore import removed
 )
 
 const (
@@ -28,10 +29,10 @@ const (
 	DefaultLogLevel               = "info"
 	DefaultLogPath                = "/var/log/kernelgatekeeper.log"
 	DefaultShutdownTimeout        = 30
-	DefaultSocketPath             = "/var/run/kernelgatekeeper.sock"
-	DefaultClientListenerPort     = 3129
-	DefaultEBPFMapSize            = 8192 // General default size
-	DefaultRedirSportMapSize      = 8192 // Default for the new map
+	// DefaultSocketPath moved to common
+	// DefaultClientListenerPort moved to common
+	DefaultEBPFMapSize       = 8192 // General default size
+	DefaultRedirSportMapSize = 8192 // Default for the new map
 )
 
 type Config struct {
@@ -205,15 +206,15 @@ func validateConfig(cfg *Config) error {
 		return errors.New("socketPath cannot be empty")
 	}
 	if cfg.ClientListenerPort == 0 {
-		slog.Warn("clientListenerPort is not configured or zero, using default", "default", DefaultClientListenerPort)
-		cfg.ClientListenerPort = DefaultClientListenerPort
+		slog.Warn("clientListenerPort is not configured or zero, using default", "default", common.DefaultClientListenerPort) // Use common
+		cfg.ClientListenerPort = common.DefaultClientListenerPort                                                             // Use common
 	}
 
 	// Validate Listener Address (ensure it's loopback)
-	listenerIP := net.ParseIP(clientcore.LocalListenAddr)
+	listenerIP := net.ParseIP(common.LocalListenAddr) // Use common
 	if listenerIP == nil || !listenerIP.IsLoopback() {
 		// This should ideally not happen as it's a constant, but good practice to check
-		return fmt.Errorf("internal error: configured client listener address '%s' is not a valid loopback address", clientcore.LocalListenAddr)
+		return fmt.Errorf("internal error: configured client listener address '%s' is not a valid loopback address", common.LocalListenAddr) // Use common
 	}
 
 	return nil
@@ -241,6 +242,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("logLevel", DefaultLogLevel)
 	v.SetDefault("logPath", DefaultLogPath)
 	v.SetDefault("shutdownTimeout", DefaultShutdownTimeout)
-	v.SetDefault("socketPath", DefaultSocketPath)
-	v.SetDefault("clientListenerPort", DefaultClientListenerPort)
+	v.SetDefault("socketPath", common.DefaultSocketPath)                 // Use common
+	v.SetDefault("clientListenerPort", common.DefaultClientListenerPort) // Use common
 }
