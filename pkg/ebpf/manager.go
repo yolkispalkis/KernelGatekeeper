@@ -6,9 +6,7 @@ package ebpf
 //go:generate go run -tags linux github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpf -cflags "-O2 -g -Wall -Werror -DDEBUG -I./bpf -I/usr/include/bpf -I/usr/include -I/usr/include/x86_64-linux-gnu" bpf_getsockopt ./bpf/getsockopt.c -- -I./bpf -D__TARGET_ARCH_x86
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +23,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/bpfutil"
+	// Added import
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 )
 
@@ -413,12 +411,7 @@ func (m *BPFManager) UpdateExcludedExecutables(paths []string) error {
 // --- Вспомогательные функции и остальной код manager.go ---
 // handleVerifierError, attachPrograms, Start, Close, GetNotificationChannel, etc.
 // Они остаются в основном без изменений, но нужно убедиться, что
-// Close() корректно обрабатывает все объекты, включая новую карту,
-// хотя она и должна закрываться через bpf_connect4Objects.Close().
-
-// ... (остальной код manager.go без изменений) ...
-
-// Добавим реализацию для handleVerifierError, attachPrograms, Start, Close, GetNotificationChannel, если они не были скопированы ранее
+// Close() корректно обрабатывает все объекты.
 
 func handleVerifierError(objType string, err error) {
 	var verr *ebpf.VerifierError
@@ -492,16 +485,13 @@ func (m *BPFManager) attachPrograms(cgroupPath string) error {
 }
 
 func (m *BPFManager) Start(ctx context.Context, wg *sync.WaitGroup) error {
-	// m.mu.Lock() // Блокировка не нужна здесь, т.к. Start вызывается один раз
-	// defer m.mu.Unlock()
-
 	slog.Info("Starting BPF Manager background tasks...")
 
 	// Запускаем обновление статистики
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		m.statsUpdater(ctx) // Использует внутренний ticker
+		m.statsUpdater(ctx) // Использует внутренний ticker в stats.go
 	}()
 
 	// Запускаем чтение уведомлений из ring buffer
@@ -509,7 +499,7 @@ func (m *BPFManager) Start(ctx context.Context, wg *sync.WaitGroup) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			m.readNotifications(ctx)
+			m.readNotifications(ctx) // Реализация в reader.go
 		}()
 	} else {
 		slog.Warn("BPF notification reader task not started (reader not initialized).")
@@ -519,8 +509,6 @@ func (m *BPFManager) Start(ctx context.Context, wg *sync.WaitGroup) error {
 }
 
 func (m *BPFManager) Close() error {
-	// m.mu.Lock() // Блокировка не нужна здесь, т.к. Close вызывается один раз при остановке
-	// defer m.mu.Unlock()
 	var firstErr error
 	m.stopOnce.Do(func() {
 		slog.Info("Closing BPF Manager...")
@@ -545,7 +533,6 @@ func (m *BPFManager) Close() error {
 		}
 
 		// 3. Отсоединяем программы (линки)
-		// Важно отсоединять в обратном порядке или просто все
 		links := []link.Link{m.getsockoptLink, m.sockopsLink, m.connect4Link}
 		linkNames := []string{"getsockopt", "sockops", "connect4"}
 		for i, l := range links {
@@ -574,8 +561,6 @@ func (m *BPFManager) Close() error {
 
 		// 5. Закрываем канал уведомлений
 		if m.notificationChannel != nil {
-			// Убедимся, что читатель завершился перед закрытием канала
-			// (Хотя закрытие reader'а должно было это обеспечить)
 			close(m.notificationChannel)
 			m.notificationChannel = nil
 		}
@@ -590,411 +575,4 @@ func (m *BPFManager) GetNotificationChannel() <-chan NotificationTuple { // Use 
 	return m.notificationChannel
 }
 
-// --- Остальные методы UpdateTargetPorts, UpdateConfigMap, Add/RemoveExcludedPID ---
-// UpdateTargetPorts, UpdateConfigMap остаются как есть.
-// Add/RemoveExcludedPID теперь НЕ используются для исполняемых файлов,
-// но могут использоваться для исключения PID'ов самих клиентских процессов.
-
-// (Методы UpdateTargetPorts, UpdateConfigMap, AddExcludedPID, RemoveExcludedPID, statsUpdater, readGlobalStats, GetStats - без изменений)
-
-// --- Заглушки или измененные функции ---
-// Map manipulation functions (TargetPorts, ConfigMap, ClientPIDs) remain similar
-// Stat collection (statsUpdater, readGlobalStats, GetStats) remain the same
-// Ring buffer reading (readNotifications) remains the same
-
-// UpdateTargetPorts обновляет карту целевых портов в BPF.
-func (m *BPFManager) UpdateTargetPorts(ports []int) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	targetPortsMap := m.objs.TargetPorts
-	if targetPortsMap == nil {
-		return errors.New("BPF target_ports map not initialized (was it loaded?)")
-	}
-
-	// --- Логика очистки и заполнения карты ---
-	// (Остается без изменений, как в предыдущей версии)
-	// 1. Читаем текущие порты из карты
-	currentPortsMap := make(map[uint16]bool)
-	var mapKey uint16
-	var mapValue uint8
-	iter := targetPortsMap.Iterate()
-	for iter.Next(&mapKey, &mapValue) {
-		if mapValue == 1 {
-			currentPortsMap[mapKey] = true
-		}
-	}
-	if err := iter.Err(); err != nil {
-		slog.Warn("Failed to iterate existing BPF target_ports map, clearing before update", "error", err)
-		// Очищаем карту BPF перед заполнением новыми значениями
-		for portToClear := range currentPortsMap {
-			if errDel := targetPortsMap.Delete(portToClear); errDel != nil && !errors.Is(errDel, ebpf.ErrKeyNotExist) {
-				slog.Error("Failed to delete old port during map clear", "port", portToClear, "error", errDel)
-			}
-		}
-		currentPortsMap = make(map[uint16]bool) // Очищаем и локальный кэш
-	}
-
-	// 2. Формируем желаемый набор портов
-	desiredPortsSet := make(map[uint16]bool)
-	validNewPortsList := make([]int, 0, len(ports))
-	for _, p := range ports {
-		if p > 0 && p <= 65535 {
-			portKey := uint16(p)
-			desiredPortsSet[portKey] = true
-			validNewPortsList = append(validNewPortsList, p)
-		} else {
-			slog.Warn("Invalid port number ignored in UpdateTargetPorts", "port", p)
-		}
-	}
-
-	// 3. Удаляем ненужные порты
-	deletedCount := 0
-	for portKey := range currentPortsMap {
-		if !desiredPortsSet[portKey] {
-			if err := targetPortsMap.Delete(portKey); err != nil {
-				if !errors.Is(err, ebpf.ErrKeyNotExist) {
-					slog.Error("Failed to delete target port from BPF map", "port", portKey, "error", err)
-				}
-			} else {
-				slog.Debug("Deleted target port from BPF map", "port", portKey)
-				deletedCount++
-			}
-		}
-	}
-
-	// 4. Добавляем новые порты
-	addedCount := 0
-	var mapValueOne uint8 = 1
-	for portKey := range desiredPortsSet {
-		// Добавляем только если его не было ИЛИ если мы очищали карту выше
-		if !currentPortsMap[portKey] || iter == nil || iter.Err() != nil {
-			if err := targetPortsMap.Put(portKey, mapValueOne); err != nil {
-				slog.Error("Failed to add target port to BPF map", "port", portKey, "error", err)
-			} else {
-				slog.Debug("Added target port to BPF map", "port", portKey)
-				addedCount++
-			}
-		}
-	}
-
-	if addedCount > 0 || deletedCount > 0 {
-		slog.Info("BPF target ports map updated", "added", addedCount, "deleted", deletedCount, "final_list", validNewPortsList)
-	} else {
-		slog.Debug("BPF target ports map remains unchanged", "current_list", validNewPortsList)
-	}
-
-	// Обновляем конфиг в памяти менеджера (если нужно)
-	if m.cfg != nil {
-		m.cfg.TargetPorts = validNewPortsList
-	}
-	return nil
-}
-
-// UpdateConfigMap обновляет карту конфигурации BPF (IP/порт слушателя).
-func (m *BPFManager) UpdateConfigMap(listenerIP net.IP, listenerPort uint16) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	configMap := m.objs.KgConfig
-	if configMap == nil {
-		return errors.New("BPF kg_config map not initialized")
-	}
-
-	// --- Логика обновления карты ---
-	// (Остается без изменений)
-	ipv4 := listenerIP.To4()
-	if ipv4 == nil {
-		return fmt.Errorf("listener IP is not IPv4: %s", listenerIP.String())
-	}
-	listenerIPInt := binary.BigEndian.Uint32(ipv4)
-
-	cfgValue := BpfKgConfigT{
-		ListenerIp:   listenerIPInt,
-		ListenerPort: listenerPort,
-		Padding:      0, // Явно обнуляем padding
-	}
-
-	var mapKey uint32 = 0 // Карта типа ARRAY, ключ всегда 0
-	if err := configMap.Update(mapKey, cfgValue, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("failed to update kg_config BPF map: %w", err)
-	}
-
-	slog.Info("BPF config map updated", "listener_ip", listenerIP, "listener_port", listenerPort)
-	return nil
-
-}
-
-// AddExcludedPID добавляет PID клиентского процесса в карту исключений kg_client_pids.
-// Используется, чтобы сам клиент не перенаправлялся.
-func (m *BPFManager) AddExcludedPID(pid uint32) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	clientPidsMap := m.objs.KgClientPids
-	if clientPidsMap == nil {
-		return errors.New("BPF kg_client_pids map not initialized")
-	}
-
-	var mapValue uint8 = 1
-	if err := clientPidsMap.Put(pid, mapValue); err != nil {
-		return fmt.Errorf("failed to add excluded client PID %d to BPF map: %w", pid, err)
-	}
-	slog.Debug("Added excluded client PID to BPF map", "pid", pid)
-	return nil
-}
-
-// RemoveExcludedPID удаляет PID клиентского процесса из карты исключений kg_client_pids.
-func (m *BPFManager) RemoveExcludedPID(pid uint32) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	clientPidsMap := m.objs.KgClientPids
-	if clientPidsMap == nil {
-		// Можно не возвращать ошибку, если карта не инициализирована (например, при закрытии)
-		slog.Warn("Attempted to remove excluded client PID, but kg_client_pids map is nil")
-		return nil
-		// return errors.New("BPF kg_client_pids map not initialized")
-	}
-
-	if err := clientPidsMap.Delete(pid); err != nil {
-		if errors.Is(err, ebpf.ErrKeyNotExist) {
-			slog.Debug("Attempted to remove non-existent excluded client PID from BPF map", "pid", pid)
-			return nil // Не ошибка, если ключа и так нет
-		}
-		// Возвращаем ошибку при других проблемах удаления
-		return fmt.Errorf("failed to delete excluded client PID %d from BPF map: %w", pid, err)
-	}
-	slog.Debug("Removed excluded client PID from BPF map", "pid", pid)
-	return nil
-}
-
-// statsUpdater, readGlobalStats, GetStats - без изменений
-
-func (m *BPFManager) statsUpdater(ctx context.Context) {
-	if m.cfg == nil || m.cfg.StatsInterval <= 0 {
-		slog.Info("BPF statistics collection disabled (stats_interval <= 0 or config missing).")
-		return
-	}
-	interval := time.Duration(m.cfg.StatsInterval) * time.Second
-	if interval <= 1*time.Second { // Защита от слишком частого обновления
-		interval = 15 * time.Second
-		slog.Warn("Invalid or too frequent ebpf.stats_interval configured, using default.", "default", interval)
-	}
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	slog.Info("BPF statistics updater started", "interval", interval)
-
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("Stopping BPF statistics updater due to context cancellation.")
-			return
-		case <-m.stopChan: // Используем канал менеджера
-			slog.Info("Stopping BPF statistics updater due to stop signal.")
-			return
-		case <-ticker.C:
-			// Вызываем обновление внутри цикла
-			if err := m.updateAndLogStats(); err != nil {
-				slog.Error("Failed to update BPF statistics", "error", err)
-				// Не выходим из цикла при ошибке чтения статистики
-			}
-		}
-	}
-}
-
-// updateAndLogStats читает статистику и логирует ее. Вызывается из statsUpdater.
-// Не экспортируется.
-func (m *BPFManager) updateAndLogStats() error {
-	m.statsCache.Lock()
-	defer m.statsCache.Unlock()
-
-	now := time.Now()
-	duration := now.Sub(m.statsCache.lastStatsTime).Seconds()
-	// Избегаем деления на ноль или слишком малый интервал
-	if duration < 0.1 {
-		slog.Debug("Skipping stats update, interval too short", "duration_sec", duration)
-		return nil
-	}
-
-	currentStats, err := m.readGlobalStatsInternal() // Используем внутреннюю версию без блокировки
-	if err != nil {
-		return fmt.Errorf("failed to read BPF stats: %w", err)
-	}
-
-	// Функция для расчета скорости
-	calculateRate := func(current, last uint64, dur float64) float64 {
-		if dur <= 0 {
-			return 0.0
-		}
-		// Обработка переполнения счетчика (если current < last)
-		var delta uint64
-		if current >= last {
-			delta = current - last
-		} else {
-			// Предполагаем переполнение 64-битного счетчика
-			delta = (uint64(1<<64-1) - last) + current + 1
-			slog.Warn("BPF counter overflow detected", "last", last, "current", current)
-		}
-		return float64(delta) / dur
-	}
-
-	redirectRate := calculateRate(currentStats.Redirected, m.statsCache.lastTotalStats.Redirected, duration)
-	getsockoptOkRate := calculateRate(currentStats.GetsockoptOk, m.statsCache.lastTotalStats.GetsockoptOk, duration)
-	getsockoptFailRate := calculateRate(currentStats.GetsockoptFail, m.statsCache.lastTotalStats.GetsockoptFail, duration)
-
-	slog.Info("eBPF Statistics",
-		"total_pkts", currentStats.Packets,
-		"total_redirected", currentStats.Redirected,
-		"redirect_rate_pps", fmt.Sprintf("%.2f", redirectRate),
-		"total_getsockopt_ok", currentStats.GetsockoptOk,
-		"getsockopt_ok_rate_pps", fmt.Sprintf("%.2f", getsockoptOkRate),
-		"total_getsockopt_fail", currentStats.GetsockoptFail,
-		"getsockopt_fail_rate_pps", fmt.Sprintf("%.2f", getsockoptFailRate),
-		"interval_sec", fmt.Sprintf("%.2f", duration),
-	)
-
-	// Обновляем кэш
-	m.statsCache.lastTotalStats = currentStats
-	m.statsCache.lastStatsTime = now
-
-	return nil
-}
-
-// readGlobalStatsInternal читает статистику BPF без блокировки мьютекса statsCache.
-// Должна вызываться только из методов, которые уже держат блокировку.
-func (m *BPFManager) readGlobalStatsInternal() (GlobalStats, error) {
-	var aggregate GlobalStats
-	globalStatsMap := m.objs.KgStats
-	if globalStatsMap == nil {
-		// Не возвращаем ошибку, если карта nil, т.к. Close() мог быть вызван
-		slog.Warn("BPF kg_stats map is nil during stats read")
-		return aggregate, nil // Возвращаем нулевую структуру
-		// return aggregate, errors.New("BPF kg_stats map is nil (was it loaded?)")
-	}
-
-	var perCPUValues []BpfGlobalStatsT
-	var mapKey uint32 = 0 // Ключ для MAP_TYPE_PERCPU_ARRAY
-
-	// LookupPerCPU выполняет Lookup + агрегацию
-	err := globalStatsMap.Lookup(mapKey, &perCPUValues) // Lookup читает значения для всех CPU
-	if err != nil {
-		if errors.Is(err, ebpf.ErrKeyNotExist) {
-			slog.Debug("Stats key not found in BPF kg_stats map, returning zero stats.", "key", mapKey)
-			return aggregate, nil // Не ошибка, если ключ не найден (хотя для percpu_array это странно)
-		}
-		// Возвращаем ошибку для других проблем чтения карты
-		return aggregate, fmt.Errorf("failed lookup stats key %d in BPF kg_stats map: %w", mapKey, err)
-	}
-
-	// Суммируем значения со всех CPU
-	for _, cpuStat := range perCPUValues {
-		aggregate.Packets += cpuStat.Packets
-		aggregate.Bytes += cpuStat.Bytes // Суммируем байты, если они есть в структуре
-		aggregate.Redirected += cpuStat.Redirected
-		aggregate.GetsockoptOk += cpuStat.GetsockoptOk
-		aggregate.GetsockoptFail += cpuStat.GetsockoptFail
-	}
-
-	return aggregate, nil
-}
-
-// GetStats возвращает последнюю прочитанную статистику из кэша.
-func (m *BPFManager) GetStats() (GlobalStats, error) {
-	m.statsCache.RLock() // Блокировка на чтение
-	defer m.statsCache.RUnlock()
-	// Возвращаем копию из кэша
-	// Ошибка здесь не возвращается, т.к. читаем из кэша.
-	// Если нужно принудительно обновить перед возвратом:
-	// currentStats, err := m.readGlobalStatsInternal()
-	// if err != nil { return GlobalStats{}, err }
-	// m.statsCache.lastTotalStats = currentStats // Обновление кэша потребует Lock() вместо RLock()
-	return m.statsCache.lastTotalStats, nil
-}
-
-// readNotifications - без изменений
-
-func (m *BPFManager) readNotifications(ctx context.Context) {
-	slog.Info("BPF ring buffer notification reader task started.")
-	defer slog.Info("BPF ring buffer notification reader task stopped.")
-
-	var bpfTuple BpfNotificationTupleT // Используем тип из types.go
-	tupleSize := binary.Size(bpfTuple)
-	if tupleSize <= 0 {
-		slog.Error("Could not determine size of BpfNotificationTupleT", "size", tupleSize)
-		return
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("Stopping BPF ring buffer reader due to context cancellation.")
-			return
-		case <-m.stopChan: // Используем канал менеджера
-			slog.Info("Stopping BPF ring buffer reader due to stop signal.")
-			return
-		default:
-		}
-
-		record, err := m.notificationReader.Read()
-		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) || errors.Is(err, os.ErrClosed) {
-				slog.Info("BPF ring buffer reader closed.")
-				return // Нормальное завершение
-			}
-			if errors.Is(err, context.Canceled) {
-				slog.Info("BPF ring buffer reading cancelled by context.")
-				return // Нормальное завершение
-			}
-			// Логируем другие ошибки и продолжаем
-			slog.Error("Error reading from BPF ring buffer", "error", err)
-			// Небольшая пауза перед повторной попыткой
-			select {
-			case <-time.After(100 * time.Millisecond):
-				continue
-			case <-ctx.Done():
-				return
-			case <-m.stopChan:
-				return
-			}
-		}
-
-		// Обработка записи
-		if len(record.RawSample) < tupleSize {
-			slog.Warn("Received BPF ring buffer event with unexpected size, skipping.", "expected_min", tupleSize, "received", len(record.RawSample))
-			continue
-		}
-
-		// Декодируем в структуру BPF
-		// Используем NativeEndian, т.к. BPF работает в нативной архитектуре
-		reader := bytes.NewReader(record.RawSample)
-		if err := binary.Read(reader, NativeEndian, &bpfTuple); err != nil {
-			slog.Error("Failed to decode BPF ring buffer event data into BpfNotificationTupleT", "error", err)
-			continue
-		}
-
-		// Конвертируем в структуру Go приложения
-		event := NotificationTuple{
-			PidTgid:     bpfTuple.PidTgid,
-			SrcIP:       bpfutil.IpFromInt(bpfTuple.SrcIp),     // BigEndian IP -> net.IP
-			OrigDstIP:   bpfutil.IpFromInt(bpfTuple.OrigDstIp), // BigEndian IP -> net.IP
-			SrcPort:     bpfutil.Ntohs(bpfTuple.SrcPort),       // Network short -> Host short
-			OrigDstPort: bpfutil.Ntohs(bpfTuple.OrigDstPort),   // Network short -> Host short
-			Protocol:    bpfTuple.Protocol,
-		}
-
-		// Отправляем в канал Go
-		select {
-		case m.notificationChannel <- event:
-			slog.Debug("Sent BPF connection notification to service processor",
-				"pid_tgid", event.PidTgid, "src", fmt.Sprintf("%s:%d", event.SrcIP, event.SrcPort),
-				"orig_dst", fmt.Sprintf("%s:%d", event.OrigDstIP, event.OrigDstPort))
-		case <-ctx.Done():
-			slog.Info("Stopping BPF ring buffer reader while sending notification (context cancelled).")
-			return
-		case <-m.stopChan:
-			slog.Info("Stopping BPF ring buffer reader while sending notification (stop signal).")
-			return
-		default:
-			// Канал переполнен, событие теряется
-			slog.Warn("BPF notification channel is full, dropping event.", "channel_cap", cap(m.notificationChannel), "channel_len", len(m.notificationChannel))
-		}
-	}
-}
+// Close() корректно обрабатывает все объекты.
