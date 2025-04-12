@@ -27,7 +27,6 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     struct bpf_sock *bpf_sk;
     struct sock *sk;
 
-    // ctx->sk имеет тип struct bpf_sock *
     bpf_sk = ctx->sk;
     if (!bpf_sk) {
          #ifdef DEBUG
@@ -38,21 +37,15 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
         return 0;
     }
 
-    // Проверяем, является ли сокет TCP и получаем полный struct sock *
-    // Используем bpf_skc_to_tcp_sock, если это TCP, или аналогичный для другого типа, если нужно
-    // В нашем случае ожидается TCP для HTTP/HTTPS прокси
     if (bpf_sk->protocol != IPPROTO_TCP) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_WARN: Socket is not TCP (protocol: %u), cannot get full sock struct reliably.\n", bpf_sk->protocol);
         #endif
-         // Не можем получить порт, возвращаем ошибку или позволяем ядру? Вернем ошибку.
         kg_stats_inc(3);
         ctx->retval = -95; // -EOPNOTSUPP
         return 0;
     }
-    // Преобразуем bpf_sock * в sock * (это преобразование разрешено для TCP)
     sk = (struct sock *)bpf_sk;
-    // Дополнительная проверка на NULL после преобразования (маловероятно, но безопасно)
     if (!sk) {
          #ifdef DEBUG
         bpf_printk("GETSOCKOPT_ERR: Conversion from bpf_sock to sock resulted in NULL.\n");
@@ -63,11 +56,12 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     }
 
     // --- Читаем порт источника из структуры сокета ---
-    // Правильный путь доступа через встроенную структуру inet_sock
+    // Пробуем прямой доступ к inet_sport, предполагая, что inet_sock встроена
     __be16 sport_n; // Порт источника в сетевом порядке байт
-    if (BPF_CORE_READ_INTO(&sport_n, sk, sk_common.skc_inet_sport)) { // <- ИСПРАВЛЕННЫЙ ПУТЬ
+    // Используем sk->inet_sport напрямую как часть CO-RE пути
+    if (BPF_CORE_READ_INTO(&sport_n, sk, inet_sport)) { // <- ИСПРАВЛЕННЫЙ ПУТЬ
          #ifdef DEBUG
-        bpf_printk("GETSOCKOPT_ERR: Failed to read sk_common.skc_inet_sport.\n");
+        bpf_printk("GETSOCKOPT_ERR: Failed to read inet_sport from sock struct.\n");
         #endif
         kg_stats_inc(3);
         ctx->retval = -1; // EPERM или другая ошибка
@@ -77,7 +71,6 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
     // Преобразуем порт источника в хостовый порядок байт для поиска в карте.
     __u16 local_port_h = bpf_ntohs(sport_n);
     // --- Конец получения порта источника ---
-
 
     // Ищем оригинальный адрес назначения, используя порт источника перенаправленного сокета.
     struct original_dest_t *orig_dest = bpf_map_lookup_elem(&kg_redir_sport_to_orig, &local_port_h);
