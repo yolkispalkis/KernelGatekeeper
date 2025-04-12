@@ -1,12 +1,12 @@
 // FILE: pkg/ebpf/bpf/getsockopt.c
 //go:build ignore
 
-#include "vmlinux.h"
+#include "vmlinux.h" // Должен содержать определения struct sock, inet_sock и т.д. из BTF
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
-#include "bpf_shared.h" // Includes definition for kg_redir_sport_to_orig map
+#include "bpf_shared.h" // Включает определение карты kg_redir_sport_to_orig
 
 #ifndef AF_INET
 #define AF_INET 2
@@ -14,81 +14,100 @@
 #ifndef SOL_IP
 #define SOL_IP 0 // IPPROTO_IP
 #endif
-// SO_ORIGINAL_DST is defined in bpf_shared.h
+// SO_ORIGINAL_DST определен в bpf_shared.h
 
 SEC("cgroup/getsockopt")
 int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
-    // Only interested in SOL_IP level and SO_ORIGINAL_DST option
+    // Интересует только SOL_IP уровень и опция SO_ORIGINAL_DST
     if (ctx->level != SOL_IP || ctx->optname != SO_ORIGINAL_DST) {
-        return 1; // Allow other getsockopt calls
+        return 1; // Разрешаем другие вызовы getsockopt
     }
 
-    // Read the source port of the current (redirected) socket from the context
-    // ctx->local_port seems to be available and in host byte order
-    __u32 local_port_u32;
-    if (bpf_core_read(&local_port_u32, sizeof(local_port_u32), &ctx->local_port)) {
+    // --- Получаем порт источника из структуры сокета ---
+    struct sock *sk;
+    // Читаем указатель на сокет безопасно из контекста.
+    // Прямой доступ ctx->sk обычно разрешен в этом хуке.
+    sk = ctx->sk;
+    if (!sk) {
         #ifdef DEBUG
-        bpf_printk("GETSOCKOPT_ERR: Failed to read ctx->local_port.\n");
+        bpf_printk("GETSOCKOPT_ERR: ctx->sk is NULL.\n");
         #endif
-        kg_stats_inc(3); // Increment getsockopt_fail
-        ctx->retval = -1; // Indicate error, e.g., -EPERM
-        return 0; // Handled with error
+        kg_stats_inc(3); // Увеличиваем getsockopt_fail
+        ctx->retval = -1; // Возвращаем ошибку, например, EPERM
+        return 0; // Обработали с ошибкой
     }
-    __u16 local_port_h = (__u16)local_port_u32; // Host byte order
 
-    // Lookup the original destination details using the redirected source port
+    // Читаем порт источника (inet_sport) с помощью CO-RE.
+    // Требуется, чтобы BTF предоставлял определение inet_sock.
+    __be16 sport_n; // Порт источника в сетевом порядке байт
+    // Используем BPF_CORE_READ_INTO для безопасного доступа через указатели (inet_sock вложен в sock).
+    if (BPF_CORE_READ_INTO(&sport_n, sk, inet_sport)) {
+         #ifdef DEBUG
+        bpf_printk("GETSOCKOPT_ERR: Failed to read sk->inet_sport.\n");
+        #endif
+        kg_stats_inc(3);
+        ctx->retval = -1; // EPERM или другая ошибка
+        return 0; // Обработали с ошибкой
+    }
+
+    // Преобразуем порт источника в хостовый порядок байт для поиска в карте.
+    __u16 local_port_h = bpf_ntohs(sport_n);
+    // --- Конец получения порта источника ---
+
+
+    // Ищем оригинальный адрес назначения, используя порт источника перенаправленного сокета.
     struct original_dest_t *orig_dest = bpf_map_lookup_elem(&kg_redir_sport_to_orig, &local_port_h);
     if (!orig_dest) {
-        // Original destination not found for this port.
-        // This might happen if sockops didn't run or entry was already consumed.
-        // Allow the getsockopt call to proceed to the kernel's default handler.
+        // Оригинальный адрес не найден для этого порта.
+        // Это может случиться, если sockops не сработал или запись уже использована.
+        // Позволяем ядру обработать getsockopt по умолчанию.
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_WARN: No original destination found for redir_src_port %u.\n", local_port_h);
         #endif
-        // Do NOT increment fail counter here.
-        return 1; // Let kernel handle it
+        // НЕ увеличиваем счетчик ошибок здесь.
+        return 1; // Позволяем ядру обработать
     }
 
-    // Check if the user buffer is valid and sufficiently large
+    // Проверяем валидность и размер буфера пользователя.
     if (!ctx->optval || !ctx->optval_end ||
         (void *)(ctx->optval + sizeof(struct sockaddr_in)) > ctx->optval_end) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_ERR: Invalid optval buffer for redir_src_port %u. optval=%p optval_end=%p needed=%d\n",
                   local_port_h, ctx->optval, ctx->optval_end, sizeof(struct sockaddr_in));
         #endif
-        // Clean up the map entry as it cannot be delivered
+        // Очищаем запись в карте, так как не можем ее доставить.
         bpf_map_delete_elem(&kg_redir_sport_to_orig, &local_port_h);
-        kg_stats_inc(3); // Increment getsockopt_fail
+        kg_stats_inc(3); // Увеличиваем getsockopt_fail
         ctx->retval = -14; // -EFAULT
-        return 0; // Tell kernel we handled it (with an error)
+        return 0; // Говорим ядру, что мы обработали (с ошибкой).
     }
 
-    // Prepare the sockaddr_in structure to write back to userspace
+    // Подготавливаем структуру sockaddr_in для записи пользователю.
     struct sockaddr_in sa_out = {};
     sa_out.sin_family = AF_INET;
-    // Use bpf_core_read for safety when accessing map value fields
+    // Используем bpf_core_read для безопасного доступа к полям значения карты.
     bpf_core_read(&sa_out.sin_addr.s_addr, sizeof(sa_out.sin_addr.s_addr), &orig_dest->dst_ip);
     bpf_core_read(&sa_out.sin_port, sizeof(sa_out.sin_port), &orig_dest->dst_port);
 
-    // Write the original destination address back to the user buffer
+    // Записываем оригинальный адрес назначения в буфер пользователя.
     long ret = bpf_probe_write_user(ctx->optval, &sa_out, sizeof(sa_out));
     if (ret != 0) {
         #ifdef DEBUG
         bpf_printk("GETSOCKOPT_ERR: bpf_probe_write_user failed for redir_src_port %u: %ld\n", local_port_h, ret);
         #endif
-        // Clean up the map entry
+        // Очищаем запись в карте.
         bpf_map_delete_elem(&kg_redir_sport_to_orig, &local_port_h);
-        kg_stats_inc(3); // Increment getsockopt_fail
-        ctx->retval = ret; // Return the error code from probe_write_user
-        return 0; // Tell kernel we handled it (with an error)
+        kg_stats_inc(3); // Увеличиваем getsockopt_fail
+        ctx->retval = ret; // Возвращаем код ошибки от probe_write_user.
+        return 0; // Говорим ядру, что мы обработали (с ошибкой).
     }
 
-    // Successfully wrote the data. Set return value and length.
-    ctx->retval = 0; // Success
+    // Успешно записали данные. Устанавливаем возвращаемое значение и длину.
+    ctx->retval = 0; // Успех
     ctx->optlen = sizeof(struct sockaddr_in);
-    kg_stats_inc(2); // Increment getsockopt_ok
+    kg_stats_inc(2); // Увеличиваем getsockopt_ok
 
-    // IMPORTANT: Clean up the map entry now that it has been successfully used.
+    // ВАЖНО: Очищаем запись в карте теперь, когда она успешно использована.
     bpf_map_delete_elem(&kg_redir_sport_to_orig, &local_port_h);
 
     #ifdef DEBUG
@@ -96,8 +115,8 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
               sa_out.sin_addr.s_addr, bpf_ntohs(sa_out.sin_port), local_port_h);
     #endif
 
-    // Tell the kernel we have successfully handled the getsockopt call.
-    // Returning 0 prevents the kernel's default handler from running.
+    // Говорим ядру, что мы успешно обработали вызов getsockopt.
+    // Возврат 0 предотвращает запуск стандартного обработчика ядра.
     return 0;
 }
 
