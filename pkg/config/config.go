@@ -2,15 +2,18 @@
 package config
 
 import (
+	// Need for IP parsing
 	"errors"
 	"fmt"
 	"log/slog"
+	"net" // Need for IP parsing
 	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/viper"
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/clientcore" // Need for default listener address
 )
 
 const (
@@ -20,14 +23,15 @@ const (
 	DefaultProxyMaxRetries        = 3
 	DefaultPacFileTTL             = 60
 	DefaultPacExecTimeout         = 5
-	DefaultEBPFLoadMode           = "getsockopt"
+	DefaultEBPFLoadMode           = "getsockopt" // Still relevant name, even if implementation changed
 	DefaultEBPFStatsInterval      = 15
 	DefaultLogLevel               = "info"
 	DefaultLogPath                = "/var/log/kernelgatekeeper.log"
 	DefaultShutdownTimeout        = 30
 	DefaultSocketPath             = "/var/run/kernelgatekeeper.sock"
 	DefaultClientListenerPort     = 3129
-	DefaultEBPFMapSize            = 8192
+	DefaultEBPFMapSize            = 8192 // General default size
+	DefaultRedirSportMapSize      = 8192 // Default for the new map
 )
 
 type Config struct {
@@ -56,18 +60,19 @@ type ProxyConfig struct {
 type KerberosConfig struct {
 	Realm     string `mapstructure:"realm"`
 	KDCHost   string `mapstructure:"kdcHost"`
-	CachePath string `mapstructure:"cachePath"`
+	CachePath string `mapstructure:"cachePath"` // Note: Primarily used by old logic, client uses env/defaults
 }
 
 type EBPFConfig struct {
-	ProgramPath             string   `mapstructure:"programPath"`
+	ProgramPath             string   `mapstructure:"programPath"` // Unused currently
 	TargetPorts             []int    `mapstructure:"targetPorts"`
-	LoadMode                string   `mapstructure:"loadMode"`
+	LoadMode                string   `mapstructure:"loadMode"` // Currently fixed at getsockopt logic internally
 	StatsInterval           int      `mapstructure:"statsInterval"`
 	Excluded                []string `mapstructure:"excluded"`
 	NotificationChannelSize int      `mapstructure:"notificationChannelSize"`
-	OrigDestMapSize         int      `mapstructure:"origDestMapSize"`
-	PortMapSize             int      `mapstructure:"portMapSize"`
+	OrigDestMapSize         int      `mapstructure:"origDestMapSize"`   // Size for kg_orig_dest
+	RedirSportMapSize       int      `mapstructure:"redirSportMapSize"` // Size for kg_redir_sport_to_orig
+	// PortMapSize is removed
 }
 
 func LoadConfig(configPath string) (*Config, error) {
@@ -76,7 +81,6 @@ func LoadConfig(configPath string) (*Config, error) {
 		v.SetConfigFile(configPath)
 		v.SetConfigType(filepath.Ext(configPath)[1:])
 	} else {
-		// Look for config in standard locations
 		v.AddConfigPath("/etc/kernelgatekeeper/")
 		v.AddConfigPath("$HOME/.config/kernelgatekeeper")
 		v.AddConfigPath(".")
@@ -93,13 +97,10 @@ func LoadConfig(configPath string) (*Config, error) {
 	if err := v.ReadInConfig(); err != nil {
 		var configFileNotFoundError viper.ConfigFileNotFoundError
 		if errors.As(err, &configFileNotFoundError) && configPath == "" {
-			// Config file not found in default paths; rely on defaults/env vars
 			slog.Warn("Configuration file not found in default locations, using defaults and environment variables.")
 		} else if errors.As(err, &configFileNotFoundError) && configPath != "" {
-			// Config file not found at specified path
 			return nil, fmt.Errorf("configuration file not found at specified path %s: %w", configPath, err)
 		} else {
-			// Some other error reading the config file
 			return nil, fmt.Errorf("error reading configuration file %s: %w", v.ConfigFileUsed(), err)
 		}
 	} else {
@@ -107,7 +108,6 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 
 	var config Config
-	// Unmarshal the config
 	if err := v.Unmarshal(&config); err != nil {
 		return nil, fmt.Errorf("error unmarshalling configuration: %w", err)
 	}
@@ -115,7 +115,6 @@ func LoadConfig(configPath string) (*Config, error) {
 	// Explicitly handle duration conversion for ShutdownTimeout
 	config.ShutdownTimeout = time.Duration(v.GetInt("shutdownTimeout")) * time.Second
 
-	// Validate the configuration
 	if err := validateConfig(&config); err != nil {
 		return nil, fmt.Errorf("configuration validation failed: %w", err)
 	}
@@ -142,7 +141,6 @@ func validateConfig(cfg *Config) error {
 		if cfg.Proxy.WpadURL == "" {
 			return errors.New("proxy.wpadUrl is required when proxy.type is 'wpad'")
 		}
-		// Validate wpadUrl format
 		u, err := url.Parse(cfg.Proxy.WpadURL)
 		if err != nil {
 			return fmt.Errorf("invalid proxy.wpadUrl: %w", err)
@@ -171,8 +169,8 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf("invalid port %d in ebpf.targetPorts, must be between 1 and 65535", port)
 		}
 	}
-	if strings.ToLower(cfg.EBPF.LoadMode) != "getsockopt" {
-		return fmt.Errorf("invalid ebpf.loadMode: '%s', currently only 'getsockopt' is supported", cfg.EBPF.LoadMode)
+	if strings.ToLower(cfg.EBPF.LoadMode) != "getsockopt" { // Keep name even if impl changed
+		return fmt.Errorf("invalid ebpf.loadMode: '%s', currently only 'getsockopt' (internal mode name) is supported", cfg.EBPF.LoadMode)
 	}
 	if cfg.EBPF.StatsInterval <= 0 {
 		slog.Warn("ebpf.statsInterval is not positive, using default", "default", DefaultEBPFStatsInterval)
@@ -182,10 +180,13 @@ func validateConfig(cfg *Config) error {
 		slog.Warn("ebpf.origDestMapSize is not positive, using default", "default", DefaultEBPFMapSize)
 		cfg.EBPF.OrigDestMapSize = DefaultEBPFMapSize
 	}
-	// Note: NotificationChannelSize validation could be added here if needed
-	if cfg.EBPF.PortMapSize <= 0 {
-		slog.Warn("ebpf.portMapSize is not positive, using default", "default", DefaultEBPFMapSize)
-		cfg.EBPF.PortMapSize = DefaultEBPFMapSize
+	if cfg.EBPF.RedirSportMapSize <= 0 {
+		slog.Warn("ebpf.redirSportMapSize is not positive, using default", "default", DefaultRedirSportMapSize)
+		cfg.EBPF.RedirSportMapSize = DefaultRedirSportMapSize
+	}
+	if cfg.EBPF.NotificationChannelSize <= 0 {
+		slog.Warn("ebpf.notificationChannelSize is not positive, using default", "default", 4096)
+		cfg.EBPF.NotificationChannelSize = 4096
 	}
 
 	// Validate Log settings
@@ -208,6 +209,13 @@ func validateConfig(cfg *Config) error {
 		cfg.ClientListenerPort = DefaultClientListenerPort
 	}
 
+	// Validate Listener Address (ensure it's loopback)
+	listenerIP := net.ParseIP(clientcore.LocalListenAddr)
+	if listenerIP == nil || !listenerIP.IsLoopback() {
+		// This should ideally not happen as it's a constant, but good practice to check
+		return fmt.Errorf("internal error: configured client listener address '%s' is not a valid loopback address", clientcore.LocalListenAddr)
+	}
+
 	return nil
 }
 
@@ -220,17 +228,15 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("proxy.pacExecutionTimeout", DefaultPacExecTimeout)
 	v.SetDefault("proxy.pacFileTtl", DefaultPacFileTTL)
 
-	// Kerberos defaults (client mostly relies on environment/system config)
 	v.SetDefault("kerberos.enableCache", true)
-	// Other kerberos settings like realm, kdcHost, principal, keytabPath are intentionally not defaulted
 
 	v.SetDefault("ebpf.loadMode", DefaultEBPFLoadMode)
 	v.SetDefault("ebpf.statsInterval", DefaultEBPFStatsInterval)
 	v.SetDefault("ebpf.targetPorts", []int{80, 443})
 	v.SetDefault("ebpf.excluded", []string{})
 	v.SetDefault("ebpf.origDestMapSize", DefaultEBPFMapSize)
-	v.SetDefault("ebpf.notificationChannelSize", 4096) // Default size
-	v.SetDefault("ebpf.portMapSize", DefaultEBPFMapSize)
+	v.SetDefault("ebpf.redirSportMapSize", DefaultRedirSportMapSize) // Default for new map
+	v.SetDefault("ebpf.notificationChannelSize", 4096)
 
 	v.SetDefault("logLevel", DefaultLogLevel)
 	v.SetDefault("logPath", DefaultLogPath)

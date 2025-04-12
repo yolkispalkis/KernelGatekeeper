@@ -1,6 +1,9 @@
 proxy:
   type: wpad
   wpadUrl: "http://wpad/wpad.dat"
+  connectionTimeout: 10
+  requestTimeout: 30
+  pacFileTtl: 60
 
 kerberos:
   enableCache: true
@@ -10,10 +13,14 @@ ebpf:
   excluded:
     - "/usr/local/bin/kernelgatekeeper-service"
     - "/usr/local/bin/kernelgatekeeper-client"
-    - "/opt/cisco/secureclient/bin/vpnagentd"
+    - "/opt/cisco/anyconnect/bin/vpnagentd"
 
-logLevel: "debug"
+  origDestMapSize: 8192
+  redirSportMapSize: 8192
+  statsInterval: 15
+
+logLevel: "info"
 logPath: "/var/log/kernelgatekeeper.log"
-
 shutdownTimeout: 30
 socketPath: "/var/run/kernelgatekeeper.sock"
+clientListenerPort: 3129
