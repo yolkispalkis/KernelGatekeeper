@@ -108,7 +108,7 @@ proceed_to_main_logic:
     }
 
     // <<< USES kg_client_pids >>>
-    __u8 *is_kg_client = bpf_map_lookup_elem(&kg_client_pids, ¤t_pid); // Map defined in bpf_shared.h
+    __u8 *is_kg_client = bpf_map_lookup_elem(&kg_client_pids, &current_pid); // Map defined in bpf_shared.h
     if (is_kg_client && *is_kg_client == 1) {
         #ifdef DEBUG
         bpf_printk("CONNECT4_SKIP: Skipping connection from known client PID %u\n", current_pid);
