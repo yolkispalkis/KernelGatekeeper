@@ -1,3 +1,4 @@
+// FILE: pkg/clientcore/connection_handler.go
 package clientcore
 
 import (
@@ -126,8 +127,14 @@ func (h *ConnectionHandler) getOriginalDestination(conn net.Conn) (net.IP, uint1
 
 	ip := net.IPv4(originalDst.Addr[0], originalDst.Addr[1], originalDst.Addr[2], originalDst.Addr[3])
 	portBytes := make([]byte, 2)
-	common.NativeEndian.PutUint16(portBytes, originalDst.Port)
-	port := binary.BigEndian.Uint16(portBytes)
+	// Assuming getsockopt returns port in network byte order, but the struct field Port is uint16
+	// We need to read it into bytes using native endianness and then convert to host/standard BigEndian for network operations
+	// common.NativeEndian.PutUint16(portBytes, originalDst.Port)
+	// port := binary.BigEndian.Uint16(portBytes)
+	// Correction: SO_ORIGINAL_DST typically returns the port in network byte order (BigEndian).
+	// The originalDst.Port is uint16, so we need to ensure it's interpreted correctly.
+	// bpf_ntohs equivalent in Go for a uint16 already in network order:
+	port := binary.BigEndian.Uint16((*[2]byte)(unsafe.Pointer(&originalDst.Port))[:])
 
 	return ip, port, nil
 }
@@ -230,37 +237,98 @@ func (h *ConnectionHandler) relayDataBidirectionally(ctx context.Context, conn1,
 	copyData := func(dst net.Conn, src net.Conn) {
 		defer wg.Done()
 
-		copyTimeout := relayCopyTimeout
-		if dl, ok := ctx.Deadline(); ok {
-			copyTimeout = time.Until(dl)
-			if copyTimeout < 0 {
-				copyTimeout = 0
+		// Use a reasonable buffer size
+		buf := make([]byte, 32*1024) // 32KB buffer
+
+		for {
+			// Set read deadline for each read operation
+			readDeadline := time.Now().Add(relayCopyTimeout)
+			if dl, ok := ctx.Deadline(); ok && dl.Before(readDeadline) {
+				readDeadline = dl
+			}
+			if time.Until(readDeadline) <= 0 {
+				errChan <- ctx.Err() // Context deadline exceeded
+				return
+			}
+			if err := src.SetReadDeadline(readDeadline); err != nil {
+				if !common.IsConnectionClosedErr(err) { // Avoid logging closed errors repeatedly
+					slog.Warn("Failed to set read deadline for relay", "error", err)
+				}
+				// Don't necessarily exit, attempt the read anyway
+			}
+
+			nr, readErr := src.Read(buf)
+
+			// Clear deadline immediately after read attempt
+			_ = src.SetReadDeadline(time.Time{})
+
+			if nr > 0 {
+				// Set write deadline based on context or a fixed timeout
+				writeDeadline := time.Now().Add(relayCopyTimeout / 2) // Shorter write timeout
+				if dl, ok := ctx.Deadline(); ok && dl.Before(writeDeadline) {
+					writeDeadline = dl
+				}
+				if time.Until(writeDeadline) <= 0 {
+					errChan <- ctx.Err()
+					return
+				}
+				if err := dst.SetWriteDeadline(writeDeadline); err != nil {
+					if !common.IsConnectionClosedErr(err) {
+						slog.Warn("Failed to set write deadline for relay", "error", err)
+					}
+				}
+
+				nw, writeErr := dst.Write(buf[0:nr])
+
+				// Clear deadline immediately
+				_ = dst.SetWriteDeadline(time.Time{})
+
+				if writeErr != nil {
+					errChan <- writeErr
+					return
+				}
+				if nw != nr {
+					errChan <- io.ErrShortWrite
+					return
+				}
+			}
+
+			// Handle read errors after potential write
+			if readErr != nil {
+				// Send EOF or context errors non-fatally, others are fatal
+				if readErr == io.EOF || errors.Is(readErr, context.Canceled) || errors.Is(readErr, net.ErrClosed) {
+					errChan <- readErr // Signal closure/cancellation
+				} else if common.IsTimeoutError(readErr) {
+					// Read timed out, continue loop to try reading again unless context is done
+					select {
+					case <-ctx.Done():
+						errChan <- ctx.Err()
+						return
+					default:
+						continue
+					}
+				} else {
+					errChan <- readErr // Send other errors
+				}
+				return // Exit loop on any read error (EOF, timeout handled, other error)
+			}
+
+			// Check context after successful read/write cycle
+			select {
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			default:
+				// continue loop
 			}
 		}
-		if copyTimeout <= 0 {
-			errChan <- ctx.Err()
-			return
-		}
-
-		if err := src.SetReadDeadline(time.Now().Add(copyTimeout)); err != nil {
-			slog.Warn("Failed to set read deadline for relay", "error", err)
-		}
-		defer src.SetReadDeadline(time.Time{})
-
-		_, err := io.Copy(dst, src)
-
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			errChan <- ctxErr
-			return
-		}
-
-		errChan <- err
 	}
 
 	wg.Add(2)
 	go copyData(conn1, conn2)
 	go copyData(conn2, conn1)
 
+	// Wait for the first error or context cancellation
 	var firstError error
 	select {
 	case err := <-errChan:
@@ -269,20 +337,25 @@ func (h *ConnectionHandler) relayDataBidirectionally(ctx context.Context, conn1,
 		firstError = ctx.Err()
 	}
 
+	// Close connections to unblock the other goroutine
 	conn1.Close()
 	conn2.Close()
 
-	wg.Wait()
+	// Wait for the second goroutine to finish and collect its error if it's more significant
+	wg.Wait() // Ensure both copyData goroutines have exited
 
 	select {
-	case err := <-errChan:
-		if firstError == nil || !errors.Is(err, io.EOF) && !common.IsConnectionClosedErr(err) && !errors.Is(err, context.Canceled) {
-			slog.Debug("Second relay goroutine finished", "error", err)
-			if firstError == nil {
-				firstError = err
-			}
+	case secondError := <-errChan: // Check the channel again for the second error
+		// Ignore EOF, closed, or context errors if we already have an error
+		isIgnorable := errors.Is(secondError, io.EOF) || common.IsConnectionClosedErr(secondError) || errors.Is(secondError, context.Canceled) || common.IsTimeoutError(secondError)
+		if firstError == nil && !isIgnorable {
+			firstError = secondError // Record the second error if it's significant and we don't have one yet
+		} else if firstError != nil && !isIgnorable {
+			// Optionally log the second error if it's different and significant
+			slog.Debug("Second relay goroutine finished with error after first error", "first_error", firstError, "second_error", secondError)
 		}
 	default:
+		// No second error received after waiting
 	}
 
 	return firstError

@@ -1,3 +1,4 @@
+// FILE: cmd/client/main.go
 package main
 
 import (
@@ -14,7 +15,7 @@ import (
 	"time"
 
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/clientcore"
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/common" // Import common
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/common"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/kerb"
 	"github.com/yolkispalkis/kernelgatekeeper/pkg/logging"
@@ -72,11 +73,9 @@ func main() {
 
 	signals.SetupHandler(ctx, rootCancel, &globalShutdownOnce)
 
-	// FIX: Pass cfg to NewStateManager (assuming the incompatible type error was due to import cycle)
-	// The error message "cannot use cfg (...) as *invalid type value" strongly suggests the type was unresolved due to the cycle.
-	// Assuming NewStateManager takes *config.Config
 	stateManager := clientcore.NewStateManager(cfg)
 
+	// Assuming kerb.NewKerberosClient now correctly accepts *config.KerberosConfig
 	kClient, kerr := kerb.NewKerberosClient(&cfg.Kerberos)
 	if kerr != nil {
 		slog.Error("Failed to initialize Kerberos client", "error", kerr)
@@ -86,6 +85,7 @@ func main() {
 		slog.Info("Kerberos client initialized.")
 	}
 
+	// Assuming proxy.NewProxyManager now correctly accepts *config.ProxyConfig
 	pMgr, perr := proxy.NewProxyManager(&cfg.Proxy)
 	if perr != nil {
 		slog.Error("Failed to initialize Proxy Manager", "error", perr)
@@ -109,7 +109,7 @@ func main() {
 
 	ipcSocketPath := flags.socketPath
 	if ipcSocketPath == "" {
-		ipcSocketPath = common.DefaultSocketPath // Use common
+		ipcSocketPath = common.DefaultSocketPath
 	}
 	ipcManager := clientcore.NewIPCManager(ctx, stateManager, ipcSocketPath, flags.connectTimeout)
 

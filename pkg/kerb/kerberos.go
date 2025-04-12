@@ -14,20 +14,16 @@ import (
 	gokrb5client "github.com/jcmturner/gokrb5/v8/client"
 	krb5config "github.com/jcmturner/gokrb5/v8/config"
 	"github.com/jcmturner/gokrb5/v8/credentials"
-	// config import removed
+
+	// Import the actual config package
+	pkgconfig "github.com/yolkispalkis/kernelgatekeeper/pkg/config"
 )
 
-// Define KerberosConfig locally if it's only needed here
-type KerberosConfig struct {
-	Realm     string `mapstructure:"realm"`
-	KDCHost   string `mapstructure:"kdcHost"`
-	CachePath string `mapstructure:"cachePath"` // Note: Primarily used by old logic, client uses env/defaults
-}
-
+// KerberosClient manages Kerberos authentication using user ccache.
 type KerberosClient struct {
 	// config is kept minimally for potential future use (e.g. realm/kdc hints)
 	// but cachePath is NOT used from here anymore.
-	config *KerberosConfig // Use local struct
+	config *pkgconfig.KerberosConfig // Use the imported config type
 
 	client        *gokrb5client.Client
 	mu            sync.Mutex
@@ -37,8 +33,8 @@ type KerberosClient struct {
 }
 
 // NewKerberosClient creates a Kerberos client configured to use the user's ccache.
-// The KerberosConfig is now mainly informational or for future hints.
-func NewKerberosClient(cfg *KerberosConfig) (*KerberosClient, error) { // Use local struct
+// Accepts the KerberosConfig part from the main application config.
+func NewKerberosClient(cfg *pkgconfig.KerberosConfig) (*KerberosClient, error) { // Use imported config type
 	slog.Info("Initializing Kerberos client context (user ccache mode)")
 
 	k := &KerberosClient{
@@ -64,6 +60,8 @@ func NewKerberosClient(cfg *KerberosConfig) (*KerberosClient, error) { // Use lo
 	return k, nil // Return client instance regardless of initial ticket state
 }
 
+// initializeFromCCache attempts to load credentials and create a gokrb5 client.
+// Must be called with the mutex held.
 func (k *KerberosClient) initializeFromCCache() error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -134,21 +132,8 @@ func (k *KerberosClient) initializeFromCCache() error {
 	// Success - valid credentials loaded
 	k.client = cl
 	k.isInitialized = true
-	// Use actual credential end time
-	// Use the EndTime method provided by the Credentials struct
-	var ok bool
-	if k.client != nil && k.client.Credentials != nil && !k.client.Credentials.Expired() {
-		k.ticketExpiry = k.client.Credentials.ValidUntil()
-		slog.Debug("Using actual credential end time from ccache", "expiry", k.ticketExpiry.Format(time.RFC3339))
-		ok = true // Indicate we successfully got the expiry
-	} else {
-		ok = false // Indicate we couldn't get the specific TGT expiry
-	}
-	if !ok {
-		// Fallback estimate if TGT retrieval fails
-		k.ticketExpiry = time.Now().Add(8 * time.Hour) // Standard estimate
-		slog.Warn("Could not retrieve specific TGT expiry, using standard estimate", "estimate_hours", 8)
-	}
+	k.ticketExpiry = cl.Credentials.ValidUntil()
+	slog.Debug("Using actual credential end time from ccache", "expiry", k.ticketExpiry.Format(time.RFC3339))
 
 	slog.Info("Kerberos context initialized successfully from ccache",
 		"principal", strings.Join(k.client.Credentials.CName().NameString, "/"),
@@ -183,8 +168,8 @@ func (k *KerberosClient) CheckAndRefreshClient() error {
 			"reason_needs_init", !isInit,
 			"reason_expiry_near_or_zero", expiry.IsZero() || time.Now().Add(5*time.Minute).After(expiry))
 
-		// Reload from ccache
-		err := k.initializeFromCCache() // This will update internal state
+		// Reload from ccache (initializeFromCCache handles locking internally)
+		err := k.initializeFromCCache()
 		if err != nil {
 			slog.Error("Failed to refresh Kerberos client from ccache", "ccache", ccName, "error", err)
 			return fmt.Errorf("ccache reload attempt failed unexpectedly: %w", err)
@@ -210,12 +195,13 @@ func (k *KerberosClient) CheckAndRefreshClient() error {
 
 // Gokrb5Client returns the underlying gokrb5 client instance if initialized and valid.
 func (k *KerberosClient) Gokrb5Client() *gokrb5client.Client {
-	if !k.IsInitialized() {
-		return nil
-	}
-	k.mu.Lock()
+	k.mu.Lock() // Lock needed to safely access k.client
 	defer k.mu.Unlock()
-	return k.client
+	// Check isInitialized and expiry *while holding the lock*
+	if k.isInitialized && k.client != nil && !k.ticketExpiry.IsZero() && time.Now().Before(k.ticketExpiry) {
+		return k.client
+	}
+	return nil
 }
 
 // GetStatus returns the current status information of the Kerberos client.
@@ -247,15 +233,17 @@ func (k *KerberosClient) GetStatus() map[string]interface{} {
 				status["tgt_time_left"] = timeLeft.Round(time.Second).String()
 			} else {
 				status["tgt_time_left"] = "Expired"
-				status["initialized"] = false // Mark as not initialized if expired
+				// Don't set initialized=false here, let the main check handle it
 			}
 		} else {
 			status["tgt_expiry"] = "Unknown (lookup failed)"
-			status["initialized"] = false // Can't be valid if expiry is unknown
 		}
-	} else {
-		status["tgt_time_left"] = "Not Initialized / No Ticket"
-		status["initialized"] = false
+	}
+
+	// Update initialized based on the final check
+	status["initialized"] = isCurrentlyValid
+	if !isCurrentlyValid {
+		status["tgt_time_left"] = "Not Initialized / Expired"
 	}
 
 	return status
@@ -287,8 +275,26 @@ func determineEffectiveCacheName() string {
 
 	if cachePath == "" {
 		uidStr := strconv.Itoa(os.Getuid())
-		cachePath = fmt.Sprintf("FILE:/tmp/krb5cc_%s", uidStr)
-		source = "default pattern"
+		// Common default patterns
+		defaultPatterns := []string{
+			fmt.Sprintf("/tmp/krb5cc_%s", uidStr),          // Default on many Linux systems
+			fmt.Sprintf("/var/run/user/%s/krb5cc", uidStr), // Systemd user session default
+		}
+		// Check which default exists
+		for _, pattern := range defaultPatterns {
+			potentialPath := "FILE:" + pattern
+			// Simple check if the file itself exists for FILE type
+			if _, err := os.Stat(pattern); err == nil {
+				cachePath = potentialPath
+				source = "default pattern (" + pattern + ")"
+				break
+			}
+		}
+		// Fallback if no default found
+		if cachePath == "" {
+			cachePath = "FILE:/tmp/krb5cc_" + uidStr // Fallback to original default if others don't exist
+			source = "fallback default pattern"
+		}
 	}
 
 	// Expand %{uid} if present (though less likely if default is used)
@@ -320,26 +326,34 @@ func determineEffectiveCacheName() string {
 }
 
 func getDefaultKrb5ConfPath() string {
+	// Check environment variable first
+	if path := os.Getenv("KRB5_CONFIG"); path != "" {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+
 	if os.PathSeparator == '\\' { // Basic Windows check
 		programData := os.Getenv("PROGRAMDATA")
 		if programData != "" {
-			path := programData + "\\Kerberos\\krb5.conf"
-			if _, err := os.Stat(path); err == nil {
-				return path
+			// Check common locations within ProgramData
+			locations := []string{
+				programData + "\\Kerberos\\krb5.conf",
+				programData + "\\Kerberos\\krb5.ini",
+				programData + "\\MIT\\Kerberos\\krb5.ini",
+				programData + "\\MIT\\Kerberos\\krb5.conf",
 			}
-			path = programData + "\\MIT\\Kerberos\\krb5.ini" // Alternative location
-			if _, err := os.Stat(path); err == nil {
-				return path
+			for _, path := range locations {
+				if _, err := os.Stat(path); err == nil {
+					return path
+				}
 			}
 		}
-		// Fallback guesses for Windows
-		if _, err := os.Stat("C:\\ProgramData\\Kerberos\\krb5.conf"); err == nil {
-			return "C:\\ProgramData\\Kerberos\\krb5.conf"
+		// Fallback guesses for Windows outside ProgramData (less standard)
+		if _, err := os.Stat("C:\\Windows\\krb5.ini"); err == nil {
+			return "C:\\Windows\\krb5.ini"
 		}
-		if _, err := os.Stat("C:\\ProgramData\\MIT\\Kerberos\\krb5.ini"); err == nil {
-			return "C:\\ProgramData\\MIT\\Kerberos\\krb5.ini"
-		}
-		return "" // No standard default known easily
+		return "" // No standard default known easily or found
 	}
 	// Linux/macOS default
 	return "/etc/krb5.conf"

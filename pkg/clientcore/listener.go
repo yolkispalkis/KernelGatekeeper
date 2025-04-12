@@ -7,11 +7,8 @@ import (
 	"log/slog"
 	"net"
 
-	"github.com/yolkispalkis/kernelgatekeeper/pkg/common" // Import common
-	// config import removed
+	"github.com/yolkispalkis/kernelgatekeeper/pkg/common"
 )
-
-// LocalListenAddr moved to pkg/common
 
 type LocalListener struct {
 	listener net.Listener
@@ -20,11 +17,11 @@ type LocalListener struct {
 
 func NewLocalListener(port uint16) *LocalListener {
 	if port == 0 {
-		port = common.DefaultClientListenerPort // Use common
+		port = common.DefaultClientListenerPort
 		slog.Warn("Client listener port not configured or zero, using default", "default", port)
 	}
 	return &LocalListener{
-		address: fmt.Sprintf("%s:%d", common.LocalListenAddr, port), // Use common constant
+		address: fmt.Sprintf("%s:%d", common.LocalListenAddr, port),
 	}
 }
 
@@ -46,7 +43,7 @@ func (l *LocalListener) Close() error {
 	if l.listener != nil {
 		slog.Info("Closing local listener", "address", l.address)
 		err := l.listener.Close()
-		l.listener = nil
+		l.listener = nil // Ensure listener is nil after closing
 		return err
 	}
 	return nil
@@ -81,11 +78,14 @@ func (l *LocalListener) IP() net.IP {
 	return tcpAddr.IP
 }
 
-// ParseListenerIP is deprecated if only LocalListenAddr is used, but kept for potential future use.
+// ParseListenerIP parses an IP string into its big-endian uint32 representation.
 func ParseListenerIP(ipStr string) (uint32, error) {
 	ip := net.ParseIP(ipStr).To4()
 	if ip == nil {
 		return 0, fmt.Errorf("IP address is not IPv4: %s", ipStr)
+	}
+	if len(ip) != 4 { // Double check it's exactly 4 bytes
+		return 0, fmt.Errorf("unexpected IPv4 length for %s: %d bytes", ipStr, len(ip))
 	}
 	return binary.BigEndian.Uint32(ip), nil
 }
