@@ -44,7 +44,7 @@ int kernelgatekeeper_getsockopt(struct bpf_sockopt *ctx) {
         return 1;
     }
 
-    __be16 peer_port_n = BPF_CORE_READ(ctx->sk, __sk_common.skc_dport);
+    __be16 peer_port_n = BPF_CORE_READ(ctx->sk, sk_dport);
 
     __u16 peer_port_h = bpf_ntohs(peer_port_n);
 
